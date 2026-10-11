@@ -50,24 +50,30 @@
 #include "dsound_buffer_model.h"
 #include "xbox_adpcm.h"
 #include "audio_output.h"
+#include "hle_dsound_3d.h"
+#include <math.h>
 
 void hle_dsound_stream_tick(uint64_t now);   /* hle_dsound_stream.c */
 
 /* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather
  * than including the kernel header, which this file has no other need of. */
 int xbox_EnvSwitch(const char *name, int default_on);
+long __stdcall xbox_NtSetEvent(void *EventHandle, long *PreviousState);   /* NTSTATUS */
+void *xbox_bridge_resolve_handle(uint32_t token);                          /* kernel_bridge.c */
 
 enum {
     SET_FORMAT     = 0x0Cu,   /* tag | channels << 16 | bits << 24 */
     SET_RATE       = 0x10u,
     SET_ALIGN      = 0x14u,
     SET_VOLUME     = 0x1Cu,   /* hundredths of a dB, headroom applied */
-    SET_DATA       = 0xB8u,
-    SET_SIZE       = 0xBCu,
-    SET_PLAY_START = 0xC0u,
-    SET_PLAY_LEN   = 0xC4u,
-    SET_LOOP_START = 0xC8u,
-    SET_LOOP_LEN   = 0xCCu,
+    /* The buffer settings as DSOUND 5344 and earlier lay them out; later
+     * builds put them 4 bytes on (buf_shift below). */
+    BUF_DATA       = 0xB8u,
+    BUF_SIZE       = 0xBCu,
+    BUF_PLAY_START = 0xC0u,
+    BUF_PLAY_LEN   = 0xC4u,
+    BUF_LOOP_START = 0xC8u,
+    BUF_LOOP_LEN   = 0xCCu,
 
     TAG_PCM   = 0x0001u,
     TAG_ADPCM = 0x0069u,
@@ -75,7 +81,36 @@ enum {
 
     PRE_ROLL_MS       = 50u,     /* silence ahead of a buffer's sound; see prime() */
     SERVICE_PERIOD_US = 5000,    /* the service thread's cadence; see service_thread() */
+
+    MAX_NOTIFY        = 64u,     /* positions per buffer */
+    NOTIFY_STOP       = 0xFFFFFFFFu,  /* DSBPN_OFFSETSTOP */
+
+    STOPEX_ENVELOPE   = 1u,      /* DSBSTOPEX_ENVELOPE: stop through the release */
+    STOPEX_RELEASEWAVEFORM = 2u, /* DSBSTOPEX_RELEASEWAVEFORM: play out past the loop */
 };
+
+/* The voice processor's envelopes (SetEG), stepped as the hardware steps
+ * them: once per 32-sample frame of its 48 kHz mix, 1500 times a second,
+ * whatever the voice's pitch. The phases' lengths are in units of 16 such
+ * frames. The shapes are xemu's (hw/xbox/mcpx/apu, voice_step_envelope):
+ * attack a straight line to 255, hold at 255, decay exponential to the
+ * sustain level, release exponential to -60 dB over its length. */
+enum {
+    EG_OFF, EG_DELAY, EG_ATTACK, EG_HOLD, EG_DECAY, EG_SUSTAIN, EG_RELEASE, EG_DONE,
+    EG_FRAMES_PER_SECOND = 1500u,
+};
+
+/* DSENVELOPEDESC, as DWORD indices. */
+enum { EGD_EG, EGD_MODE, EGD_DELAY, EGD_ATTACK, EGD_HOLD, EGD_DECAY, EGD_RELEASE,
+       EGD_SUSTAIN, EGD_PITCH, EGD_FILTER };
+
+typedef struct Envelope {
+    int      phase;
+    uint32_t t;                  /* frames into the phase */
+    float    level;              /* 0..255 */
+    float    from;               /* the level the release started at */
+    double   frac;               /* part of a frame not yet stepped */
+} Envelope;
 
 typedef struct Buffer {
     uint32_t iface;              /* the IDirectSoundBuffer the game holds */
@@ -93,9 +128,34 @@ typedef struct Buffer {
      * voice ran dry. */
     uint32_t gap_max_ms, discarded_ms, discards, dry;
     uint64_t report_ms;
+    uint64_t cursor_trace_ms;    /* RECOMP_DSOUND_CURSOR_TRACE */
+    /* Where it is heard (hle_dsound_3d.c): the rate the title asked for
+     * (SetFrequency/SetPitch; 0 = its own), and whether the slot has a mix,
+     * in which case it is submitted at its own rate and plays at
+     * model.sample_rate through the mix's ratio. The model's rate is the
+     * asked-for one times the Doppler shift. */
+    uint32_t asked_rate;
+    int mixed;
+    /* The amplitude [0] and multi [1] envelopes, from Play; and a stop
+     * through the release (StopEx with DSBSTOPEX_ENVELOPE): 1 while it
+     * runs, 2 once it has, when the buffer stops. */
+    Envelope eg[2];
+    int releasing;
 } Buffer;
 
+/* SetNotificationPositions: { dwOffset, hEventNotify } pairs, kept apart from
+ * the Buffer (which is remade whenever the title changes the buffer's data)
+ * and checked against the cursor the title sees. `last` is that cursor when
+ * last checked, in the model's bytes, and `playing` whether it was moving. */
+typedef struct Notify {
+    uint32_t iface, count;
+    uint32_t offset[MAX_NOTIFY], event[MAX_NOTIFY];
+    uint32_t last;
+    int      playing;
+} Notify;
+
 static Buffer g_buffers[SLOTS];
+static Notify g_notify[SLOTS];
 static CRITICAL_SECTION g_lock;
 static INIT_ONCE g_lock_once = INIT_ONCE_STATIC_INIT;
 
@@ -113,6 +173,61 @@ static void lock(void)
 }
 
 static void unlock(void) { LeaveCriticalSection(&g_lock); }
+
+/* Where the buffer settings (data, size, play and loop regions) sit moved by
+ * 4 bytes between DSOUND 5344 and 5455: the XDK's own
+ * CDirectSoundBufferSettings_SetBufferData keeps the data pointer at +0xB8
+ * up to 5344 and at +0xBC from 5455 on. Read from that function in all 25
+ * titles in games/ (Oct 2026): 3925 has none, 4134-5344 +0xB8, 5455-5849
+ * +0xBC, with no exception. Read with the old offsets, a 5849 buffer's size
+ * was a pointer: MK Shaolin Monks' 64 KB movie-sound ring was clocked as
+ * 22.7 MB, so its play cursor ran on past the ring and wrapped 118 s later
+ * instead of every 0.34 s, and the movie, paced by that cursor, froze where
+ * it wrapped. The build comes from the XBE's own library table, which the
+ * loader copies to 0x00010000 with the rest of the image header. */
+static uint32_t dsound_build(void)
+{
+    static uint32_t build = 0xFFFFFFFFu;
+    uint32_t n, table, i;
+
+    if (build != 0xFFFFFFFFu)
+        return build;
+    build = 0u;
+    if (HLE_MEM32(0x00010000u) != 0x48454258u) {     /* "XBEH" */
+        fprintf(stderr, "[DSOUND] no XBE header at 0x00010000 (%08X, %u libraries at %08X)\n",
+                HLE_MEM32(0x00010000u), HLE_MEM32(0x00010160u), HLE_MEM32(0x00010164u));
+        return build;
+    }
+    n = HLE_MEM32(0x00010160u);
+    table = HLE_MEM32(0x00010164u);
+    for (i = 0; i < n && i < 64u; i++) {
+        uint32_t e = table + i * 16u;
+        if (e < 0x00010000u || e + 16u > 0x00020000u)
+            break;
+        if (HLE_MEM32(e) == 0x554F5344u && HLE_MEM32(e + 4u) == 0x0000444Eu) {  /* "DSOUND\0\0" */
+            build = HLE_MEM32(e + 12u) & 0xFFFFu;
+            break;
+        }
+    }
+    fprintf(stderr, "[DSOUND] library build %u: buffer settings at +0x%02X\n",
+            build, BUF_DATA + (build >= 5455u ? 4u : 0u));
+    return build;
+}
+
+static uint32_t buf_shift(void)
+{
+    static int shift = -1;
+    if (shift < 0)
+        shift = dsound_build() >= 5455u ? 4 : 0;
+    return (uint32_t)shift;
+}
+
+#define SET_DATA       (BUF_DATA + buf_shift())
+#define SET_SIZE       (BUF_SIZE + buf_shift())
+#define SET_PLAY_START (BUF_PLAY_START + buf_shift())
+#define SET_PLAY_LEN   (BUF_PLAY_LEN + buf_shift())
+#define SET_LOOP_START (BUF_LOOP_START + buf_shift())
+#define SET_LOOP_LEN   (BUF_LOOP_LEN + buf_shift())
 
 /* Buffer settings: [iface] = [object + 0x1C]. Voice settings: [object + 0x10],
  * i.e. [iface - 0x0C]. */
@@ -163,6 +278,8 @@ static void reset_output(Buffer *b)
 static void retire(Buffer *b)
 {
     recomp_audio_output_reset_voice(slot_of(b));
+    recomp_audio_output_clear_mix(slot_of(b));
+    recomp_audio_output_route(slot_of(b), 0u);
     memset(b, 0, sizeof *b);
 }
 
@@ -194,6 +311,232 @@ static void prime(Buffer *b, uint32_t rate, uint32_t channels, uint32_t bits,
     /* The buffer's own volume: the voice has one gain, set at each submission. */
     if (recomp_audio_output_submit(slot_of(b), silence, bytes, rate, channels, bits, volume))
         b->primed = 1;
+}
+
+/* ── Envelopes ─────────────────────────────────────────────────── */
+
+static void eg_start(Envelope *e, const uint32_t d[10])
+{
+    memset(e, 0, sizeof *e);
+    e->phase = (d[EGD_MODE] >= 1u && d[EGD_MODE] <= 3u) ? (int)d[EGD_MODE] : EG_OFF;
+    e->level = e->phase == EG_HOLD ? 255.0f : 0.0f;
+}
+
+/* One frame of the envelope: the level it holds through that frame. */
+static void eg_step(Envelope *e, const uint32_t d[10])
+{
+    float sustain = (float)(d[EGD_SUSTAIN] > 255u ? 255u : d[EGD_SUSTAIN]);
+    uint32_t len;
+
+    for (;;) {
+        switch (e->phase) {
+        case EG_DELAY:
+            len = (d[EGD_DELAY] & 0xFFFu) * 16u;
+            if (e->t < len) { e->level = 0.0f; e->t++; return; }
+            e->phase = EG_ATTACK; e->t = 0u;
+            continue;
+        case EG_ATTACK:
+            len = (d[EGD_ATTACK] & 0xFFFu) * 16u;
+            if (e->t < len) { e->level = 255.0f * (float)e->t / (float)len; e->t++; return; }
+            e->phase = EG_HOLD; e->t = 0u;
+            continue;
+        case EG_HOLD:
+            len = (d[EGD_HOLD] & 0xFFFu) * 16u;
+            if (e->t < len) { e->level = 255.0f; e->t++; return; }
+            e->phase = EG_DECAY; e->t = 0u;
+            continue;
+        case EG_DECAY: {
+            uint32_t rate = d[EGD_DECAY] & 0xFFFu;
+            float lvl;
+            if (rate == 0u) { e->phase = EG_SUSTAIN; continue; }
+            lvl = 255.0f * powf(0.99988799f, (float)e->t * 4096.0f / (float)rate);
+            if (lvl <= sustain + 0.2f) { e->phase = EG_SUSTAIN; continue; }
+            e->level = lvl; e->t++;
+            return;
+        }
+        case EG_SUSTAIN:
+            e->level = sustain;
+            return;
+        case EG_RELEASE: {
+            float pos;
+            len = (d[EGD_RELEASE] & 0xFFFu) * 16u;
+            if (len == 0u || e->t >= len) { e->phase = EG_DONE; continue; }
+            pos = (float)e->t / (float)len;
+            e->level = e->from * expf(-6.91f * pos);
+            e->t++;
+            return;
+        }
+        case EG_DONE:
+            e->level = 0.0f;
+            return;
+        default:                     /* EG_OFF: the envelope is not in the path */
+            e->level = 255.0f;
+            return;
+        }
+    }
+}
+
+/* Run the envelope over `frames` sample frames at `rate`. */
+static void eg_advance(Envelope *e, const uint32_t d[10], uint32_t frames, uint32_t rate)
+{
+    e->frac += (double)frames * EG_FRAMES_PER_SECOND / (double)rate;
+    while (e->frac >= 1.0) {
+        e->frac -= 1.0;
+        eg_step(e, d);
+    }
+}
+
+static void eg_release(Envelope *e)
+{
+    if (e->phase == EG_OFF || e->phase == EG_DONE)
+        return;
+    e->from = e->level;
+    e->phase = EG_RELEASE;
+    e->t = 0u;
+}
+
+/* The amplitude envelope applied to the PCM about to be submitted, stepping
+ * through it frame by frame as the hardware does. */
+static void eg_apply(Envelope *e, const uint32_t d[10], uint8_t *pcm, uint32_t bytes,
+                     uint32_t channels, uint32_t bits, uint32_t rate)
+{
+    uint32_t frame = channels * bits / 8u, n = bytes / frame, f, c;
+    double step = (double)EG_FRAMES_PER_SECOND / (double)rate;
+    float gain;
+
+    if (e->level == 0.0f && e->phase == EG_OFF) e->level = 255.0f;
+    gain = e->level / 255.0f;
+    for (f = 0; f < n; f++) {
+        for (c = 0; c < channels; c++) {
+            if (bits == 8u) {
+                uint8_t *x = pcm + f * frame + c;
+                *x = (uint8_t)lrintf(128.0f + ((float)*x - 128.0f) * gain);
+            } else {
+                uint8_t *x = pcm + f * frame + c * 2u;
+                int16_t v = (int16_t)(x[0] | x[1] << 8);
+                v = (int16_t)lrintf((float)v * gain);
+                x[0] = (uint8_t)v; x[1] = (uint8_t)((uint16_t)v >> 8);
+            }
+        }
+        e->frac += step;
+        while (e->frac >= 1.0) {
+            e->frac -= 1.0;
+            eg_step(e, d);
+            gain = e->level / 255.0f;
+        }
+    }
+}
+
+/* ── Notifications ─────────────────────────────────────────────── */
+
+static Notify *notify_find(uint32_t iface)
+{
+    uint32_t i;
+    if (!iface) return NULL;
+    for (i = 0; i < SLOTS; i++)
+        if (g_notify[i].iface == iface)
+            return &g_notify[i];
+    return NULL;
+}
+
+static void notify_signal(uint32_t handle)
+{
+    void *event = handle ? xbox_bridge_resolve_handle(handle) : NULL;
+    if (event)
+        xbox_NtSetEvent(event, NULL);
+}
+
+/* A title's offset as the model counts: ADPCM is clocked in decoded bytes,
+ * and a position inside a block is reached when the block is. */
+static uint32_t notify_model_offset(const Buffer *b, uint32_t offset)
+{
+    if ((b->format & 0xFFFFu) == TAG_ADPCM && b->output) {
+        uint32_t channels = (b->format >> 16) & 0xFFu;
+        return offset / (XBOX_ADPCM_BLOCK_BYTES * channels) *
+               (XBOX_ADPCM_BLOCK_SAMPLES * channels * 2u);
+    }
+    return offset;
+}
+
+/* Every position in [lo, hi] -- part of what the cursor has just played. */
+static void notify_span(const Notify *n, const Buffer *b, uint32_t lo, uint32_t hi)
+{
+    uint32_t k;
+    for (k = 0; k < n->count; k++) {
+        uint32_t at;
+        if (n->offset[k] == NOTIFY_STOP)
+            continue;
+        at = notify_model_offset(b, n->offset[k]);
+        if (at >= lo && at <= hi)
+            notify_signal(n->event[k]);
+    }
+}
+
+static void notify_stopped(Notify *n)
+{
+    uint32_t k;
+    for (k = 0; k < n->count; k++)
+        if (n->offset[k] == NOTIFY_STOP)
+            notify_signal(n->event[k]);
+    n->playing = 0;
+}
+
+/* Where the cursor has got to since the last look: the positions it passed,
+ * and DSBPN_OFFSETSTOP when it ran off the end of a buffer that does not
+ * loop. The title's own stops are told by notify_stop(). */
+static void notify_check(Buffer *b, uint64_t now)
+{
+    Notify *n = notify_find(b->iface);
+    uint32_t cur;
+
+    if (!n || !n->count)
+        return;
+    cur = recomp_dsound_buffer_cursor(&b->model, now);
+    if (!n->playing) {
+        if (b->model.playing) {      /* started by a path that did not say */
+            n->last = cur;
+            n->playing = 1;
+        }
+        return;
+    }
+    if (b->model.playing) {
+        /* What was played since: on from the last position, and over the
+         * wrap to the loop start when it looped. A position is reached when
+         * the cursor gets to it, so the one it started at is not. */
+        if (cur > n->last) {
+            notify_span(n, b, n->last + 1u, cur);
+        } else if (cur < n->last) {
+            notify_span(n, b, n->last + 1u, b->model.size_bytes);
+            notify_span(n, b, b->model.loop_start_bytes, cur);
+        }
+        n->last = cur;
+    } else {
+        /* Played to its end. */
+        notify_span(n, b, n->last + 1u, b->model.size_bytes);
+        notify_stopped(n);
+    }
+}
+
+/* The title started (or moved) the cursor: positions are counted from here. */
+static void notify_start(Buffer *b, uint64_t now)
+{
+    Notify *n = notify_find(b->iface);
+    if (!n) return;
+    n->last = recomp_dsound_buffer_cursor(&b->model, now);
+    n->playing = b->model.playing != 0u;
+}
+
+/* The title stopped it (Stop, StopEx, the end of a release); `stop` says
+ * whether that is a stop DSBPN_OFFSETSTOP is told of, as a pause is not. */
+static void notify_stop(Buffer *b, uint64_t now, int stop)
+{
+    Notify *n = notify_find(b->iface);
+    if (!n || !n->count) return;
+    notify_check(b, now);
+    if (n->playing) {
+        if (stop) notify_stopped(n);
+        else n->playing = 0;
+    }
 }
 
 /* Send the samples the output clock has consumed since the last pump. */
@@ -274,10 +617,77 @@ static void pump(Buffer *b, uint64_t now)
             if (offset == out->size_bytes) offset = out->loop_start_bytes;
         }
     }
-    prime(b, out->sample_rate, channels, bits, (int32_t)setting(b->iface, SET_VOLUME));
-    recomp_audio_output_submit(slot_of(b), pcm, bytes, out->sample_rate,
-                               channels, bits,
-                               (int32_t)setting(b->iface, SET_VOLUME));
+    {
+        int32_t volume = (int32_t)setting(b->iface, SET_VOLUME);
+        RecompAudioMix mix;
+        uint32_t rate = out->sample_rate, route = 0u, played_at = out->sample_rate;
+        uint32_t amp[10], multi[10];
+        int has_amp = hle_ds3d_envelope(b->iface, 0u, amp) && amp[EGD_MODE] != 0u;
+        int has_multi = hle_ds3d_envelope(b->iface, 1u, multi) && multi[EGD_MODE] != 0u;
+        float doppler = 1.0f;
+
+        if (hle_ds3d_mix(b->iface, channels, volume, has_multi, &mix, &route)) {
+            /* Submitted at its own rate; the mix's ratio plays it at the
+             * model's, so a rate change never restarts the host voice. */
+            doppler = mix.ratio;
+            rate = out->original_sample_rate;
+            mix.ratio = (float)out->sample_rate / (float)rate;
+            recomp_audio_output_set_mix(slot_of(b), &mix);
+            recomp_audio_output_route(slot_of(b), route);
+            b->mixed = 1;
+        } else if (b->mixed) {
+            recomp_audio_output_clear_mix(slot_of(b));
+            recomp_audio_output_route(slot_of(b), 0u);
+            b->mixed = 0;
+        }
+        /* The envelopes run on what is played, as it is played. */
+        if (has_amp)
+            eg_apply(&b->eg[0], amp, pcm, bytes, channels, bits, played_at);
+        if (has_multi) {
+            /* The multi envelope bends the pitch by lPitchScale at its peak,
+             * in 32nds of xemu's 1/4096 octave. Its filter half is not run. */
+            eg_advance(&b->eg[1], multi, bytes / (channels * bits / 8u), played_at);
+            doppler *= powf(2.0f, (float)(int8_t)multi[EGD_PITCH] * 32.0f *
+                                  (b->eg[1].level / 255.0f) / 4096.0f);
+        }
+        if (b->releasing == 1 &&
+            (!has_amp || b->eg[0].phase == EG_DONE || b->eg[0].phase == EG_OFF))
+            b->releasing = 2;
+        prime(b, rate, channels, bits, volume);
+        recomp_audio_output_submit(slot_of(b), pcm, bytes, rate, channels, bits, volume);
+        /* The Doppler shift changes how fast the buffer is consumed, as it
+         * does on the console -- from now: after this slice was taken, or
+         * the output clock would step over it. */
+        if (b->mixed) {
+            uint32_t asked = b->asked_rate ? b->asked_rate : b->model.original_sample_rate;
+            uint32_t want = (uint32_t)lrintf((float)asked * doppler);
+            if (want < 1000u) want = 1000u;
+            if (want > 200000u) want = 200000u;
+            if (want != b->model.sample_rate) {
+                (void)recomp_dsound_buffer_set_frequency(&b->model, want, now);
+                (void)recomp_dsound_buffer_set_frequency(&b->output_model, want, now);
+            }
+        }
+        /* The release has run out: the buffer stops, as the hardware stops
+         * the voice. */
+        if (b->releasing == 2) {
+            b->releasing = 0;
+            notify_stop(b, now, 1);
+            recomp_dsound_buffer_stop(&b->model, now);
+            recomp_dsound_buffer_stop(&b->output_model, now);
+        }
+    }
+}
+
+/* Play from stopped: the voice starts again, and so do its envelopes. */
+static void envelopes_start(Buffer *b)
+{
+    uint32_t d[10], k;
+    for (k = 0; k < 2u; k++) {
+        if (hle_ds3d_envelope(b->iface, k, d)) eg_start(&b->eg[k], d);
+        else memset(&b->eg[k], 0, sizeof b->eg[k]);
+    }
+    b->releasing = 0;
 }
 
 static Buffer *find(uint32_t iface)
@@ -447,6 +857,48 @@ static void resync_output(Buffer *b, int continuing)
  * behaviour. */
 void hle_dsound_stream_service(uint64_t now);   /* hle_dsound_stream.c */
 
+/* Mix-in buffers (DSBCAPS_MIXIN): each is a submix on the host, placed by
+ * its own mix bins, 3D position and volume as any voice is, and what the
+ * title routed into it with SetOutputBuffer plays through it. Refreshed
+ * every 20 ms, and only told the host when something changed. */
+static void mixins_service(uint64_t now)
+{
+    static uint64_t last;
+    static struct { uint32_t key, channels; int32_t volume; RecompAudioMix mix; } told[32];
+    uint32_t keys[32], n, i, k;
+
+    if (now - last < 20u)
+        return;
+    last = now;
+    n = hle_ds3d_mixins(keys, 32u);
+    for (i = 0; i < n; i++) {
+        uint32_t format = setting(keys[i], SET_FORMAT);
+        uint32_t channels = (format >> 16) & 0xFFu, route;
+        int32_t volume = (int32_t)setting(keys[i], SET_VOLUME);
+        RecompAudioMix mix;
+        if (channels < 1u || channels > 2u) channels = 2u;
+        if (!hle_ds3d_mix(keys[i], channels, volume, 1, &mix, &route))
+            continue;
+        for (k = 0; k < 32u; k++)
+            if (told[k].key == keys[i]) break;
+        if (k < 32u && told[k].channels == channels && told[k].volume == volume &&
+            memcmp(&told[k].mix, &mix, sizeof mix) == 0)
+            continue;
+        if (k == 32u)
+            for (k = 0; k < 32u; k++)
+                if (!told[k].key) break;
+        if (k < 32u) {
+            told[k].key = keys[i];
+            told[k].channels = channels;
+            told[k].volume = volume;
+            told[k].mix = mix;
+        }
+        lock();
+        recomp_audio_output_set_submix(keys[i], channels, &mix, volume);
+        unlock();
+    }
+}
+
 static DWORD WINAPI service_thread(LPVOID param)
 {
     host_timer *timer = host_timer_create(HOST_TIMER_ANY);
@@ -462,9 +914,13 @@ static DWORD WINAPI service_thread(LPVOID param)
             Buffer *b = &g_buffers[i];
             if (b->iface && b->output && b->output_model.playing)
                 pump(b, now);
+            if (b->iface)
+                notify_check(b, now);
         }
         unlock();
         hle_dsound_stream_service(now);
+        hle_ds3d_service();
+        mixins_service(now);
 
         next += (int64_t)SERVICE_PERIOD_US * 1000;
         if (host_time_ns() - next > 100000000)   /* 100 ms behind: do not catch up */
@@ -656,10 +1112,16 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
     recomp_dsound_buffer_cursor(&b->model, now);
     continuing = b->model.playing && b->output_model.playing &&
                  !(flags & RECOMP_DSOUND_PLAY_FROMSTART);
+    if (!continuing)
+        notify_check(b, now);
     result = recomp_dsound_buffer_play(&b->model, flags, now);
     if (result == RECOMP_DSOUND_OK) {
         b->paused = 0;
         resync_output(b, continuing);
+        if (!continuing) {
+            envelopes_start(b);
+            notify_start(b, now);
+        }
     }
     unlock();
     HLE_RETURN(result);
@@ -674,9 +1136,54 @@ static void stop(uint32_t iface)
     b = find(iface);
     if (b) {
         pump(b, now);
+        notify_stop(b, now, 1);
         recomp_dsound_buffer_stop(&b->model, now);
         b->paused = 0;
+        b->releasing = 0;
         resync_output(b, 0);
+    }
+    unlock();
+}
+
+/* StopEx's flags. DSBSTOPEX_ENVELOPE runs the envelopes' release, and the
+ * buffer stops when the amplitude envelope's has run out (at once if it has
+ * none). DSBSTOPEX_RELEASEWAVEFORM lets a looping buffer play on past its
+ * loop to its end. Neither: an immediate stop. The time stamp is not
+ * honoured: a scheduled stop is taken now. */
+static void stop_ex(uint32_t iface, uint32_t flags)
+{
+    uint64_t now = now_ms();
+    uint32_t amp[10];
+    Buffer *b;
+
+    if (!(flags & (STOPEX_ENVELOPE | STOPEX_RELEASEWAVEFORM))) {
+        stop(iface);
+        return;
+    }
+    lock();
+    b = find(iface);
+    if (b && b->model.playing) {
+        pump(b, now);
+        if (flags & STOPEX_RELEASEWAVEFORM) {
+            b->model.play_flags &= ~RECOMP_DSOUND_PLAY_LOOPING;
+            b->output_model.play_flags &= ~RECOMP_DSOUND_PLAY_LOOPING;
+        }
+        if (flags & STOPEX_ENVELOPE) {
+            if (hle_ds3d_envelope(iface, 0u, amp) && amp[EGD_MODE] != 0u &&
+                (amp[EGD_RELEASE] & 0xFFFu) != 0u && b->output) {
+                eg_release(&b->eg[0]);
+                eg_release(&b->eg[1]);
+                b->releasing = 1;
+            } else if (!(flags & STOPEX_RELEASEWAVEFORM)) {
+                unlock();
+                stop(iface);
+                return;
+            }
+        }
+    } else if (b) {
+        unlock();
+        stop(iface);
+        return;
     }
     unlock();
 }
@@ -695,7 +1202,7 @@ HLE_EXPORT(IDirectSoundBuffer_Stop)
 HLE_EXPORT(IDirectSoundBuffer_StopEx)
 {
     g_ds_calls[DS_CALL_BUF_STOPEX]++;
-    stop(HLE_ARG(0));
+    stop_ex(HLE_ARG(0), HLE_ARG(3));
     HLE_RETURN(HLE_ARG(0) ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
 }
 
@@ -741,8 +1248,83 @@ HLE_EXPORT(CDirectSoundBuffer_StopEx)
 {
     uint32_t iface = DS_BUFFER_FROM_OBJECT(HLE_ARG(0));
     g_ds_calls[DS_CALL_BUF_STOPEX]++;
-    stop(iface);
+    stop_ex(iface, HLE_ARG(3));
     HLE_RETURN(iface ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
+}
+
+/* HRESULT IDirectSoundBuffer_SetNotificationPositions(this, DWORD count,
+ * LPCDSBPOSITIONNOTIFY notifies): { dwOffset, hEventNotify } pairs, a new
+ * set replacing the old. The title's own body runs too, to keep the XDK's
+ * view of the buffer; the events are signalled from here, by the service
+ * thread, as the cursor the title is told passes each offset. */
+static uint32_t set_notifications(uint32_t iface, uint32_t count, uint32_t pairs)
+{
+    Notify *n;
+    uint32_t i, k;
+
+    if (!iface)
+        return RECOMP_DSOUND_POINTER_ERROR;
+    if (count > MAX_NOTIFY) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[DSOUND] buffer %08X asks for %u notification positions; "
+                    "the first %u are kept\n", iface, count, MAX_NOTIFY);
+        count = MAX_NOTIFY;
+    }
+    if (count && (!pairs || !guest_readable(pairs, count * 8u)))
+        return RECOMP_DSOUND_INVALID_PARAM;
+    lock();
+    n = notify_find(iface);
+    for (i = 0; !n && i < SLOTS; i++)
+        if (!g_notify[i].iface) n = &g_notify[i];
+    if (!n) {
+        /* The table is full: drop a set nothing plays any more. */
+        for (i = 0; !n && i < SLOTS; i++)
+            if (!find(g_notify[i].iface)) n = &g_notify[i];
+    }
+    if (n) {
+        Buffer *b = find(iface);
+        memset(n, 0, sizeof *n);
+        n->iface = iface;
+        n->count = count;
+        for (k = 0; k < count; k++) {
+            n->offset[k] = HLE_MEM32(pairs + k * 8u);
+            n->event[k] = HLE_MEM32(pairs + k * 8u + 4u);
+        }
+        if (b) notify_start(b, now_ms());
+        {
+            static int said;
+            if (said < 8) {
+                said++;
+                fprintf(stderr, "[DSOUND] buffer %08X: %u notification positions%s\n",
+                        iface, count, count && n->offset[0] == NOTIFY_STOP ? " (stop)" : "");
+            }
+        }
+    }
+    unlock();
+    return RECOMP_DSOUND_OK;
+}
+
+HLE_ORIGINAL(IDirectSoundBuffer_SetNotificationPositions);
+HLE_EXPORT(IDirectSoundBuffer_SetNotificationPositions)
+{
+    uint32_t iface = HLE_ARG(0), count = HLE_ARG(1), pairs = HLE_ARG(2);
+    uint32_t result = set_notifications(iface, count, pairs);
+    if (result == RECOMP_DSOUND_OK && hle_original_IDirectSoundBuffer_SetNotificationPositions)
+        HLE_CALL_ORIGINAL(IDirectSoundBuffer_SetNotificationPositions);
+    else
+        g_eax = result;
+}
+
+HLE_ORIGINAL(CDirectSoundBuffer_SetNotificationPositions);
+HLE_EXPORT(CDirectSoundBuffer_SetNotificationPositions)
+{
+    uint32_t iface = DS_BUFFER_FROM_OBJECT(HLE_ARG(0)), count = HLE_ARG(1), pairs = HLE_ARG(2);
+    uint32_t result = set_notifications(iface, count, pairs);
+    if (result == RECOMP_DSOUND_OK && hle_original_CDirectSoundBuffer_SetNotificationPositions)
+        HLE_CALL_ORIGINAL(CDirectSoundBuffer_SetNotificationPositions);
+    else
+        g_eax = result;
 }
 
 /* DSBPAUSE_RESUME, DSBPAUSE_PAUSE, DSBPAUSE_SYNCHPLAYBACK. */
@@ -776,12 +1358,15 @@ static uint32_t pause_buffer(uint32_t iface, uint32_t how)
             if (b->paused) {
                 b->paused = 0;
                 if (recomp_dsound_buffer_play(&b->model, b->paused_flags, now)
-                        == RECOMP_DSOUND_OK)
+                        == RECOMP_DSOUND_OK) {
                     resync_output(b, 0);
+                    notify_start(b, now);
+                }
             }
         } else if (b->model.playing) {
             b->paused = 1;
             b->paused_flags = b->model.play_flags & RECOMP_DSOUND_PLAY_LOOPING;
+            notify_stop(b, now, 0);
             recomp_dsound_buffer_stop(&b->model, now);
             resync_output(b, 0);
         }
@@ -848,6 +1433,25 @@ HLE_EXPORT(IDirectSoundBuffer_GetCurrentPosition)
         if ((b->format & 0xFFFFu) == TAG_ADPCM && b->output)
             cursor = cursor / (XBOX_ADPCM_BLOCK_SAMPLES * b->model.block_align) *
                      (XBOX_ADPCM_BLOCK_BYTES * b->model.block_align / 2u);
+        /* RECOMP_DSOUND_CURSOR_TRACE=1: what a title polling for its clock
+         * sees, once a second per buffer. A movie paced by its sound stops
+         * dead when this stops moving. */
+        {
+            static int trace = -1;
+            if (trace < 0)
+                trace = xbox_EnvSwitch("RECOMP_DSOUND_CURSOR_TRACE", 0);
+            if (trace && now - b->cursor_trace_ms >= 1000u) {
+                b->cursor_trace_ms = now;
+                fprintf(stderr, "[DSOUND] cursor %08X (slot %d): %u of %u, %s%s, %u Hz;"
+                        " play region %u+%u, loop region %u+%u\n",
+                        iface, slot_of(b), cursor, b->size,
+                        b->model.playing ? "playing" : "stopped",
+                        (b->model.play_flags & RECOMP_DSOUND_PLAY_LOOPING) ? " looping" : "",
+                        b->model.sample_rate,
+                        setting(iface, SET_PLAY_START), setting(iface, SET_PLAY_LEN),
+                        setting(iface, SET_LOOP_START), setting(iface, SET_LOOP_LEN));
+            }
+        }
     }
     unlock();
     for (i = 1u; i <= 2u; i++) {
@@ -878,20 +1482,48 @@ HLE_EXPORT(IDirectSoundBuffer_SetCurrentPosition)
                 position = position / block * XBOX_ADPCM_BLOCK_SAMPLES *
                            b->model.block_align;
         }
-        if (result == RECOMP_DSOUND_OK)
+        if (result == RECOMP_DSOUND_OK) {
+            notify_check(b, now);
             result = recomp_dsound_buffer_set_position(&b->model, position, now);
-        if (result == RECOMP_DSOUND_OK)
+        }
+        if (result == RECOMP_DSOUND_OK) {
             resync_output(b, 0);
+            notify_start(b, now);
+        }
     }
     unlock();
     HLE_RETURN(result);
 }
 
+static uint32_t set_rate(uint32_t iface, uint32_t frequency);
+
 /* HRESULT IDirectSoundBuffer_SetFrequency(this, DWORD frequency); 0 = default */
 HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
 {
     g_ds_calls[DS_CALL_BUF_SETFREQUENCY]++;
-    uint32_t iface = HLE_ARG(0), frequency = HLE_ARG(1), result = RECOMP_DSOUND_OK;
+    HLE_RETURN(set_rate(HLE_ARG(0), HLE_ARG(1)));
+}
+
+/* HRESULT IDirectSoundBuffer_SetPitch(this, LONG pitch): the same, in the
+ * Xbox's pitch units (1/4096 octave from 48 kHz). MK Shaolin Monks calls it
+ * from 14 places and SetFrequency from 2; until this was replaced, every one
+ * of its pitch changes went unheard. The title's own body runs first, so its
+ * settings stay as the XDK keeps them (the chip part is CMcpxVoiceClient_SetPitch,
+ * replaced below). */
+HLE_ORIGINAL(IDirectSoundBuffer_SetPitch);
+HLE_EXPORT(IDirectSoundBuffer_SetPitch)
+{
+    uint32_t iface = HLE_ARG(0);
+    int32_t pitch = (int32_t)HLE_ARG(1);
+
+    if (hle_original_IDirectSoundBuffer_SetPitch)
+        HLE_CALL_ORIGINAL(IDirectSoundBuffer_SetPitch);
+    HLE_RETURN(set_rate(iface, hle_ds3d_pitch_to_frequency(pitch)));
+}
+
+static uint32_t set_rate(uint32_t iface, uint32_t frequency)
+{
+    uint32_t result = RECOMP_DSOUND_OK;
     uint64_t now = now_ms();
     Buffer *b;
 
@@ -906,12 +1538,13 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
     if (b) {
         uint32_t before = b->model.sample_rate;
         pump(b, now);
+        b->asked_rate = frequency;
         result = recomp_dsound_buffer_set_frequency(&b->model, frequency, now);
         if (result == RECOMP_DSOUND_OK && b->model.sample_rate != before)
             (void)recomp_dsound_buffer_set_frequency(&b->output_model, frequency, now);
     }
     unlock();
-    HLE_RETURN(result);
+    return result;
 }
 
 /* Whether the buffer's settings are in the layout this file reads: a rate
