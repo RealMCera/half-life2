@@ -55,6 +55,7 @@ IDirect3DDevice8 *hle_d3d8_shadow_device(void);
 unsigned long hle_d3d8_shadow_swaps(void);
 /* Whether these texels are the frame buffer's -- see hle_d3d8.c. */
 int hle_d3d8_is_framebuffer(uint32_t phys);
+int hle_d3d8_is_device_depth(uint32_t phys, uint32_t size);
 /* From hle_d3d8.c: where the texels of the texture bound to a stage live, so
  * a draw can tell whether it samples the playing movie. */
 void hle_d3d8_note_stage_texels(uint32_t stage, uint32_t phys);
@@ -68,6 +69,8 @@ int hle_d3d8_trace_on(void);
 #define FORMAT_CUBEMAP       0x00000004u
 #define XFMT_P8              0x0B
 #define TEXTURE_CACHE        512
+#define FB_SCREEN            1
+#define FB_DEPTH             2
 #define MAX_STAGES           4
 
 typedef struct {
@@ -84,10 +87,12 @@ typedef struct {
      * the content -- the guest's bytes are not, since nothing on the guest
      * side draws them, so it is never re-uploaded. */
     int                rendered;
-    /* The texels are the frame buffer's, so the content comes from the
-     * host's frame, refreshed when it is bound after the screen changed. */
+    /* The texels are the frame buffer's (FB_SCREEN) or the device depth's
+     * (FB_DEPTH), so the content comes from the host's frame or its depth,
+     * refreshed when it is bound after the screen changed. */
     int                framebuffer;
     unsigned long      screen_copied;   /* hle_d3d8_screen_changes() at the copy */
+    unsigned long      drawn_swap;      /* a rendered surface: last made the target */
     /* P8: the host texture holds the texels expanded through a palette, and
      * this is the checksum of that palette (0: not known, bake again). */
     int                p8;
@@ -101,6 +106,10 @@ typedef struct {
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
+/* The Size word of what each stage last had bound: the image rectangle and
+ * pitch the hardware keeps when SwitchTexture changes only the offset and
+ * format (hle_d3d8_texture_by_state). */
+static uint32_t g_stage_size[MAX_STAGES];
 static texture_entry *g_bound_entry[MAX_STAGES];
 
 /* Each stage's palette: where the guest keeps it (physical, 0 for none) and
@@ -149,23 +158,26 @@ static uint32_t level_rows(uint32_t fmt, uint32_t h)
  * their Format word carries every dimension, where a linear one needs the
  * object's Size. */
 #define SYNTH_MAX 4096
-static struct { uint32_t data, format; } g_synth[SYNTH_MAX];
+static struct { uint32_t data, format, size; } g_synth[SYNTH_MAX];
 static int g_synth_count, g_synth_next;
 
 static int is_synth(uint32_t va) { return (va & 1u) != 0u; }
 
-static uint32_t synth_key(uint32_t data, uint32_t format)
+/* `size` is a linear texture's Size word, which its Format does not carry:
+ * 0 for the swizzled and compressed ones. */
+static uint32_t synth_key_sized(uint32_t data, uint32_t format, uint32_t size)
 {
     /* A direct-mapped memo in front of the scan: a title switches between
      * the same few hundred textures thousands of times a frame. */
     static int memo[1024];
-    uint32_t h = ((data >> 7) ^ (data >> 17) ^ (format * 0x9E3779B1u)) & 1023u;
+    uint32_t h = ((data >> 7) ^ (data >> 17) ^ (format * 0x9E3779B1u) ^ (size * 0x85EBCA6Bu)) & 1023u;
     int i = memo[h] - 1;
 
-    if (i >= 0 && i < g_synth_count && g_synth[i].data == data && g_synth[i].format == format)
+    if (i >= 0 && i < g_synth_count && g_synth[i].data == data && g_synth[i].format == format &&
+        g_synth[i].size == size)
         return ((uint32_t)(i + 1) << 4) | 1u;
     for (i = 0; i < g_synth_count; i++)
-        if (g_synth[i].data == data && g_synth[i].format == format) {
+        if (g_synth[i].data == data && g_synth[i].format == format && g_synth[i].size == size) {
             memo[h] = i + 1;
             return ((uint32_t)(i + 1) << 4) | 1u;
         }
@@ -177,8 +189,14 @@ static uint32_t synth_key(uint32_t data, uint32_t format)
     }
     g_synth[i].data = data;
     g_synth[i].format = format;
+    g_synth[i].size = size;
     memo[h] = i + 1;
     return ((uint32_t)(i + 1) << 4) | 1u;
+}
+
+static uint32_t synth_key(uint32_t data, uint32_t format)
+{
+    return synth_key_sized(data, format, 0u);
 }
 
 /* A field of a texture object: Common (+0), Data (+4), Format (+12) or
@@ -193,6 +211,7 @@ static uint32_t obj_field(uint32_t va, uint32_t off)
         case 0:  return COMMON_TYPE_TEXTURE | 1u;
         case 4:  return g_synth[i].data;
         case 12: return g_synth[i].format;
+        case 16: return g_synth[i].size;
         default: return 0;
         }
     }
@@ -716,7 +735,7 @@ static void framebuffer_probe(texture_entry *e, unsigned long now)
 }
 
 static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va,
-                                              const texture_layout *t)
+                                              const texture_layout *t, int source)
 {
     unsigned long now = hle_d3d8_shadow_swaps();
     uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
@@ -725,7 +744,7 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
 
     for (i = 0; i < g_texture_count; i++) {
         texture_entry *c = &g_textures[i];
-        if (c->host && c->va == va && c->framebuffer) {
+        if (c->host && c->va == va && c->framebuffer == source) {
             e = c;
             break;
         }
@@ -743,10 +762,11 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
         }
         e->va = va;
         e->rendered = 1;
-        e->framebuffer = 1;
-        fprintf(stderr, "[HLE-D3D8] the title binds its own frame as a texture "
+        e->framebuffer = source;
+        fprintf(stderr, "[HLE-D3D8] the title binds its own %s as a texture "
                 "0x%08X (%ux%u, format 0x%02X, data 0x%08X); filling it from the "
-                "host's frame\n", va, t->width, t->height, t->fmt, data);
+                "host's\n", source == FB_DEPTH ? "depth buffer" : "frame", va,
+                t->width, t->height, t->fmt, data);
         fflush(stderr);
     }
     e->data = data;
@@ -767,8 +787,12 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
         if (e->checked_swap != now || e->screen_copied != changes) {
             e->checked_swap = now;
             e->screen_copied = changes;
-            host_CopyBackBufferToTexture(e->host);
-            framebuffer_probe(e, now);
+            if (source == FB_DEPTH) {
+                host_CopyDepthToTexture(e->host);
+            } else {
+                host_CopyBackBufferToTexture(e->host);
+                framebuffer_probe(e, now);
+            }
         }
     }
     return e->host;
@@ -776,6 +800,10 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
 
 static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
                                                unsigned long now);
+static int rendered_surface_recent(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now);
+static void rendered_surface_drawn(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now);
 
 /* Whether a texture over frame-buffer memory can be the title reading its
  * screen. A frame buffer is linear and uncompressed, so a swizzled or DXT
@@ -805,17 +833,53 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
      * the downsample. A match needs this exact memory, format and size drawn
      * into as an offscreen surface, which a title reading its real frame
      * (Future Perfect, XGRA) never does. */
-    {
+    /* Unless that was long ago and the memory is a frame buffer: then it is
+     * the screen again. Rainbow Six 3's loading thread draws into its front
+     * buffer as a bare surface; in the level the same memory is the frame on
+     * screen, sampled by the night and thermal vision for their trail, and
+     * the stale loading screen the surface still held was laid over the
+     * view. */
+    if (!(hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) &&
+          !rendered_surface_recent(data, format, size, now))) {
         IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
         if (rs)
             return rs;
+    }
+    /* A colour texture over the device's depth buffer: the title reading
+     * its depth's bytes as colour. Rainbow Six 3's post-process weights its
+     * blur and glow by the depth's top byte this way. The depth is the
+     * host's and was never in guest memory, so those texels were whatever
+     * the memory last held -- a ghost of an old frame over every view, and
+     * the glow cut off straight across the screen -- and they are now the
+     * host's depth in the Z24S8 byte layout, copied when the screen has
+     * changed since (RECOMP_HLE_D3D8_DEPTH_COLOUR=guest: the memory). */
+    {
+        static int mode = -1;
+        if (mode < 0) {
+            const char *e = getenv("RECOMP_HLE_D3D8_DEPTH_COLOUR");
+            mode = e && strcmp(e, "guest") == 0 ? 0 : 1;
+        }
+        /* Not a texture the title has drawn into: that is a picture of its
+         * own, whatever memory it sits in. */
+        if (mode == 1 && hle_d3d8_is_device_depth(data & 0x0FFFFFFFu, size) &&
+            read_layout(va, &t) && can_be_screen(&t) && !d3d8_format_is_depth((D3DFORMAT)t.fmt)) {
+            int drawn = 0;
+            for (i = 0; i < g_texture_count && !drawn; i++)
+                drawn = g_textures[i].host && g_textures[i].va == va && g_textures[i].rendered &&
+                        !g_textures[i].framebuffer;
+            if (!drawn) {
+                IDirect3DTexture8 *dt = framebuffer_texture(dev, va, &t, FB_DEPTH);
+                if (dt)
+                    return dt;
+            }
+        }
     }
     /* Before the ordinary lookup, because these are not identified by
      * their texels -- they have none of their own -- and because they
      * must be refreshed every frame, which a cache hit would skip. */
     if (hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) && read_layout(va, &t) &&
         can_be_screen(&t)) {
-        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
+        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t, FB_SCREEN);
         if (fb)
             return fb;
     }
@@ -891,7 +955,7 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
      * the guest side, so they are zeros; the host's frame goes in instead, and
      * the entry is marked so the zeros never overwrite it. */
     if (hle_d3d8_is_framebuffer(t.phys) && can_be_screen(&t)) {
-        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
+        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t, FB_SCREEN);
         if (fb)
             return fb;
     }
@@ -1553,8 +1617,10 @@ IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surfa
     uint32_t size = HLE_MEM32(surface + 16);
     IDirect3DTexture8 *have = rendered_surface_for(data, format, size, now);
 
-    if (have)
+    if (have) {
+        rendered_surface_drawn(data, format, size, now);
         return have;
+    }
     if (!read_layout(surface, &t))
         return NULL;
     e = cache_slot(dev, now);
@@ -1572,11 +1638,41 @@ IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surfa
     e->format = format;
     e->size = size;
     e->rendered = 1;
-    e->checked_swap = e->used_swap = now;
+    e->checked_swap = e->used_swap = e->drawn_swap = now;
     fprintf(stderr, "[HLE-D3D8] shadow render target surface 0x%08X: format 0x%02X %ux%u "
             "at 0x%08X, sampled by any texture over that memory\n",
             surface, t.fmt, t.width, t.height, data);
     return e->host;
+}
+
+/* hle_d3d8_render_surface made that surface the target again. */
+static void rendered_surface_drawn(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size))
+            c->drawn_swap = now;
+    }
+}
+
+/* Whether the rendered surface over this memory has been drawn into lately:
+ * within the last two Swaps. */
+static int rendered_surface_recent(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size))
+            return now - c->drawn_swap <= 2u;
+    }
+    return 0;
 }
 
 /* The host render target a texture's memory was drawn into as a bare
@@ -1773,6 +1869,40 @@ void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format)
                 break;
             }
         }
+        /* A linear texture's size is not in its Format: the hardware keeps
+         * the stage's image rectangle and pitch from what it had bound, and
+         * only the offset changes. What decides how the memory is read is the
+         * pitch, so the texture the offset names is one over that memory with
+         * the stage's pitch, at its own size (a smaller target reads the same
+         * rows), or failing any, the stage's size itself. Rainbow Six 3's
+         * thermal and night vision copy the screen into a 640x480 surface and
+         * SwitchTexture its offset into a stage that had the 640x480 back
+         * buffer; a 320x240 texture over the same memory (another pitch) was
+         * taken instead, held last frame's blur, and the vision came out one
+         * flat colour. Its next pass switches to a 640x240 target with the
+         * same pitch, which must be read as itself. */
+        if (d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) && g_stage_size[stage]) {
+            uint32_t want = g_stage_size[stage], pitch = want >> 24;
+            uint32_t same = 0;
+
+            if (va && (HLE_MEM32(va + 16) >> 24) != pitch)
+                va = 0;
+            for (i = 0; !va && i < g_texture_count; i++) {
+                texture_entry *c = &g_textures[i];
+                if (c->host && c->va && !is_synth(c->va) && c->data == data &&
+                    c->format == format && (c->size >> 24) == pitch &&
+                    HLE_MEM32(c->va + 4) == data && HLE_MEM32(c->va + 12) == format)
+                    va = c->va;
+            }
+            for (i = 0; !va && !same && i < g_texture_count; i++) {
+                texture_entry *c = &g_textures[i];
+                if (c->host && c->rendered && c->va == 0 && c->data == data &&
+                    (c->size >> 24) == pitch)
+                    same = c->size;
+            }
+            if (!va)
+                va = synth_key_sized(data, format, same ? same : want);
+        }
         /* Not one SetTexture has bound: a swizzled or compressed texture is
          * described completely by its Format, so it is mirrored from that. */
         if (!va && !d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) &&
@@ -1805,6 +1935,8 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
 
         if (!dev || stage >= MAX_STAGES)
             return;
+        if (texture && obj_field(texture, 16))
+            g_stage_size[stage] = obj_field(texture, 16);
         if (texture) {
             /* A cube the title rendered into is bound as itself, and one it
              * filled from memory as a copy of those bytes (static_cube). */
@@ -1845,7 +1977,7 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
             int i;
             g_stage0_framebuffer = 0;
             for (i = 0; host && i < g_texture_count; i++)
-                if (g_textures[i].host == host && g_textures[i].framebuffer) {
+                if (g_textures[i].host == host && g_textures[i].framebuffer == FB_SCREEN) {
                     g_stage0_framebuffer = 1;
                     break;
                 }

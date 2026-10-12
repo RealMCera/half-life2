@@ -146,6 +146,8 @@ static unsigned long      g_push_count, g_push_draws, g_push_other, g_push_nostr
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
 static int                g_target_is_screen = 1;   /* the bound target is the screen */
 static unsigned long      g_screen_changes;          /* draws and clears that reached it */
+static int                g_cpu_bb_locked;           /* the title locked the back buffer */
+static void cpu_frame_underlay(void);
 static HWND               g_shadow_hwnd;
 static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
@@ -672,6 +674,17 @@ static void note_framebuffer_phys(uint32_t data)
                 " whose texels live there is the title reading its own screen\n", phys);
         fflush(stderr);
     }
+}
+
+/* Whether this physical memory, with these dimensions (a pixel container's
+ * Size word; only the width and height are compared), is the device's own
+ * depth buffer, whole. Rainbow Six 3 also renders a 640x240 blur level into
+ * that memory once the depth has been read: that is a picture of its own. */
+int hle_d3d8_is_device_depth(uint32_t phys, uint32_t size)
+{
+    return g_autodepth_va && phys &&
+           (HLE_MEM32(g_autodepth_va + 4) & 0x0FFFFFFFu) == (phys & 0x0FFFFFFFu) &&
+           (HLE_MEM32(g_autodepth_va + 16) & 0x00FFFFFFu) == (size & 0x00FFFFFFu);
 }
 
 int hle_d3d8_is_framebuffer(uint32_t phys)
@@ -1477,6 +1490,8 @@ static unsigned long g_draws_overread;
 
 static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
+    if (g_cpu_bb_locked)
+        cpu_frame_underlay();
     g_ff_active = 0;
     g_draw_overread = 0;
     if (g_target_shadow_map) {
@@ -1885,6 +1900,7 @@ HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetScissors);
 HLE_ORIGINAL(D3DDevice_CopyRects);
 HLE_ORIGINAL(D3DDevice_GetBackBuffer2);
+HLE_ORIGINAL(D3DSurface_LockRect);
 /* The dispatch table, for calling a title's callback. */
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
@@ -2203,6 +2219,10 @@ HLE_EXPORT(Direct3D_CreateDevice)
          * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
          * decides what a Swap means (frame_end_shadow). */
         g_swap_effect = HLE_MEM32(pp_va + 0x14);
+        /* The flip that would have waited for it is on a GPU that is not
+         * there; the flip gate keeps the title's cadence instead. */
+        if ((int32_t)g_eax >= 0)
+            xbox_Nv2aFlipGateSetTitleInterval(HLE_MEM32(pp_va + 0x30));
         fprintf(stderr, "[HLE-D3D8] CreateDevice: %ux%u format 0x%02X, %u back buffer(s), "
                 "swap effect %u (1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
                 "refresh %u Hz, presentation interval 0x%08X -> 0x%08X\n",
@@ -2262,8 +2282,10 @@ HLE_EXPORT(D3DDevice_Clear)
                 done += n;
             }
         }
-        if (g_target_is_screen)
+        if (g_target_is_screen) {
             g_screen_changes++;
+            g_cpu_bb_locked = 0;    /* cleared over what the CPU wrote */
+        }
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())
@@ -2467,6 +2489,177 @@ int hle_d3d8_movie_layer_shown(void)
     return g_movie_drawn;
 }
 
+/* A frame the title wrote into the back buffer with the CPU.
+ *
+ * The host draws what the title asks the GPU to draw, and nothing writes the
+ * result back to guest memory, so a picture the CPU puts straight into the
+ * back buffer is never shown. Rainbow Six 3 does exactly that: its splash
+ * screen and every Bink movie are copied into the locked back buffer, the
+ * intro with no draw into the screen at all and the main menu's background
+ * with the menu drawn over it, and the window showed black (or the menu over
+ * black) while guest memory held the movie.
+ *
+ * Two ways in. A D3DSurface_LockRect of the back buffer (below) marks it
+ * written: the next host draw into the screen first lays guest memory down
+ * under it (a Clear in between wins, as it would on the console), and a Swap
+ * with no draw since shows it. Without a lock, a Swap with no host draw or
+ * clear into the screen since the last one looks at the back buffer's memory:
+ * if it has changed and is not empty, the CPU wrote it, and it is shown until
+ * the title draws into the screen again. A title that draws normally and never
+ * locks its back buffer never reaches either. RECOMP_CPU_FRAME=0 turns both
+ * off. Linear 32-bit and R5G6B5 back buffers only; the picture goes through
+ * the movie layer (d3d8_movie.c). */
+static uint32_t g_cpu_frame_surface;    /* the back buffer at this Swap */
+static unsigned long g_cpu_frame_changes = (unsigned long)-1;
+static uint32_t g_cpu_frame_hash;
+static int g_cpu_frame_live;
+static int g_cpu_frame_logged;
+
+static int cpu_frame_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+        enabled = xbox_EnvSwitch("RECOMP_CPU_FRAME", 1);
+    return enabled;
+}
+
+static void cpu_frame_note(uint32_t surface)
+{
+    g_cpu_frame_surface = surface;
+}
+
+/* The surface's picture, if it is one this can read: its pixels, size and
+ * bytes per pixel. */
+static const uint8_t *cpu_frame_pixels(uint32_t surface, uint32_t *w, uint32_t *h,
+                                       uint32_t *pitch, uint32_t *bpp, uint32_t *data)
+{
+    uint32_t format, size, fmt;
+
+    if (!surface)
+        return NULL;
+    *data = HLE_MEM32(surface + 4);
+    format = HLE_MEM32(surface + 12);
+    size = HLE_MEM32(surface + 16);
+    fmt = (format >> 8) & 0xFFu;
+    *bpp = (fmt == 0x12u || fmt == 0x1Eu) ? 4u : fmt == 0x11u ? 2u : 0u;
+    *w = (size & 0xFFFu) + 1u;
+    *h = ((size >> 12) & 0xFFFu) + 1u;
+    *pitch = (((size >> 24) & 0xFFu) + 1u) * 64u;
+    if (!size || !*data || !*bpp || *pitch < *w * *bpp ||
+        (uint64_t)(*data & 0x03FFFFFFu) + (uint64_t)*pitch * *h > 0x04000000u)
+        return NULL;
+    return (const uint8_t *)HLE_PTR(0x80000000u | (*data & 0x0FFFFFFFu));
+}
+
+/* Hands the surface's picture to the movie layer. 1 if it did. */
+static int cpu_frame_upload(uint32_t surface, const char *how)
+{
+    static uint8_t *bgra;
+    static size_t cap;
+    uint32_t w, h, pitch, bpp, data, x, y;
+    const uint8_t *src = cpu_frame_pixels(surface, &w, &h, &pitch, &bpp, &data);
+
+    if (!src)
+        return 0;
+    if ((size_t)w * h * 4u > cap) {
+        free(bgra);
+        cap = (size_t)w * h * 4u;
+        bgra = (uint8_t *)malloc(cap);
+        if (!bgra) {
+            cap = 0;
+            return 0;
+        }
+    }
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = src + (size_t)y * pitch;
+        uint8_t *out = bgra + (size_t)y * w * 4u;
+
+        if (bpp == 4u) {
+            memcpy(out, row, (size_t)w * 4u);
+            for (x = 0; x < w; x++)
+                out[x * 4u + 3u] = 0xFF;
+            continue;
+        }
+        for (x = 0; x < w; x++) {               /* R5G6B5 */
+            uint32_t p = row[x * 2u] | (uint32_t)row[x * 2u + 1u] << 8;
+            out[x * 4u + 0u] = (uint8_t)(((p & 0x1Fu) * 527u + 23u) >> 6);
+            out[x * 4u + 1u] = (uint8_t)((((p >> 5) & 0x3Fu) * 259u + 33u) >> 6);
+            out[x * 4u + 2u] = (uint8_t)((((p >> 11) & 0x1Fu) * 527u + 23u) >> 6);
+            out[x * 4u + 3u] = 0xFF;
+        }
+    }
+    d3d8_movie_set_frame(bgra, w, h);
+    if (g_cpu_frame_logged < 4) {
+        g_cpu_frame_logged++;
+        fprintf(stderr, "[HLE-D3D8] swap %lu: the back buffer (0x%08X, %ux%u) was written by "
+                "the CPU (%s); showing guest memory (RECOMP_CPU_FRAME=0 to switch off)\n",
+                g_shadow_swaps, data, w, h, how);
+    }
+    return 1;
+}
+
+/* For a title project that paces its own movie copy (Rainbow Six 3's
+ * recomp_manual.c): this frame the title skipped writing the back buffer, and
+ * what it wrote last time is still there in guest memory -- the host never
+ * writes guest memory -- so it is shown again exactly as if the title had
+ * locked the back buffer and copied the same picture in. */
+void hle_d3d8_cpu_frame_repeat(void)
+{
+    if (g_shadow)
+        g_cpu_bb_locked = 1;
+}
+
+/* Before a host draw into the screen: a back buffer the title locked since
+ * the last draw goes down first, under what is drawn next. */
+static void cpu_frame_underlay(void)
+{
+    g_cpu_bb_locked = 0;
+    if (!cpu_frame_enabled() || !g_target_is_screen)
+        return;
+    if (cpu_frame_upload(g_backbuffer_va, "locked, then drawn over"))
+        d3d8_movie_draw();
+}
+
+static int cpu_frame_present(void)
+{
+    uint32_t surface = g_cpu_frame_surface, w, h, pitch, bpp, data, x, y;
+    uint32_t hash = 2166136261u;
+    unsigned long changes = g_screen_changes;
+    const uint8_t *src;
+    int any = 0, locked = g_cpu_bb_locked;
+
+    g_cpu_bb_locked = 0;
+    if (!cpu_frame_enabled() || !surface)
+        return 0;
+    if (changes != g_cpu_frame_changes) {
+        /* The host drew into the screen: its frame is the picture. */
+        g_cpu_frame_changes = changes;
+        g_cpu_frame_live = 0;
+        return 0;
+    }
+    src = cpu_frame_pixels(surface, &w, &h, &pitch, &bpp, &data);
+    if (!src)
+        return g_cpu_frame_live ? (d3d8_movie_draw(), 1) : 0;
+
+    /* A sample of the picture, not all of it: one word in 16 of every fourth
+     * row changes when a movie frame does. */
+    for (y = 0; y < h; y += 4) {
+        const uint32_t *row = (const uint32_t *)(src + (size_t)y * pitch);
+        for (x = 0; x < w * bpp / 4u; x += 16) {
+            hash = (hash ^ row[x]) * 16777619u;
+            any |= row[x] != 0;
+        }
+    }
+    if ((hash != g_cpu_frame_hash || locked) && any &&
+        cpu_frame_upload(surface, locked ? "locked" : "changed with nothing drawn"))
+        g_cpu_frame_live = 1;
+    g_cpu_frame_hash = hash;
+    if (g_cpu_frame_live)
+        d3d8_movie_draw();
+    return g_cpu_frame_live;
+}
+
 static void frame_end_shadow(void)
 {
     if (g_shadow) {
@@ -2529,6 +2722,8 @@ static void frame_end_shadow(void)
              * cost is that anything drawn over such a movie is covered,
              * which is why RECOMP_XMV_LAYER=0 turns this case off. */
             d3d8_movie_draw();
+            g_movie_drawn = 1;
+        } else if (cpu_frame_present()) {
             g_movie_drawn = 1;
         }
         g_movie_sampled = 0;
@@ -2639,6 +2834,7 @@ HLE_EXPORT(D3DDevice_Swap)
     xbox_FpsCountSwap();
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+    cpu_frame_note(g_backbuffer_va);
     if (shadow_trace_on())
         fprintf(stderr, "[TRACE swap %lu] Swap flags 0x%X (back buffer 0x%08X data 0x%08X)\n",
                 g_shadow_swaps, HLE_ARG(0), g_backbuffer_va,
@@ -2697,6 +2893,7 @@ HLE_EXPORT(D3DDevice_Present)
     xbox_FpsCountSwap();
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+    cpu_frame_note(g_backbuffer_va);
     {
         LARGE_INTEGER t0, t1, t2;
         QueryPerformanceCounter(&t0);
@@ -5031,6 +5228,25 @@ HLE_EXPORT(D3DDevice_GetBackBuffer2)
         fprintf(stderr, "[TRACE swap %lu] GetBackBuffer2(%d) -> 0x%08X data 0x%08X\n",
                 g_shadow_swaps, (int32_t)HLE_ARG(0), g_eax,
                 g_eax ? HLE_MEM32(g_eax + 4) : 0);
+}
+
+/* HRESULT D3DSurface_LockRect(D3DSurface *surface, D3DLOCKED_RECT *locked,
+ *                             const RECT *rect, DWORD flags)
+ * Replaced only to see a title lock its back buffer to write a picture into
+ * it with the CPU (cpu_frame_underlay, above): Rainbow Six 3's Bink movies. */
+HLE_EXPORT(D3DSurface_LockRect)
+{
+    static int seen;
+    uint32_t surface = HLE_ARG(0);
+
+    first_call(&seen, "D3DSurface_LockRect", surface);
+    if (original_missing(hle_original_D3DSurface_LockRect, "D3DSurface_LockRect"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DSurface_LockRect);
+    if (g_shadow && surface && g_backbuffer_va &&
+        (HLE_MEM32(surface + 4) & 0x0FFFFFFFu) ==
+        (HLE_MEM32(g_backbuffer_va + 4) & 0x0FFFFFFFu))
+        g_cpu_bb_locked = 1;
 }
 
 /* HRESULT D3DDevice_CopyRects(IDirect3DSurface8 *src, const RECT *srcRects,
