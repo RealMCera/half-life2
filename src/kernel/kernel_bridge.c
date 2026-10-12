@@ -3697,17 +3697,44 @@ static uint32_t s_handle_dispatcher[BRIDGE_HANDLE_MAX];
 static uint32_t *s_pseudo_thread_obj;
 
 
+/* Allocating and freeing a token. Guest threads run truly in parallel on
+ * Windows, and a worker starts running inside CreateThread, before its
+ * creator has published the thread's token. Without a lock, two threads
+ * asking at the same moment can both find the same free slot and get one
+ * token for two HANDLEs (upstream #190 saw a token that named both a loader
+ * thread and a file a worker had open; closing the file lost the thread).
+ * Two threads publishing the same HANDLE could likewise both miss it and
+ * take two slots. A spinlock, as upstream: the section never blocks, never
+ * calls out and never runs guest code, so it is short, and it is safe to
+ * take from any host thread. Readers of a slot take no lock -- a slot
+ * changes only by being allocated or freed, both under it. */
+static volatile LONG s_handle_lock;
+
+static void handle_lock(void)
+{
+    while (InterlockedCompareExchange(&s_handle_lock, 1, 0) != 0)
+        SwitchToThread();
+}
+
+static void handle_unlock(void) { InterlockedExchange(&s_handle_lock, 0); }
+
 static uint32_t bridge_handle_token(HANDLE h)
 {
     int i;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    handle_lock();
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        if (s_handle_table[i] == h) {
+            handle_unlock();
+            return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        }
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == NULL) {
             s_handle_table[i] = h;
+            handle_unlock();
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
+    handle_unlock();
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
 }
@@ -3776,10 +3803,15 @@ static HANDLE bridge_take_handle(uint32_t token)
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
+            HANDLE h;
+            /* Under the allocation lock: the flags are cleared before the
+             * slot can be handed to the next caller. */
+            handle_lock();
+            h = s_handle_table[i];
             s_handle_table[i] = NULL;
             s_handle_async[i] = 0;
             s_handle_nobuf[i] = 0;
+            handle_unlock();
             return h;
         }
     }
@@ -4813,6 +4845,56 @@ static void bridge_NtSetInformationFile(void)
                     length > 8 ? BRIDGE_MEM32(info_va + 8) : 0u);
         }
     }
+
+    /* FileRenameInformation (10) carries a guest pointer, so it is unpacked
+     * here, where guest addresses mean something, and the file layer gets a
+     * host OBJECT_ATTRIBUTES built the way bridge_build_oa builds
+     * NtCreateFile's. Guest layout, 16 bytes:
+     *     +0  BOOLEAN       ReplaceIfExists
+     *     +4  HANDLE        RootDirectory
+     *     +8  OBJECT_STRING FileName { u16 Length, u16 Max, char *Buffer }
+     * Before this the class was unhandled, and a title that writes a file
+     * under a temporary name and renames it into place never found it. */
+    if (infoclass == 10u) {
+        XBOX_OBJECT_ATTRIBUTES oa;
+        XBOX_ANSI_STRING name;
+        char path[1024];
+        uint32_t root, buf;
+        uint16_t len;
+
+        if (!info_va || length < 16u) {
+            g_eax = 0xC0000004u;             /* STATUS_INFO_LENGTH_MISMATCH */
+            bridge_write_iostatus(ios_va, (NTSTATUS)g_eax, 0);
+            return;
+        }
+        root = BRIDGE_MEM32(info_va + 4);
+        len  = BRIDGE_MEM16(info_va + 8);
+        buf  = BRIDGE_MEM32(info_va + 12);
+        if (!len || len >= sizeof path || !buf || !bridge_va_mapped(buf, len)) {
+            g_eax = (uint32_t)STATUS_OBJECT_NAME_INVALID;
+            bridge_write_iostatus(ios_va, (NTSTATUS)g_eax, 0);
+            return;
+        }
+        memcpy(path, XBOX_TO_NATIVE(buf), len);
+        path[len] = '\0';
+        name.Buffer = path;
+        name.Length = len;
+        name.MaximumLength = (USHORT)(len + 1);
+        /* -3 is the XDK DOS-device namespace, not a file handle. */
+        oa.RootDirectory = root && root != 0xFFFFFFFDu
+                         ? bridge_resolve_handle(root) : NULL;
+        oa.ObjectName = &name;
+        oa.Attributes = 0;
+        g_eax = (uint32_t)xbox_RenameFileByHandle(handle, &oa,
+                    (BOOLEAN)(BRIDGE_MEM8(info_va) != 0));
+        if (g_eax)
+            fprintf(stderr, "  [FILE] rename to %s -> 0x%08X FAILED\n",
+                    path, g_eax);
+        fflush(stderr);
+        bridge_write_iostatus(ios_va, (NTSTATUS)g_eax, 0);
+        return;
+    }
+
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
