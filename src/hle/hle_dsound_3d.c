@@ -94,7 +94,7 @@ enum {
     BIN_COUNT = 32u,
     MAX_BINS = 8u,
 
-    VOICES = 640u,             /* 256 buffers and the streams, with room to spare */
+    VOICES = 1536u,            /* 256 buffers and 1024 streams (hle_dsound_stream.c), and spare */
     ATTEN_SILENT = 6398,       /* 0xFFF / 64 dB in hundredths: the hardware's floor */
 };
 
@@ -231,12 +231,12 @@ static void default_buffer(Ds3dBuffer *b)
 }
 
 /* Where each key was last found: the pump looks every voice up several
- * times every 5 ms, and the table is 640 long. A hint, checked before use. */
-static uint16_t g_hint[1024];
+ * times every 5 ms, and the table is 1536 long. A hint, checked before use. */
+static uint16_t g_hint[2048];
 
 static Voice *find(uint32_t key)
 {
-    uint32_t i, h = (key >> 2) & 1023u;
+    uint32_t i, h = (key >> 2) & 2047u;
     if (!key) return NULL;
     if (g_hint[h] < VOICES && g_voices[g_hint[h]].key == key)
         return &g_voices[g_hint[h]];
