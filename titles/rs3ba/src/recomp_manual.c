@@ -261,6 +261,68 @@ void sub_00337CE0(void)
     }
 }
 
+/* ── Black Arrow: the sound engine's own errors ─────────────── */
+
+/*
+ * Two windows into Ubisoft's SND engine, which reports nothing in a retail
+ * build. Both run the title's own code unchanged and only print; both are
+ * off unless RECOMP_RS3_SND_LOG is set. Added 12 Oct 2026 while looking for
+ * why the guns' own reports, the reloads and the night-vision switch are
+ * never requested (docs/technical/rs3ba-audio.md): neither fired, so the
+ * engine is not refusing them -- nothing asks it to play them.
+ *
+ *   sub_00036610  the engine's DirectSound result check: edx is the HRESULT,
+ *                 [esp+4] the call as text; it accepts 0 and 1 and swallows
+ *                 the rest. =1 prints every failure.
+ *   sub_00170A67  sprintf. The engine formats its refusals ("Play fails,
+ *                 first resource 0x%x ... is not loaded", "Unexpected return
+ *                 value %d of SND_fn_eSynchStreamAsyncSnd") into a local
+ *                 buffer and drops them. =1 prints those whose format is the
+ *                 engine's (0x0050C000-0x00510000); =2 also any formatted
+ *                 text that reads like an error.
+ */
+static int rs3ba_snd_log(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RS3_SND_LOG");
+        on = e ? atoi(e) : 0;
+    }
+    return on;
+}
+
+extern void sub_00036610_gen(void);
+
+void sub_00036610(void)
+{
+    uint32_t hr = g_edx, text = RS3_MEM32(g_esp + 4);
+    if (rs3ba_snd_log() && hr != 0u && hr != 1u) {
+        static unsigned long said;
+        if (said++ < 200)
+            fprintf(stderr, "[SND] failed 0x%08X: %.160s\n", hr,
+                    text ? (const char *)(uintptr_t)(text + g_xbox_mem_offset) : "?");
+    }
+    sub_00036610_gen();
+}
+
+extern void sub_00170A67_gen(void);
+
+void sub_00170A67(void)
+{
+    uint32_t buf = RS3_MEM32(g_esp + 4), fmt = RS3_MEM32(g_esp + 8);
+    int on = rs3ba_snd_log();
+    sub_00170A67_gen();
+    if (on && buf) {
+        const char *t = (const char *)(uintptr_t)(buf + g_xbox_mem_offset);
+        int engine = fmt >= 0x0050C000u && fmt < 0x00510000u;
+        int errorish = strstr(t, "ail") || strstr(t, "rror") || strstr(t, "nexpected") ||
+                       strstr(t, "not loaded");
+        static unsigned long said;
+        if ((engine || (on > 1 && errorish)) && said++ < 400)
+            fprintf(stderr, "[SND] %.200s\n", t);
+    }
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*

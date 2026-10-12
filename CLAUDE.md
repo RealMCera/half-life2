@@ -160,6 +160,9 @@ dropped silently. `hle_dsound_stream.c` keeps 1024 streams and lends them 256 vo
 An `HLE_ORIGINAL` is defined in each title's generated `recomp_hle.c`, so a title that
 predates one fails to link with `hle_original_<Name>` undefined: lift it again
 (`--from lift`). `RECOMP_DSOUND_STREAM_LOG=1` logs every stream and packet.
+Still open: Black Arrow never *requests* its guns' own reports, its reloads or its
+night-vision switch; everything below DirectSound is ruled out
+(`docs/technical/rs3ba-audio.md`).
 
 **Two audio paths (Oct 2026, `docs/technical/audio-architecture.md`).** `RECOMP_AUDIO=native`
 (the default) replaces DirectSound by name, as above. `RECOMP_AUDIO=apu` runs the title's own

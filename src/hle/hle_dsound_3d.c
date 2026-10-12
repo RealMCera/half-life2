@@ -1402,6 +1402,18 @@ HLE_EXPORT(IDirectSound_CommitDeferredSettings)
  * distance, and the mix bins it starts with. */
 static void buffer_created(uint32_t desc, uint32_t out)
 {
+    if ((int32_t)g_eax < 0) {
+        /* The title's own creation refused it: whatever sound it was for is
+         * never played, and nothing else says so. */
+        static unsigned long refused;
+        unsigned long n = ++refused;
+        while (n >= 10 && n % 10 == 0) n /= 10;
+        if (n == 1)
+            fprintf(stderr, "[DSOUND] CreateSoundBuffer failed 0x%08X, flags 0x%08X, %u bytes "
+                    "(%lu so far)\n", g_eax,
+                    desc && guest_readable(desc, 0x0Cu) ? HLE_MEM32(desc + 4u) : 0u,
+                    desc && guest_readable(desc, 0x0Cu) ? HLE_MEM32(desc + 8u) : 0u, refused);
+    }
     if ((int32_t)g_eax < 0 || !out || !guest_readable(out, 4u) ||
         !desc || !guest_readable(desc, 0x14u))
         return;

@@ -913,6 +913,16 @@ HLE_EXPORT(CDirectSound_CreateSoundStream)
     if (!hle_original_CDirectSound_CreateSoundStream)
         HLE_RETURN(HR_E_FAIL);
     HLE_CALL_ORIGINAL(CDirectSound_CreateSoundStream);
+    if ((int32_t)g_eax < 0) {
+        /* The title's own creation refused it: the sound it was for is lost. */
+        static unsigned long refused;
+        unsigned long n = ++refused;
+        while (n >= 10 && n % 10 == 0) n /= 10;
+        if (n == 1)
+            fprintf(stderr, "[DSOUND] CreateSoundStream failed 0x%08X, flags 0x%08X "
+                    "(%lu so far)\n", g_eax,
+                    desc && guest_readable(desc, 4u) ? HLE_MEM32(desc) : 0u, refused);
+    }
     if ((int32_t)g_eax >= 0 && out && guest_readable(out, 4u)) {
         lock();
         record_stream(HLE_MEM32(out), desc);
