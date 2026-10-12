@@ -18,3 +18,6 @@ if(MSVC)
 else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
+
+# Independent mapping rules; linked explicitly by adopting ports.
+add_subdirectory(mapping)
