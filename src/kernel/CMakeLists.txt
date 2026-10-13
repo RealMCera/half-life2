@@ -22,6 +22,9 @@ set(KERNEL_SOURCES
     xbox_memory_layout.c
     xbox_watchpoint.c
     xbox_fault_route.c
+    xbox_nic.c
+    xbox_net_udp.c
+    xbox_crypto_soft.c
     icall_feedback.c
     exit_trace.c
     recomp_trace.c
@@ -43,13 +46,16 @@ target_include_directories(xbox_kernel PUBLIC
     ${XBOXRECOMP_SRC_DIR}
 )
 target_link_libraries(xbox_kernel PUBLIC xbox_config)
+# The System Link host's router forward and addresses (xbox_net_udp.c).
+target_link_libraries(xbox_kernel PRIVATE xbox_net)
 
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     # winmm for timeBeginPeriod (the vblank clock's fallback timer), dbghelp
     # and psapi for the sampling profiler's symbol and module lookups.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt winmm dbghelp psapi)
+    # ws2_32 for the System Link tunnel's UDP socket (xbox_net_udp.c).
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt winmm dbghelp psapi ws2_32)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
@@ -68,3 +74,8 @@ else()
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+
+# DES and modular exponentiation against published answers; System Link
+# only works if both consoles compute exactly what the Xbox kernel does.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/crypto_soft
+                 ${CMAKE_CURRENT_BINARY_DIR}/crypto_soft)
