@@ -166,6 +166,24 @@ static uint64_t now_ms(void) { return GetTickCount64(); }
 /* Name the first few call sites of a replaced stream method, once each: a
  * title that waits on a status this file reports differently from the console
  * is found by reading the caller. */
+/* RECOMP_DSOUND_STREAM_TRACE=1: every call on a stream, with its argument,
+ * what it answered and where from, for a title that waits on one stream
+ * forever. Capped at 4000 lines. */
+static void stream_trace(const char *what, uint32_t object, uint32_t arg, uint32_t result)
+{
+    static int on = -1;
+    static int lines;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_DSOUND_STREAM_TRACE", 0);
+    if (!on || lines >= 4000)
+        return;
+    lines++;
+    fprintf(stderr, "[DSOUND-TRACE] %-10s object %08X arg %08X -> %08X (from 0x%08X, %llu ms)\n",
+            what, object, arg, result, HLE_MEM32(g_esp), (unsigned long long)now_ms());
+    fflush(stderr);
+}
+
 static void note_caller(const char *what)
 {
     static uint32_t seen[12];
@@ -703,6 +721,7 @@ static void record_stream(uint32_t iface, uint32_t desc)
         return;
     }
     hle_dsound_service_start();
+    stream_trace("Create", iface, max_packets, (uint32_t)again);
     memset(s, 0, sizeof *s);
     s->iface       = iface;
     s->active_ms   = now_ms();
@@ -793,6 +812,9 @@ HLE_EXPORT(CDirectSoundStream_Process)
     Packet *p;
     static int said;
 
+    stream_trace("Process", object,
+                 packet && guest_readable(packet, 8u) ? HLE_MEM32(packet + 4u) : 0u, 0u);
+
     if (!packet || !guest_readable(packet, 0x18u))
         HLE_RETURN(HR_E_POINTER);
     lock();
@@ -873,6 +895,7 @@ HLE_EXPORT(CDirectSoundStream_Flush)
 {
     g_calls_flush++;
     note_caller("Flush");
+    stream_trace("Flush", HLE_ARG(0), 0u, 0u);
     flush_stream(HLE_ARG(0));
     HLE_RETURN(DS_OK);
 }
@@ -896,6 +919,7 @@ HLE_EXPORT(CDirectSoundStream_FlushEx)
     static int said;
     g_calls_flush++;
     note_caller("FlushEx");
+    stream_trace("FlushEx", HLE_ARG(0), HLE_ARG(3), 0u);
     if (said < 4 && (HLE_ARG(1) || HLE_ARG(2))) {
         said++;
         fprintf(stderr, "[DSOUND] stream FlushEx at time %08X%08X, flags %X: "
@@ -909,6 +933,7 @@ HLE_EXPORT(CDirectSoundStream_FlushEx)
  * data; the packets already queued play out as they are. */
 HLE_EXPORT(CDirectSoundStream_Discontinuity)
 {
+    stream_trace("Discont", HLE_ARG(0), 0u, 0u);
     HLE_RETURN(DS_OK);
 }
 
@@ -938,6 +963,7 @@ HLE_EXPORT(CDirectSoundStream_Pause)
     uint64_t now = now_ms();
     Stream *s;
 
+    stream_trace("Pause", HLE_ARG(0), mode, 0u);
     lock();
     s = find_by_object(HLE_ARG(0));
     if (s) {
@@ -998,6 +1024,7 @@ HLE_EXPORT(CDirectSoundStream_GetStatus__r2)
     }
     unlock();
     HLE_MEM32(out) = status;
+    stream_trace("GetStatus", HLE_ARG(0), 0u, status);
     HLE_RETURN(DS_OK);
 }
 
@@ -1009,6 +1036,7 @@ HLE_EXPORT(CDirectSoundStream_SetVolume)
     uint32_t object = HLE_ARG(0), volume = HLE_ARG(1);
     Stream *s;
 
+    stream_trace("SetVolume", object, volume, 0u);
     lock();
     s = find_by_object(object);
     if (s)

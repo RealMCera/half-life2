@@ -105,6 +105,41 @@ HLE_EXPORT(D3DDevice_SetFlickerFilter)
     HLE_RETURN(0);
 }
 
+/* void D3DDevice_SetShaderConstantMode(D3DSHADERCONSTANTMODE Mode): the
+ * title's own body, then the mode is kept so the shadow device knows whether
+ * the reserved viewport constants are its to write (shadow_viewport_constants). */
+HLE_ORIGINAL(D3DDevice_SetShaderConstantMode);
+static uint32_t g_shader_constant_mode;
+static int original_missing(void (*fn)(void), const char *name);
+HLE_EXPORT(D3DDevice_SetShaderConstantMode)
+{
+    static int seen;
+    uint32_t mode = HLE_ARG(0);
+
+    first_call(&seen, "D3DDevice_SetShaderConstantMode", mode);
+    if (!original_missing(hle_original_D3DDevice_SetShaderConstantMode,
+                          "D3DDevice_SetShaderConstantMode"))
+        HLE_CALL_ORIGINAL(D3DDevice_SetShaderConstantMode);
+    if (mode != g_shader_constant_mode) {
+        static int said;
+        if (said++ < 8) {
+            fprintf(stderr, "[HLE-D3D8] shader constant mode 0x%02X -> 0x%02X\n",
+                    g_shader_constant_mode, mode);
+            fflush(stderr);
+        }
+    }
+    g_shader_constant_mode = mode;
+    HLE_RETURN(0);
+}
+
+/* Whether the title owns constants 58 and 59 (X_D3DSCM_NORESERVEDCONSTANTS,
+ * 0x10), so neither the viewport nor anything else of shadow mode's goes
+ * there. */
+int hle_d3d8_reserved_constants_free(void)
+{
+    return (g_shader_constant_mode & 0x10u) != 0;
+}
+
 /* void D3DDevice_SetSoftDisplayFilter(BOOL Enable) -- TV encoder only. */
 HLE_EXPORT(D3DDevice_SetSoftDisplayFilter)
 {
@@ -713,8 +748,11 @@ static IDirect3DSurface8 *g_device_depth;
  * render target (shadow_set_render_target), the CreateDevice one to begin
  * with.
  *
- * Not handled: X_D3DSCM_NORESERVEDCONSTANTS, which frees 58 and 59 for the
- * title (a title that then sets them wins until its next SetViewport). */
+ * Under X_D3DSCM_NORESERVEDCONSTANTS (D3DDevice_SetShaderConstantMode) 58
+ * and 59 are the title's, and nothing is written there: Gladius keeps a bone
+ * of its skinning palette in c-39..c-37, and with the viewport written over
+ * two of its rows every vertex weighted to that bone went to y = 1.2e7 -- a
+ * beam across the arena from each character. */
 static float        g_z_scale = 1.0f;
 static D3DVIEWPORT8 g_title_viewport;
 static int          g_title_viewport_set;
@@ -731,20 +769,54 @@ static float xbox_depth_z_scale(uint32_t format)
     }
 }
 
+/* The multisample factors of the screen surface being drawn into, 1x1 for
+ * any other target (shadow_set_render_target).
+ *
+ * For a supersample type (g_multisample_type) the NV2A rasterises the
+ * screen at the surface's own size, and the XDK's viewport constants are in
+ * those pixels: the viewport scaled by the factors. A multisample type keeps
+ * the device's pixels, so nothing is scaled for it. Gladius (1x2, a 640x960 screen for its 640x480 device) works
+ * its programs' screen space out itself and arrives at the XDK's numbers --
+ * scale 320, 480, offset 320.53, 480.53 -- and with the undo in the device's
+ * 640x480 every program draw came out at twice its height: the menus below
+ * the screen's bottom edge, the character select cut off at the waist. So
+ * the reserved constants and the undo are both in the surface's pixels; the
+ * host still draws at the device's size, and between the two the factor
+ * cancels for a title that uses the reserved constants. */
+static UINT g_target_aa_x = 1, g_target_aa_y = 1;
+
+/* D3DPRESENT_PARAMETERS.MultiSampleType from CreateDevice. A supersample
+ * type (0x2000 set: 0x2012 vertical, 0x2011 horizontal, 0x2022 ...) renders
+ * the picture at the surface's size, and screen space is in its pixels; a
+ * multisample type (0x1000: 0x1011, 0x1021 ...) takes extra samples of a
+ * picture still rasterised in the device's pixels. Gladius is 0x2012 and
+ * hands its programs surface pixels; Need for Speed Underground 2 is 0x1021
+ * and hands them device pixels, so with its viewport scaled its menus came
+ * out in the left half of the screen. */
+static uint32_t g_multisample_type;
+#define X_D3DMULTISAMPLE_SUPERSAMPLE 0x2000u
+
+/* D3DDevice_SetShaderConstantMode's last mode is g_shader_constant_mode. */
+#define X_D3DSCM_NORESERVEDCONSTANTS 0x10u
+
 static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
 {
-    float half_w = (float)g_target_width / 2.0f;
-    float half_h = (float)g_target_height / 2.0f;
+    int super = (g_multisample_type & X_D3DMULTISAMPLE_SUPERSAMPLE) != 0;
+    float ax = super ? (float)g_target_aa_x : 1.0f, ay = super ? (float)g_target_aa_y : 1.0f;
+    float half_w = (float)g_target_width / 2.0f * ax;
+    float half_h = (float)g_target_height / 2.0f * ay;
     float reserved[8] = {
-        (float)vp->Width / 2.0f, -(float)vp->Height / 2.0f,
+        (float)vp->Width / 2.0f * ax, -(float)vp->Height / 2.0f * ay,
         (vp->MaxZ - vp->MinZ) * g_z_scale, 1.0f,
-        (float)vp->Width / 2.0f + (float)vp->X, (float)vp->Height / 2.0f + (float)vp->Y,
+        ((float)vp->Width / 2.0f + (float)vp->X) * ax,
+        ((float)vp->Height / 2.0f + (float)vp->Y) * ay,
         vp->MinZ * g_z_scale, 0.0f
     };
     float scale[4]  = { half_w, -half_h, g_z_scale, 1.0f };
     float offset[4] = { half_w, half_h, 0.0f, 0.0f };
 
-    host_vsh_set_constant(58, reserved, 2);
+    if (!(g_shader_constant_mode & X_D3DSCM_NORESERVEDCONSTANTS))
+        host_vsh_set_constant(58, reserved, 2);
     host_vsh_set_screenspace(scale, offset);
 }
 
@@ -2219,6 +2291,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
          * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
          * decides what a Swap means (frame_end_shadow). */
         g_swap_effect = HLE_MEM32(pp_va + 0x14);
+        g_multisample_type = HLE_MEM32(pp_va + 0x10);
         /* The flip that would have waited for it is on a GPU that is not
          * there; the flip gate keeps the title's cadence instead. */
         if ((int32_t)g_eax >= 0)
@@ -2984,6 +3057,11 @@ static int xbox_vsdt_expanded(uint32_t format, UINT *size)
      * draw through them was skipped as "program without layout" -- about
      * 23 a frame in the menus, the front-end text among them. */
     case 0x31: *size = 6; return 3;
+    /* PBYTE3: three unsigned bytes, 0..1, and no DXGI format of that width.
+     * Gladius's two-bone skinning declarations carry their weights in one at
+     * v9; every draw through them was skipped, which took the faces, hands
+     * and every joint between two bones off its characters. */
+    case 0x34: *size = 3; return 3;
     default:   return 0;
     }
 }
@@ -4093,6 +4171,43 @@ static uint32_t push_vertex_stride(void)
     return fvf_stride(g_shadow_vs);
 }
 
+/* NV097_SET_VERTEX_DATA4UB (0x1940 + 4r), _2F_M (0x1880 + 8r) and _4F_M
+ * (0x1A00 + 16r) outside a begin/end: the register's current value, for the
+ * draws that follow. Gladius draws its menu backdrop as a push of its own --
+ * 4UB colour into v3, then a quad of positions only -- and the colour method
+ * stopped the walk, so the backdrop was never drawn. 4UB is x in the low
+ * byte, as the XDK's SetVertexDataColor writes it. Whether the method was
+ * one of these. */
+static int push_vertex_constant(uint32_t method, uint32_t va, uint32_t count)
+{
+    float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    uint32_t reg, k;
+
+    if (method >= 0x1940u && method < 0x1980u && count == 1u) {
+        uint32_t c = HLE_MEM32(va);
+        reg = (method - 0x1940u) / 4u;
+        for (k = 0; k < 4u; k++)
+            v[k] = (float)((c >> (8u * k)) & 0xFFu) / 255.0f;
+    } else if (method >= 0x1880u && method < 0x1900u && count == 2u && !(method & 7u)) {
+        reg = (method - 0x1880u) / 8u;
+        for (k = 0; k < 2u; k++) {
+            uint32_t w = HLE_MEM32(va + 4u * k);
+            memcpy(&v[k], &w, 4);
+        }
+    } else if (method >= 0x1A00u && method < 0x1B00u && count == 4u && !(method & 15u)) {
+        reg = (method - 0x1A00u) / 16u;
+        for (k = 0; k < 4u; k++) {
+            uint32_t w = HLE_MEM32(va + 4u * k);
+            memcpy(&v[k], &w, 4);
+        }
+    } else {
+        return 0;
+    }
+    if (g_shadow)
+        host_vsh_set_vertex_data((int)reg, v);
+    return 1;
+}
+
 static void push_replay(uint32_t start, uint32_t end)
 {
     static uint32_t *data;
@@ -4148,6 +4263,9 @@ static void push_replay(uint32_t start, uint32_t end)
             n += count;
         } else if (method >= NV2A_PUSH_ARRAYS_FIRST && method < NV2A_PUSH_ARRAYS_END) {
             /* The title's vertex arrays: hle_d3d8_push_arrays_scan has them. */
+        } else if (!prim && push_vertex_constant(method, va, count)) {
+            /* A register's current value, as SetVertexDataColor/2f/4f set
+             * it: what the inline array's vertices do not carry. */
         } else {
             static uint32_t said[8];
             int s;
@@ -4159,6 +4277,14 @@ static void push_replay(uint32_t start, uint32_t end)
                 fprintf(stderr, "[HLE-D3D8] push buffer: method 0x%04X (count %u) "
                         "written by the title is not replayed; its push is skipped "
                         "from there\n", method, count);
+                /* RECOMP_HLE_D3D8_PUSH_DUMP=1: that push, word by word, so
+                 * what the title draws this way can be read. */
+                if (xbox_EnvSwitch("RECOMP_HLE_D3D8_PUSH_DUMP", 0)) {
+                    uint32_t w;
+                    for (w = start; w < end && w < start + 4u * 160u; w += 4u)
+                        fprintf(stderr, "[HLE-D3D8]   push +%03X: %08X\n",
+                                w - start, HLE_MEM32(w));
+                }
             }
             g_push_other++;
             return;
@@ -4366,6 +4492,27 @@ HLE_EXPORT(D3DDevice_SetViewport)
     uint32_t viewport = HLE_ARG(0);
 
     first_call(&seen, "D3DDevice_SetViewport", viewport);
+    if (viewport && xbox_EnvSwitch("RECOMP_HLE_D3D8_TRACE_VIEWPORT", 0)) {
+        /* Every distinct viewport the title sets, once, with its caller:
+         * where a title computes the rectangle it draws its 3D into. */
+        static struct { uint32_t x, y, w, h, from; } seenvp[64];
+        static int nseen;
+        uint32_t x = HLE_MEM32(viewport), y = HLE_MEM32(viewport + 4u);
+        uint32_t w = HLE_MEM32(viewport + 8u), h = HLE_MEM32(viewport + 12u);
+        uint32_t from = HLE_MEM32(g_esp);
+        int i;
+        for (i = 0; i < nseen; i++)
+            if (seenvp[i].x == x && seenvp[i].y == y && seenvp[i].w == w &&
+                seenvp[i].h == h && seenvp[i].from == from)
+                break;
+        if (i == nseen && nseen < 64) {
+            seenvp[nseen].x = x; seenvp[nseen].y = y; seenvp[nseen].w = w;
+            seenvp[nseen].h = h; seenvp[nseen++].from = from;
+            fprintf(stderr, "[HLE-D3D8] viewport %u,%u %ux%u from 0x%08X (swap %lu)\n",
+                    x, y, w, h, from, g_shadow_swaps);
+            fflush(stderr);
+        }
+    }
     if (original_missing(hle_original_D3DDevice_SetViewport, "D3DDevice_SetViewport"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetViewport);
@@ -4456,9 +4603,8 @@ int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
 #define SHADOW_SCRATCH 8
 #define SURFACE_PARENT 20
 
-/* The multisample factors of the screen surface being drawn into, 1x1 for
- * any other target (shadow_set_render_target). */
-static UINT g_target_aa_x = 1, g_target_aa_y = 1;
+/* g_target_aa_x/y, the multisample factors of the screen surface being drawn
+ * into, are defined with the viewport constants above. */
 
 static struct { UINT width, height; IDirect3DTexture8 *texture; } g_scratch[SHADOW_SCRATCH];
 static struct { UINT width, height; IDirect3DSurface8 *surface; } g_depths[SHADOW_SCRATCH];
@@ -5513,6 +5659,11 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
                 n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
                 n[2] = (float)((int32_t)bits >> 22) / 511.0f;
                 count = 3;
+            } else if (p->packed_format[k] == 0x34u) { /* PBYTE3 */
+                /* The UNORM rule, as PBYTE1/2/4 get from theirs: b / 255. */
+                count = 3;
+                for (c = 0; c < count; c++)
+                    n[c] = (float)at[c] / 255.0f;
             } else if (p->packed_format[k] == 0x31u) { /* NORMSHORT3 */
                 /* The SNORM rule, as NORMSHORT1/2/4 get from their DXGI
                  * formats, so every width agrees: s / 32767, -32768 to -1. */

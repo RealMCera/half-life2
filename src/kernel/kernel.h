@@ -616,6 +616,7 @@ void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 
 ULONG   __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status);
@@ -1109,6 +1110,10 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 /* The console's video standard and refresh (XC_AV_STANDARD_*), from the
  * disc's region; kernel_xbox.c. */
 uint32_t xbox_kernel_console_av_standard(void);
+
+/* A PAL console that also offers 60 Hz (RECOMP_PAL60, on by default); 0 on
+ * an NTSC console. kernel_xbox.c. */
+int xbox_kernel_console_pal60(void);
 
 /* Game region the XBE certificate allows, as parsed during layout init, or 0
  * if there was no mapped XBE to read it from. */

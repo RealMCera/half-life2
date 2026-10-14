@@ -86,6 +86,8 @@ typedef struct {
     uint16_t            inputs_read;  /* Which v registers are read */
     int                 uses_proj;    /* reads the projection's first column */
     int                 pos_input;    /* v# oPos is copied from, or -1 */
+    int                 pos_scale;    /* oPos.x = v.x * c[pos_scale].x + c[pos_offset].x, */
+    int                 pos_offset;   /* or -1 for a straight copy (see g_emit_pos_scale) */
     uint64_t            const_read[3];/* constant registers read by index, a bit each */
     int                 const_indexed;/* reads through a0: any register, as far as known */
 } VshCacheEntry;
@@ -191,6 +193,15 @@ uint32_t d3d8_vsh_bound_reads(int first, int count)
  * is never asked about. */
 static int g_emit_pos_input = -1;
 static int g_bound_pos_input = -1;
+/* The other shape a screen-space program has: oPos = v * c[a] + c[b], the
+ * title's own pixel mapping (Gladius: v in -1..1, c189 = 320, 480 and
+ * c191 = 320.5, 480.5, the second reached through a temp loaded by an
+ * earlier MOV). The registers, so the draw path can put the vertices in
+ * pixels before measuring them; -1 when oPos was copied as it is. Tracked
+ * through g_emit_temp_const, which temps hold a constant's x unchanged. */
+static int g_emit_pos_scale = -1, g_emit_pos_offset = -1;
+static int g_bound_pos_scale = -1, g_bound_pos_offset = -1;
+static int g_emit_temp_const[NV2A_VS_MAX_TEMPS];
 static const D3D8VshInput *g_bound_decl;
 static int                 g_bound_decl_count;
 
@@ -209,6 +220,15 @@ int d3d8_vsh_bound_input_offset(int reg, UINT *offset)
 }
 
 int d3d8_vsh_bound_pos_input(void) { return g_bound_pos_input; }
+
+int d3d8_vsh_bound_pos_map(float *scale, float *offset)
+{
+    if (g_bound_pos_scale < 0 || g_bound_pos_offset < 0)
+        return 0;
+    *scale = g_vsh_constants.c[g_bound_pos_scale][0];
+    *offset = g_vsh_constants.c[g_bound_pos_offset][0];
+    return 1;
+}
 
 static uint32_t fnv1a_hash(const void *data, size_t len)
 {
@@ -311,7 +331,14 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
         break;
     case NV2A_VSH_REG_CONST:
         if (src->rel_addr) {
-            sb_append(sb, "c[a0 + %d]", src->reg_index);
+            /* Through crel: an index off either end reads zero, as D3D11
+             * makes any out-of-range constant read. Vulkan does not, and
+             * a skinned vertex with one bone names its unused second bone
+             * -1 (Gladius: index -1.0, weight 0), so c[-1] times 0 was
+             * whatever lay before the buffer times 0 -- NaN on MoltenVK,
+             * a vertex thrown to infinity, and a long beam across the
+             * arena from every such character. */
+            sb_append(sb, "crel(a0 + %d)", src->reg_index);
             g_emit_const_indexed = 1;
         } else {
             sb_append(sb, "c[%d]", src->reg_index);
@@ -718,6 +745,10 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 c[%d];\n"
         "};\n"
         "\n"
+        "float4 crel(int i) {\n"
+        "    return (uint)i < %du ? c[i] : float4(0, 0, 0, 0);\n"
+        "}\n"
+        "\n"
         "cbuffer VSH_Screenspace : register(b2) {\n"
         "    float4 xboxScreenspaceScale;\n"
         "    float4 xboxScreenspaceOffset;\n"
@@ -728,7 +759,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 xboxVertexData[%d];\n"
         "    float4 xboxVertexFed[4];\n"
         "};\n"
-        "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_INPUTS);
+        "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_INPUTS);
 
     /* Input structure - only declare used inputs */
     sb_append(&sb, "struct VS_IN {\n");
@@ -870,8 +901,44 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
          * from. See g_emit_pos_input. */
         if (mac_runs && inst->mac_op == NV2A_VSH_MAC_MOV &&
             inst->mac_dst.output_reg == NV2A_VSH_OUT_POS &&
-            inst->mac_src[0].reg_type == NV2A_VSH_REG_INPUT)
+            inst->mac_src[0].reg_type == NV2A_VSH_REG_INPUT) {
             g_emit_pos_input = inst->mac_src[0].reg_index;
+            g_emit_pos_scale = g_emit_pos_offset = -1;
+        }
+        /* Or through the title's own pixel mapping: see g_emit_pos_scale. */
+        if (mac_runs && inst->mac_op == NV2A_VSH_MAC_MAD &&
+            inst->mac_dst.output_reg == NV2A_VSH_OUT_POS) {
+            const NV2AVshSrcOperand *a = &inst->mac_src[0], *b = &inst->mac_src[1],
+                                    *c = &inst->mac_src[2];
+            int off = -1;
+
+            if (c->reg_type == NV2A_VSH_REG_CONST && !c->rel_addr && !c->negate &&
+                c->swizzle.x == 0)
+                off = c->reg_index;
+            else if (c->reg_type == NV2A_VSH_REG_TEMP && !c->negate && c->swizzle.x == 0 &&
+                     c->reg_index >= 0 && c->reg_index < NV2A_VS_MAX_TEMPS)
+                off = g_emit_temp_const[c->reg_index];
+            if (a->reg_type == NV2A_VSH_REG_INPUT && !a->negate && a->swizzle.x == 0 &&
+                b->reg_type == NV2A_VSH_REG_CONST && !b->rel_addr && !b->negate &&
+                b->swizzle.x == 0 && off >= 0) {
+                g_emit_pos_input = a->reg_index;
+                g_emit_pos_scale = b->reg_index;
+                g_emit_pos_offset = off;
+            } else {
+                g_emit_pos_input = g_emit_pos_scale = g_emit_pos_offset = -1;
+            }
+        }
+        /* Which temps hold a constant's x as it is, for the mapping above. */
+        if (mac_runs && inst->mac_op != NV2A_VSH_MAC_ARL && inst->mac_dst.temp_reg >= 0 &&
+            inst->mac_dst.temp_reg < NV2A_VS_MAX_TEMPS && (inst->mac_dst.write_mask & 8u)) {
+            const NV2AVshSrcOperand *a = &inst->mac_src[0];
+            g_emit_temp_const[inst->mac_dst.temp_reg] =
+                (inst->mac_op == NV2A_VSH_MAC_MOV && a->reg_type == NV2A_VSH_REG_CONST &&
+                 !a->rel_addr && !a->negate && a->swizzle.x == 0) ? a->reg_index : -1;
+        }
+        if (ilu_runs && inst->ilu_dst.temp_reg >= 0 &&
+            inst->ilu_dst.temp_reg < NV2A_VS_MAX_TEMPS && (inst->ilu_dst.write_mask & 8u))
+            g_emit_temp_const[inst->ilu_dst.temp_reg] = -1;
 
         if (mac_runs && inst->mac_op == NV2A_VSH_MAC_ARL)
             sb_append(&sb, "        a0 = _a0;\n");
@@ -1127,6 +1194,9 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
         return NULL;
     g_emit_uses_proj = 0;
     g_emit_pos_input = -1;
+    g_emit_pos_scale = g_emit_pos_offset = -1;
+    for (int t = 0; t < NV2A_VS_MAX_TEMPS; t++)
+        g_emit_temp_const[t] = -1;
     memset(g_emit_const_read, 0, sizeof g_emit_const_read);
     g_emit_const_indexed = 0;
     hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, HLSL_BUF);
@@ -1181,6 +1251,8 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     entry->inputs_read = program.inputs_read;
     entry->uses_proj   = g_emit_uses_proj;
     entry->pos_input   = g_emit_pos_input;
+    entry->pos_scale   = g_emit_pos_scale;
+    entry->pos_offset  = g_emit_pos_offset;
     memcpy(entry->const_read, g_emit_const_read, sizeof entry->const_read);
     entry->const_indexed = g_emit_const_indexed;
     entry->layout_count = 0;
@@ -1820,6 +1892,8 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     memcpy(g_bound_const_read, entry->const_read, sizeof g_bound_const_read);
     g_bound_const_indexed = entry->const_indexed;
     g_bound_pos_input = entry->pos_input;
+    g_bound_pos_scale = entry->pos_scale;
+    g_bound_pos_offset = entry->pos_offset;
     g_bound_decl = vsh->decl_count ? vsh->decl : NULL;
     g_bound_decl_count = vsh->decl_count;
 
