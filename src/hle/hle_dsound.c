@@ -46,6 +46,10 @@
 #include <string.h>
 
 #include "hle.h"
+
+/* The DirectSound replacement: off under RECOMP_AUDIO=apu, when the title's
+ * own DirectSound drives the emulated APU (src/hle/audio_path.c). */
+HLE_GROUP(audio)
 #include "platform/host_timer.h"
 #include "dsound_buffer_model.h"
 #include "xbox_adpcm.h"
@@ -60,6 +64,7 @@ void hle_dsound_stream_tick(uint64_t now);   /* hle_dsound_stream.c */
 int xbox_EnvSwitch(const char *name, int default_on);
 long __stdcall xbox_NtSetEvent(void *EventHandle, long *PreviousState);   /* NTSTATUS */
 void *xbox_bridge_resolve_handle(uint32_t token);                          /* kernel_bridge.c */
+int xbox_bridge_set_guest_event(uint32_t va);                             /* kernel_bridge.c */
 
 enum {
     SET_FORMAT     = 0x0Cu,   /* tag | channels << 16 | bits << 24 */
@@ -305,12 +310,19 @@ static void retire(Buffer *b)
  * dry several times every five seconds. This much silence first, each time
  * the voice starts or has run dry, plays everything that much later and
  * absorbs a late pump up to the same length. */
-static void prime(Buffer *b, uint32_t rate, uint32_t channels, uint32_t bits,
-                  int32_t volume)
+/* `rate` is what the silence is submitted at, `played_rate` how fast the
+ * voice consumes it: the same, unless a mix's ratio plays the voice at
+ * another speed. The pre-roll is PRE_ROLL_MS of *playing* time. Sized at the
+ * submitted rate, a buffer played at half speed (TimeSplitters 2 asks 22050
+ * of its 44000 Hz effects) sat behind 100 ms of silence: every effect started
+ * that much late, and ten 10 ms slices queued behind it overran the host
+ * voice's queue, which refused -- and lost -- pieces of the sound. */
+static void prime(Buffer *b, uint32_t rate, uint32_t played_rate, uint32_t channels,
+                  uint32_t bits, int32_t volume)
 {
     static uint8_t silence[PRE_ROLL_MS * 200 * 2 * 2];   /* 200 kHz, stereo, 16 bit */
     uint32_t frame = channels * bits / 8u;
-    uint32_t bytes = rate / 1000u * PRE_ROLL_MS * frame;
+    uint32_t bytes = (played_rate ? played_rate : rate) / 1000u * PRE_ROLL_MS * frame;
     uint32_t queued = 0u;
 
     if (b->primed) {
@@ -453,9 +465,15 @@ static Notify *notify_find(uint32_t iface)
     return NULL;
 }
 
+/* The title's event: a handle, or a KEVENT in its own memory, set in place
+ * (as hle_dsound_stream.c completes packets -- Halo 2 passes KEVENTs there,
+ * and one taken for a handle faulted in the host's SetEvent on POSIX). */
 static void notify_signal(uint32_t handle)
 {
-    void *event = handle ? xbox_bridge_resolve_handle(handle) : NULL;
+    void *event;
+    if (!handle || xbox_bridge_set_guest_event(handle))
+        return;
+    event = xbox_bridge_resolve_handle(handle);
     if (event)
         xbox_NtSetEvent(event, NULL);
 }
@@ -667,7 +685,7 @@ static void pump(Buffer *b, uint64_t now)
         if (b->releasing == 1 &&
             (!has_amp || b->eg[0].phase == EG_DONE || b->eg[0].phase == EG_OFF))
             b->releasing = 2;
-        prime(b, rate, channels, bits, volume);
+        prime(b, rate, out->sample_rate, channels, bits, volume);
         recomp_audio_output_submit(slot_of(b), pcm, bytes, rate, channels, bits, volume);
         /* The Doppler shift changes how fast the buffer is consumed, as it
          * does on the console -- from now: after this slice was taken, or

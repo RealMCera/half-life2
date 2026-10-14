@@ -24,6 +24,9 @@
  * sizes (the stream holds the bytes).
  */
 #include "audio_output.h"
+#include "audio_speakers.h"
+#include "audio_health.h"
+#include "audio_reverb.h"
 
 #include <SDL3/SDL.h>
 
@@ -34,7 +37,7 @@
 #include <string.h>
 
 #define VOICE_COUNT     (256u + 16u + 1u)
-#define QUEUE_SIZE      12u          /* audio_output_xaudio2.cpp kQueueSize */
+#define QUEUE_SIZE      64u          /* audio_output_xaudio2.cpp kQueueSize */
 #define MAX_BUFFER      160000u
 #define MIN_RATE        1000u
 #define MAX_RATE        200000u
@@ -42,6 +45,11 @@
 
 typedef struct {
     SDL_AudioStream *stream;
+    /* The voice's reverb send, for the native path's room (the bus below):
+     * the same submissions at the same rate and ratio as the voice, so SDL
+     * resamples the two alike and the send reaches the room in step with
+     * the dry sound. NULL until the voice has a send and there is a room. */
+    SDL_AudioStream *send;
     uint32_t sample_rate, channels, bits_per_sample;
     uint64_t submitted;              /* bytes put into the stream, in the caller's format */
     uint64_t chunk_end[QUEUE_SIZE];  /* FIFO: cumulative end of each submission */
@@ -81,7 +89,15 @@ typedef struct {
 } submix;
 #define SUBMIXES 32u
 
-#define MIX_FRAME_BYTES (RECOMP_SPEAKERS * 4u)
+/* Every voice is handed to SDL as float frames in the device's own channel
+ * layout, with its mix and the fold-down (audio_speakers.h) already applied:
+ * SDL's 5.1-to-stereo conversion would play a mixed voice 10 dB under an
+ * unmixed one, and a voice whose format changed with its mix had to be
+ * remade, losing what it had queued. Set when the device opens, before any
+ * voice exists. */
+static uint32_t g_out_channels = 2u;
+static float    g_fold[RECOMP_SPEAKERS][RECOMP_FOLD_MAX_CHANNELS];
+#define MIX_FRAME_BYTES (g_out_channels * 4u)
 #define MAX_RATIO       8.0f
 
 static pthread_mutex_t   g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -100,6 +116,7 @@ static unsigned long long g_dropped_buffers;
 static void drop_buffer(uint32_t slot, const char *reason)
 {
     ++g_dropped_buffers;
+    recomp_audio_health_refused();
     if (g_dropped_buffers <= 4 || (g_dropped_buffers & (g_dropped_buffers - 1)) == 0)
         fprintf(stderr, "[audio-output] dropped=%llu slot=%u reason=%s\n",
                 g_dropped_buffers, slot, reason);
@@ -109,6 +126,8 @@ static void destroy_voice(voice *v)
 {
     if (v->stream)
         SDL_DestroyAudioStream(v->stream);     /* unbinds it from the device */
+    if (v->send)
+        SDL_DestroyAudioStream(v->send);
     memset(v, 0, sizeof *v);
 }
 
@@ -175,14 +194,109 @@ static int effective_mix(uint32_t slot, uint32_t channels, RecompAudioMix *out)
     return 1;
 }
 
-/* The caller's PCM as 5.1 float frames with the slot's mix applied: the
- * voice's low-pass (a state-variable filter, as the console's and XAudio2's
- * are) on each channel, then its speaker levels. */
-static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm,
-                      uint32_t bytes, uint32_t channels, uint32_t bits, uint32_t *out_bytes)
+/* ── The native path's room ──────────────────────────────────────
+ *
+ * SDL mixes each voice as a stream of its own, so there is no one place
+ * where the voices' reverb sends add up -- and a send summed when it is
+ * submitted would reach the room before the dry sound, by however much the
+ * voice has queued. So the sends are streams too (voice.send), bound to a
+ * second logical device on the same output: SDL mixes them in device time,
+ * as it mixes the voices, and that device's post-mix runs the room over the
+ * summed send and replaces it with the wet sound. Nothing of the dry send is
+ * ever heard. The bus is mixed after the main device's post-mix, so the
+ * limiter does not see the wet sound. SDL applies a logical device's gain to
+ * its streams before its post-mix, so the bus keeps the device's gain and a
+ * muted run (RECOMP_MUTE) silences the wet sound in the post-mix instead,
+ * after the room has run -- as the main device's post-mix does.
+ *
+ * The send streams carry the send in channel 0 of the device's layout, so
+ * SDL does no channel conversion on the way to the bus. */
+static SDL_AudioDeviceID g_bus;
+static int               g_post_muted;          /* defined with the post-mix below */
+static RecompReverb     *g_bus_reverb;
+static pthread_mutex_t   g_bus_lock = PTHREAD_MUTEX_INITIALIZER;   /* g_bus_reverb only */
+static int               g_bus_room;                              /* a room to hear */
+/* What reached the bus and what left it (tests/audio_output): frames with a
+ * send in them, frames with wet sound, and when each was first seen. */
+static uint64_t g_bus_send_frames, g_bus_wet_frames, g_bus_first_send_ns, g_bus_first_wet_ns;
+
+void recomp_audio_output_reverb_stats(uint64_t *send_frames, uint64_t *wet_frames,
+                                      uint64_t *first_send_ns, uint64_t *first_wet_ns)
 {
-    static float *buf;
-    static uint32_t cap;
+    pthread_mutex_lock(&g_bus_lock);
+    if (send_frames) *send_frames = g_bus_send_frames;
+    if (wet_frames) *wet_frames = g_bus_wet_frames;
+    if (first_send_ns) *first_send_ns = g_bus_first_send_ns;
+    if (first_wet_ns) *first_wet_ns = g_bus_first_wet_ns;
+    pthread_mutex_unlock(&g_bus_lock);
+}
+
+static void SDLCALL bus_postmix(void *userdata, const SDL_AudioSpec *spec, float *buffer, int buflen)
+{
+    static float in[512], wet[2 * 512];
+    uint32_t n = spec->channels > 0 ? (uint32_t)spec->channels : 2u;
+    uint32_t frames = (uint32_t)buflen / (n * (uint32_t)sizeof(float)), done = 0, f;
+
+    (void)userdata;
+    pthread_mutex_lock(&g_bus_lock);
+    while (done < frames) {
+        uint32_t chunk = frames - done < 512u ? frames - done : 512u;
+        float *b = buffer + (size_t)done * n;
+        for (f = 0; f < chunk; f++)
+            in[f] = b[(size_t)f * n];
+        memset(wet, 0, sizeof(float) * 2u * chunk);
+        if (recomp_reverb_active(g_bus_reverb))
+            recomp_reverb_process(g_bus_reverb, in, 1, wet, wet + 1, 2, chunk);
+        for (f = 0; f < chunk; f++) {
+            if (fabsf(in[f]) > 1e-6f) {
+                g_bus_send_frames++;
+                if (!g_bus_first_send_ns) g_bus_first_send_ns = SDL_GetTicksNS();
+            }
+            if (fabsf(wet[2 * f]) + fabsf(wet[2 * f + 1]) > 1e-6f) {
+                g_bus_wet_frames++;
+                if (!g_bus_first_wet_ns) g_bus_first_wet_ns = SDL_GetTicksNS();
+            }
+        }
+        if (g_post_muted)
+            memset(wet, 0, sizeof(float) * 2u * chunk);
+        memset(b, 0, sizeof(float) * n * chunk);
+        for (f = 0; f < chunk; f++) {
+            if (n >= 2) {
+                b[(size_t)f * n] = wet[2 * f];
+                b[(size_t)f * n + 1] = wet[2 * f + 1];
+            } else {
+                b[f] = 0.70710678f * (wet[2 * f] + wet[2 * f + 1]);
+            }
+        }
+        done += chunk;
+    }
+    pthread_mutex_unlock(&g_bus_lock);
+}
+
+/* Opens the bus beside the main device; 0 leaves the native path dry. */
+static SDL_AudioDeviceID bus_open(float gain)
+{
+    SDL_AudioDeviceID bus = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
+    if (!bus)
+        return 0;
+    if (!SDL_SetAudioPostmixCallback(bus, bus_postmix, NULL)) {
+        SDL_CloseAudioDevice(bus);
+        return 0;        /* the dry sends would be heard: no bus at all */
+    }
+    SDL_SetAudioDeviceGain(bus, gain);
+    return bus;
+}
+
+/* The caller's PCM as float frames in the device's layout with the slot's
+ * mix applied: the voice's low-pass (a state-variable filter, as the
+ * console's and XAudio2's are) on each channel, then its speaker levels,
+ * folded onto the device's channels. */
+static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm,
+                      uint32_t bytes, uint32_t channels, uint32_t bits, uint32_t *out_bytes,
+                      float **send_out)
+{
+    static float *buf, *sendbuf;
+    static uint32_t cap, sendcap;
     uint32_t frame = channels * (bits / 8), frames = bytes / frame, f, c, s;
     uint32_t need = frames * MIX_FRAME_BYTES;
 
@@ -193,10 +307,34 @@ static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm
         buf = grown;
         cap = need;
     }
+    float into[2][RECOMP_FOLD_MAX_CHANNELS];
+    uint32_t n = g_out_channels, k;
+    float *sendp = NULL;
+
+    /* The reverb send, filtered as the dry path is, in channel 0. */
+    if (send_out) {
+        if (need > sendcap) {
+            float *grown = (float *)realloc(sendbuf, need);
+            if (!grown)
+                return NULL;
+            sendbuf = grown;
+            sendcap = need;
+        }
+        memset(sendbuf, 0, need);
+        sendp = sendbuf;
+        *send_out = sendbuf;
+    }
+
+    for (c = 0; c < 2u; c++)
+        for (k = 0; k < n; k++) {
+            into[c][k] = 0.0f;
+            for (s = 0; s < RECOMP_SPEAKERS; s++)
+                into[c][k] += mix->levels[c][s] * g_fold[s][k];
+        }
     for (f = 0; f < frames; f++) {
-        float *o = buf + (size_t)f * RECOMP_SPEAKERS;
-        for (s = 0; s < RECOMP_SPEAKERS; s++)
-            o[s] = 0.0f;
+        float *o = buf + (size_t)f * n;
+        for (k = 0; k < n; k++)
+            o[k] = 0.0f;
         for (c = 0; c < channels && c < 2u; c++) {
             float x = bits == 8u ? ((float)pcm[f * frame + c] - 128.0f) / 128.0f
                                  : (float)(int16_t)(pcm[f * frame + c * 2u] |
@@ -207,8 +345,10 @@ static float *mix_pcm(slot_mix *m, const RecompAudioMix *mix, const uint8_t *pcm
                 m->svf_low[c] += mix->filter.frequency * m->svf_band[c];
                 x = m->svf_low[c];
             }
-            for (s = 0; s < RECOMP_SPEAKERS; s++)
-                o[s] += x * mix->levels[c][s];
+            for (k = 0; k < n; k++)
+                o[k] += x * into[c][k];
+            if (sendp)
+                sendp[(size_t)f * n] += x * mix->reverb[c];
         }
     }
     *out_bytes = need;
@@ -444,6 +584,9 @@ static void *open_device_thread(void *arg)
 
         SDL_zero(spec);
         SDL_GetAudioDeviceFormat(dev, &spec, &frames);
+        g_out_channels = spec.channels >= 1 && spec.channels <= (int)RECOMP_FOLD_MAX_CHANNELS
+                       ? (uint32_t)spec.channels : 2u;
+        recomp_audio_fold_matrix(g_out_channels, g_fold);
         fprintf(stderr, "[audio-output] initialized backend=sdl3_%s master_gain=%.6f "
                 "device=%d Hz %d ch, %d-frame buffer\n", SDL_GetCurrentAudioDriver(),
                 (double)gain, spec.freq, spec.channels, frames);
@@ -455,6 +598,14 @@ static void *open_device_thread(void *arg)
         const char *delay = getenv("RECOMP_AUDIO_OPEN_DELAY_MS");
         if (delay && *delay && atoi(delay) > 0)
             SDL_Delay((Uint32)atoi(delay));
+    }
+    /* The native path's send bus, beside it (muted in its post-mix). */
+    {
+        SDL_AudioDeviceID bus = bus_open(gain);
+        if (!bus)
+            fprintf(stderr, "[audio-output] no reverb send bus (%s): the native path "
+                    "plays dry\n", SDL_GetError());
+        __atomic_store_n(&g_bus, bus, __ATOMIC_RELEASE);
     }
     pthread_mutex_lock(&g_lock);
     if (g_summary_printed) {                 /* shut down while this was opening */
@@ -509,6 +660,8 @@ void recomp_audio_output_shutdown(void)
 {
     uint32_t i;
 
+    recomp_audio_health_report();
+
     pthread_mutex_lock(&g_lock);
     if (g_summary_printed) {
         pthread_mutex_unlock(&g_lock);
@@ -524,6 +677,9 @@ void recomp_audio_output_shutdown(void)
     if (g_device)
         SDL_CloseAudioDevice(g_device);
     g_device = 0;
+    if (g_bus)
+        SDL_CloseAudioDevice(g_bus);
+    g_bus = 0;
     if (g_capture) {
         capture_header(g_capture, g_capture_rate ? g_capture_rate : 48000u,
                        g_capture_channels ? g_capture_channels : 2u, g_capture_bytes);
@@ -593,6 +749,14 @@ void recomp_audio_output_release_voice(uint32_t slot)
             SDL_FlushAudioStream(v->stream);
             g_draining[i] = v->stream;
             v->stream = NULL;
+            /* Its send plays out with it, into the room. */
+            for (i = 0; v->send && i < DRAINING_MAX && g_draining[i]; i++)
+                ;
+            if (v->send && i < DRAINING_MAX) {
+                SDL_FlushAudioStream(v->send);
+                g_draining[i] = v->send;
+                v->send = NULL;
+            }
         }
     }
     destroy_voice(v);
@@ -669,14 +833,43 @@ void recomp_audio_output_set_submix(uint32_t key, uint32_t channels, const Recom
     pthread_mutex_unlock(&g_lock);
 }
 
-/* No reverb on this backend yet: voices play dry. */
+/* The room (audio_reverb.c), twice: the APU path's stream runs its reverb
+ * send (mix bin 10) through g_reverb, and the native path's voices' sends
+ * reach g_bus_reverb through the send bus (bus_postmix). */
+static RecompReverb *g_reverb;
+static RecompI3dl2   g_room;
+static int           g_room_set;
+
 void recomp_audio_output_set_reverb(const RecompI3dl2 *room)
 {
     static int said;
+    pthread_mutex_lock(&g_lock);
+    g_room_set = room != NULL;
+    if (room)
+        g_room = *room;
+    if (g_reverb)
+        recomp_reverb_set_room(g_reverb, room);
+    pthread_mutex_unlock(&g_lock);
+    /* The native path's room (the bus). */
+    pthread_mutex_lock(&g_bus_lock);
+    if (!g_bus_reverb && room && room->room > -10000) {
+        SDL_AudioSpec spec;
+        int frames = 0;
+        SDL_zero(spec);
+        if (g_bus)
+            SDL_GetAudioDeviceFormat(g_bus, &spec, &frames);
+        g_bus_reverb = recomp_reverb_create(spec.freq > 0 ? (uint32_t)spec.freq : 48000u);
+    }
+    if (g_bus_reverb)
+        recomp_reverb_set_room(g_bus_reverb, room);
+    __atomic_store_n(&g_bus_room, recomp_reverb_active(g_bus_reverb), __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_bus_lock);
     if (room && room->room > -10000 && !said) {
         said = 1;
-        fprintf(stderr, "[audio-output] the title describes an I3DL2 room; this backend "
-                "has no reverb yet, so it plays dry\n");
+        fprintf(stderr, "[audio-output] I3DL2 room %d, decay %.2f s: reverb on %s\n",
+                room->room, (double)room->decay_time,
+                g_bus ? "the native path's send bus and the APU path's stream"
+                      : "the APU path's stream (no send bus: the native path plays dry)");
     }
 }
 
@@ -747,9 +940,22 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     v = &g_voices[slot];
     {
         RecompAudioMix probe;
-        mixed_now = effective_mix(slot, channels, &probe);
-        if (mixed_now)
+        if (effective_mix(slot, channels, &probe)) {
             eff = probe;
+        } else {
+            /* No mix: the channels to the front speakers at full level, as
+             * SDL's own mono and stereo conversions put them. Every voice
+             * is mixed here, so a mix being set or cleared never changes
+             * the stream's format. */
+            memset(&eff, 0, sizeof eff);
+            eff.ratio = 1.0f;
+            eff.levels[0][RECOMP_SPEAKER_FRONT_LEFT] = 1.0f;
+            if (channels == 2u)
+                eff.levels[1][RECOMP_SPEAKER_FRONT_RIGHT] = 1.0f;
+            else
+                eff.levels[0][RECOMP_SPEAKER_FRONT_RIGHT] = 1.0f;
+        }
+        mixed_now = 1;
     }
     if (v->stream && (v->sample_rate != sample_rate || v->channels != channels ||
                       v->bits_per_sample != bits_per_sample ||
@@ -768,7 +974,7 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         src.freq = (int)sample_rate;
         if (mixed_now) {
             src.format = SDL_AUDIO_F32;
-            src.channels = RECOMP_SPEAKERS;   /* SDL's 5.1 order is the Xbox's */
+            src.channels = (int)g_out_channels;   /* folded: audio_speakers.h */
         }
         v->stream = SDL_CreateAudioStream(&src, NULL);
         if (!v->stream || !SDL_BindAudioStream(g_device, v->stream)) {
@@ -788,6 +994,8 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         if (!(ratio >= 1.0f / MAX_RATIO)) ratio = 1.0f / MAX_RATIO;
         if (ratio > MAX_RATIO) ratio = MAX_RATIO;
         SDL_SetAudioStreamFrequencyRatio(v->stream, ratio);
+        if (v->send)
+            SDL_SetAudioStreamFrequencyRatio(v->send, ratio);
         v->mix_applied = g_mixes[slot].generation;
     }
 
@@ -803,6 +1011,32 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     }
     v->last_gain = gain;
     SDL_SetAudioStreamGain(v->stream, gain);
+
+    /* A send stream once the voice sends to a room, started as far behind
+     * as the voice has queued so the two line up. */
+    if (!v->send && g_bus && __atomic_load_n(&g_bus_room, __ATOMIC_ACQUIRE) &&
+        (eff.reverb[0] > 0.0f || eff.reverb[1] > 0.0f)) {
+        SDL_AudioSpec ss;
+        ss.format = SDL_AUDIO_F32;
+        ss.channels = (int)g_out_channels;
+        ss.freq = (int)sample_rate;
+        v->send = SDL_CreateAudioStream(&ss, NULL);
+        if (v->send && SDL_BindAudioStream(g_bus, v->send)) {
+            int q = SDL_GetAudioStreamQueued(v->stream);
+            static float zeros[4096];
+            SDL_SetAudioStreamFrequencyRatio(v->send, SDL_GetAudioStreamFrequencyRatio(v->stream));
+            while (q > 0) {
+                int chunk = q < (int)sizeof zeros ? q : (int)sizeof zeros;
+                SDL_PutAudioStreamData(v->send, zeros, chunk);
+                q -= chunk;
+            }
+        } else if (v->send) {
+            SDL_DestroyAudioStream(v->send);
+            v->send = NULL;
+        }
+    }
+    if (v->send)
+        SDL_SetAudioStreamGain(v->send, gain);
 
     retire_played(v);
     if (g_post_meter && v->submitted && SDL_GetAudioStreamQueued(v->stream) == 0)
@@ -843,13 +1077,16 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     }
     if (v->mixed) {
         uint32_t out_bytes = 0;
+        float *send = NULL;
         const float *frames = mix_pcm(&g_mixes[slot], &eff, pcm, bytes, channels,
-                                      bits_per_sample, &out_bytes);
+                                      bits_per_sample, &out_bytes, v->send ? &send : NULL);
         if (!frames || !SDL_PutAudioStreamData(v->stream, frames, (int)out_bytes)) {
             drop_buffer(slot, "submit");
             pthread_mutex_unlock(&g_lock);
             return 0;
         }
+        if (v->send && send)
+            SDL_PutAudioStreamData(v->send, send, (int)out_bytes);
     } else if (!SDL_PutAudioStreamData(v->stream, pcm, (int)bytes)) {
         drop_buffer(slot, "submit");
         pthread_mutex_unlock(&g_lock);
@@ -871,5 +1108,123 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     if (nonzero)
         g_reported_nonzero[slot] = 1;
     pthread_mutex_unlock(&g_lock);
+    recomp_audio_health_sound(slot, slot >= 256u, nonzero);
     return 1;
+}
+
+/* ── The APU path's stream (audio_output.h, recomp_audio_output_mix_*) ──
+ *
+ * One SDL stream in the device's layout, fed the speaker stage's frames
+ * folded with g_fold, so the APU path and the native path put a sound at the
+ * same level. The reverb send (the last channel) is not played yet: SDL has
+ * no reverb of its own. */
+static SDL_AudioStream *g_mix_stream;
+static uint32_t         g_mix_rate;
+static float           *g_mix_buf;
+static uint32_t         g_mix_cap;
+
+int recomp_audio_output_mix_submit(const float *frames, uint32_t count, uint32_t rate)
+{
+    uint32_t n, f, k, s, need;
+
+    recomp_audio_output_initialize();
+    if (!__atomic_load_n(&g_device, __ATOMIC_ACQUIRE) || !frames || !count ||
+        rate < MIN_RATE || rate > MAX_RATE)
+        return 0;
+    pthread_mutex_lock(&g_lock);
+    n = g_out_channels;
+    if (!g_mix_stream || g_mix_rate != rate) {
+        SDL_AudioSpec src;
+        if (g_mix_stream)
+            SDL_DestroyAudioStream(g_mix_stream);
+        src.format = SDL_AUDIO_F32;
+        src.channels = (int)n;
+        src.freq = (int)rate;
+        g_mix_stream = SDL_CreateAudioStream(&src, NULL);
+        if (!g_mix_stream || !SDL_BindAudioStream(g_device, g_mix_stream)) {
+            fprintf(stderr, "[audio-output] APU stream: %s\n", SDL_GetError());
+            if (g_mix_stream)
+                SDL_DestroyAudioStream(g_mix_stream);
+            g_mix_stream = NULL;
+            pthread_mutex_unlock(&g_lock);
+            recomp_audio_health_refused();
+            return 0;
+        }
+        g_mix_rate = rate;
+        fprintf(stderr, "[audio-output] APU stream: %u Hz, folded onto %u channel(s)\n",
+                rate, n);
+    }
+    need = count * n * (uint32_t)sizeof(float);
+    if (need > g_mix_cap) {
+        float *grown = (float *)realloc(g_mix_buf, need);
+        if (!grown) {
+            pthread_mutex_unlock(&g_lock);
+            recomp_audio_health_refused();
+            return 0;
+        }
+        g_mix_buf = grown;
+        g_mix_cap = need;
+    }
+    for (f = 0; f < count; f++) {
+        const float *in = frames + (size_t)f * RECOMP_MIX_CHANNELS;
+        float *o = g_mix_buf + (size_t)f * n;
+        for (k = 0; k < n; k++) {
+            float v = 0.0f;
+            for (s = 0; s < RECOMP_SPEAKERS; s++)
+                v += in[s] * g_fold[s][k];
+            o[k] = v;
+        }
+    }
+    /* The reverb send, through the room, into the front pair (both halves
+     * into a mono device). */
+    if (!g_reverb && g_room_set) {
+        g_reverb = recomp_reverb_create(rate);
+        if (g_reverb)
+            recomp_reverb_set_room(g_reverb, &g_room);
+    }
+    if (recomp_reverb_active(g_reverb)) {
+        if (n >= 2) {
+            recomp_reverb_process(g_reverb, frames + RECOMP_SPEAKERS, RECOMP_MIX_CHANNELS,
+                                  g_mix_buf, g_mix_buf + 1, n, count);
+        } else {
+            static float wet[2 * 512];
+            uint32_t done = 0;
+            while (done < count) {
+                uint32_t chunk = count - done < 512u ? count - done : 512u;
+                memset(wet, 0, sizeof wet);
+                recomp_reverb_process(g_reverb,
+                                      frames + (size_t)done * RECOMP_MIX_CHANNELS + RECOMP_SPEAKERS,
+                                      RECOMP_MIX_CHANNELS, wet, wet + 1, 2, chunk);
+                for (f = 0; f < chunk; f++)
+                    g_mix_buf[done + f] += 0.70710678f * (wet[2 * f] + wet[2 * f + 1]);
+                done += chunk;
+            }
+        }
+    }
+    if (!SDL_PutAudioStreamData(g_mix_stream, g_mix_buf, (int)need)) {
+        pthread_mutex_unlock(&g_lock);
+        recomp_audio_health_refused();
+        return 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
+int recomp_audio_output_mix_queued_ms(void)
+{
+    int q, ms;
+
+    if (!__atomic_load_n(&g_device, __ATOMIC_ACQUIRE))
+        return -1;
+    pthread_mutex_lock(&g_lock);
+    if (!g_mix_stream || !g_mix_rate) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    q = SDL_GetAudioStreamQueued(g_mix_stream);
+    ms = q > 0 ? (int)((int64_t)q / (int64_t)(g_out_channels * sizeof(float)) * 1000 /
+                       (int64_t)g_mix_rate)
+               : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ms;
 }

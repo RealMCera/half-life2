@@ -67,6 +67,11 @@
 #include <string.h>
 
 #include "hle.h"
+
+/* The DirectSound replacement: off under RECOMP_AUDIO=apu, when the title's
+ * own DirectSound drives the emulated APU (src/hle/audio_path.c). */
+HLE_GROUP(audio)
+#include "audio_path.h"
 #include "hle_dsound_3d.h"
 
 int xbox_EnvSwitch(const char *name, int default_on);
@@ -1187,6 +1192,10 @@ static void read_room(RecompI3dl2 *r, uint32_t p)
     r->hf_reference = as_float(HLE_MEM32(p + 0x2Cu));
 }
 
+/* On the APU path too: the title's own DirectSound programs the chip, and
+ * the room it describes reaches the host's reverb from here, as the native
+ * path's service thread would hand it on (it does not run there). */
+HLE_APU_OBSERVE(IDirectSound_SetI3DL2Listener)
 HLE_ORIGINAL(IDirectSound_SetI3DL2Listener);
 HLE_EXPORT(IDirectSound_SetI3DL2Listener)
 {
@@ -1212,6 +1221,8 @@ HLE_EXPORT(IDirectSound_SetI3DL2Listener)
         }
     }
     PASS(IDirectSound_SetI3DL2Listener);
+    if (recomp_audio_path_apu())
+        hle_ds3d_service();
 }
 
 /* DSI3DL2BUFFER { lDirect, lDirectHF, lRoom, lRoomHF, flRoomRolloffFactor,
@@ -1309,14 +1320,25 @@ HLE_EXPORT(IDirectSoundStream_SetOutputBuffer)
 }
 
 /* SetEG(this, pEnvelopeDesc): DSENVELOPEDESC's ten DWORDs, the first saying
- * which envelope (0 amplitude, 1 multi). hle_dsound.c runs them. */
+ * which envelope: DSEG_AMPLITUDE is 1 and DSEG_MULTI is 0. Stored here as
+ * [0] amplitude, [1] multi, which is how hle_dsound.c runs them.
+ *
+ * The XDK's own CMcpxVoiceClient_SetEG says so: its dwEG == 0 branch is the
+ * only one that reads lPitchScale and lFilterCutOff (+0x20, +0x24), which
+ * only the multi envelope has, and any other value stores nothing. This was
+ * read the other way round, and a title that sets both (TimeSplitters 2, for
+ * every sound effect: amplitude sustain 255, multi all 0) had its multi
+ * envelope applied as the volume -- every effect sample times 0. */
 static void envelope(uint32_t key, uint32_t p)
 {
     Voice *v;
-    uint32_t k, which;
+    uint32_t k, which, eg;
     if (!p || !guest_readable(p, 40u))
         return;
-    which = HLE_MEM32(p) & 1u;
+    eg = HLE_MEM32(p);
+    if (eg > 1u)
+        return;
+    which = eg == 1u ? 0u : 1u;
     lock();
     v = get(key);
     if (v) {
@@ -1347,7 +1369,9 @@ HLE_EXPORT(IDirectSoundStream_SetEG)
     PASS(IDirectSoundStream_SetEG);
 }
 
-/* Everything deferred becomes what is heard. */
+/* Everything deferred becomes what is heard. Kept on the APU path for the
+ * deferred room (see SetI3DL2Listener). */
+HLE_APU_OBSERVE(IDirectSound_CommitDeferredSettings)
 HLE_ORIGINAL(IDirectSound_CommitDeferredSettings);
 HLE_EXPORT(IDirectSound_CommitDeferredSettings)
 {
@@ -1369,6 +1393,8 @@ HLE_EXPORT(IDirectSound_CommitDeferredSettings)
         }
     unlock();
     PASS(IDirectSound_CommitDeferredSettings);
+    if (recomp_audio_path_apu())
+        hle_ds3d_service();
 }
 
 /* Creation: DSBUFFERDESC { dwSize, dwFlags, dwBufferBytes, lpwfxFormat,
