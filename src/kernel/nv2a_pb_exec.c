@@ -2786,8 +2786,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      * them apart. area > 0 is the fill loop's all-edge-functions-positive
      * side, which in window coordinates (y down) is clockwise. Front face
      * 0x900 = CW, 0x901 = CCW, the GL enums; left unwritten it counts as
-     * CCW, the GL reset. Cull face 0x404 = FRONT, 0x405 = BACK, 0x406 =
-     * FRONT_AND_BACK, likewise. A back end culls its own (it is handed
+     * CCW, the GL reset. Cull face 0x404 = FRONT, 0x405 = BACK, 0x408 =
+     * FRONT_AND_BACK (the NV097 enum; GL's 0x406 is not what the register
+     * carries), likewise. A back end culls its own (it is handed
      * everything); this is the CPU rasteriser's copy of the test. */
     if (s_reg[0x0308 / 4]) {                   /* SET_CULL_FACE_ENABLE */
         int front_is_ccw = s_reg[0x03A0 / 4] != 0x900;
@@ -2795,7 +2796,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         int tri_is_front = front_is_ccw ? tri_is_ccw : !tri_is_ccw;
         uint32_t cf = s_reg[0x039C / 4];       /* SET_CULL_FACE */
 
-        if (cf == 0x406
+        if (cf == 0x408
          || (cf == 0x404 && tri_is_front)
          || (cf == 0x405 && !tri_is_front)) {
             s_gpu.tris_culled++;
