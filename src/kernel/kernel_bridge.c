@@ -3693,6 +3693,16 @@ static void bridge_NtOpenFile(void)
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 
+/* Run guest code with the guest CPU. A file-I/O completion APC is delivered
+ * from inside the kernel call, where the thread has let the CPU go, so the
+ * callback ran in parallel with other guest threads. On the console it
+ * preempts the issuing thread and nothing else runs meanwhile; EA's stream
+ * manager (SSX 3) scans a ring from that callback while the loader advances
+ * its read pointer, and the race loses the end of a request -- the race load
+ * hung. RECOMP_APC_LOCK=0 turns it off. */
+static int guest_cpu_callback_enter(void);
+static void guest_cpu_callback_leave(int took);
+
 static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
                             uint32_t iostatus)
 {
@@ -3709,7 +3719,11 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-        fn();
+        {
+            int took = guest_cpu_callback_enter();
+            fn();
+            guest_cpu_callback_leave(took);
+        }
         g_esp += 12;
     } else {
         uint32_t ord = 0;
@@ -9977,10 +9991,10 @@ static void kernel_thunk_dispatch_body(void);
  * where the console's scheduler would switch threads anyway. Host threads
  * that only run a guest callback (vblank, interrupts) never take it.
  *
- * ponytail: a guest thread that spins in guest code on a flag another guest
- * thread sets, with no kernel call in the loop, deadlocks here. The console
- * would preempt it on its quantum; the upgrade is a periodic yield point in
- * the lifted code's backward branches. */
+ * A thread that spins in guest code on a flag another guest thread sets,
+ * with no kernel call in the loop, would hold the CPU forever; the console
+ * preempts it on its quantum. The lifted code yields at its loop heads
+ * (RECOMP_LOOP_YIELD, recomp_loop_yield below). */
 static CRITICAL_SECTION g_guest_cpu;
 static int g_guest_cpu_on = -1;
 static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
@@ -9999,14 +10013,151 @@ static int guest_cpu_enabled(void)
     return g_guest_cpu_on;
 }
 
+/* Milliseconds at QueryPerformanceCounter resolution: the hand-over waits
+ * below are a few ms, finer than GetTickCount's 15.6 ms steps. */
+static double guest_cpu_ms(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+/* Guest threads waiting for the guest CPU, and a count of hand-overs: a
+ * yield uses them to make sure a waiter actually gets its turn. */
+static volatile LONG g_guest_waiters, g_guest_gen;
+
+static void guest_cpu_acquire(void)
+{
+    InterlockedIncrement(&g_guest_waiters);
+    EnterCriticalSection(&g_guest_cpu);
+    InterlockedDecrement(&g_guest_waiters);
+    InterlockedIncrement(&g_guest_gen);
+}
+
+/* RECOMP_FAIR_YIELD=0: the plain yield (let go, SwitchToThread, take it
+ * again), which a waiter usually loses. */
+static int fair_yield_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FAIR_YIELD");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* After letting go with a waiter present: wait (at most 5 ms) until someone
+ * else has taken the CPU. A Windows critical section is not fair -- the
+ * thread that leaves it and re-enters at once usually wins against a waiter
+ * that has to be woken and scheduled first, and under host load it won
+ * every time: SSX 3's title screen froze with its file worker, read done,
+ * waiting in vain to get the CPU back while the main thread spun in the
+ * movie player on the data that worker was to deliver. */
+static void guest_cpu_hand_over(LONG gen)
+{
+    double t0 = guest_cpu_ms();
+    while (g_guest_gen == gen && guest_cpu_ms() - t0 < 5.0)
+        SwitchToThread();
+}
+
 /* Called once on each host thread that runs a guest thread, before its first
  * guest instruction. */
 void guest_cpu_join(void)
 {
     t_guest_thread = 1;
     if (guest_cpu_enabled() && !t_guest_held) {
-        EnterCriticalSection(&g_guest_cpu);
+        guest_cpu_acquire();
         t_guest_held = 1;
+    }
+}
+
+/* Loop-head preemption (RECOMP_LOOP_YIELD in the generated code): every
+ * RECOMP_LOOP_QUANTUM loop iterations a guest thread holding the guest CPU
+ * lets it go and yields, so a thread spinning on a flag another guest thread
+ * sets -- SSX 3's loader polling its I/O slots with no kernel call -- cannot
+ * starve that thread. Without the lock it only resets the counter. */
+#define RECOMP_LOOP_QUANTUM 4096
+RECOMP_TLS int g_loop_budget = RECOMP_LOOP_QUANTUM;
+
+void recomp_loop_yield(void)
+{
+    static int quantum;
+    if (!quantum) {
+        const char *e = getenv("RECOMP_LOOP_QUANTUM");
+        quantum = (e && atoi(e) > 0) ? atoi(e) : RECOMP_LOOP_QUANTUM;
+    }
+    g_loop_budget = quantum;
+    if (t_guest_held) {
+        LONG gen = g_guest_gen;
+        int waiting = fair_yield_on() && g_guest_waiters > 0;
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+        if (waiting)
+            guest_cpu_hand_over(gen);
+        else
+            SwitchToThread();
+        guest_cpu_acquire();
+        t_guest_held = 1;
+    }
+}
+
+/* Interrupt and DPC context takes the guest CPU too (RECOMP_IRQ_LOCK=0 off).
+ *
+ * On the Xbox an ISR or DPC preempts whatever thread was running and nothing
+ * else runs until it returns, and the kernel and XDK lean on that -- a
+ * uniprocessor spinlock only raises IRQL. Here ISRs (vblank, USB, APU, GPU)
+ * and DPCs run on host threads of their own, truly in parallel with the
+ * guest thread they were supposed to have interrupted; SSX 3's USB
+ * enumeration then stalled in about one boot in four (no pad on the title
+ * screen). Called from xbox_IrqlEnterInterrupt / xbox_IrqlLeaveInterrupt,
+ * so every delivered ISR and DPC is bracketed; the critical section is
+ * recursive, so a routine delivered on a thread that already holds it
+ * nests. */
+static int irq_lock_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_IRQ_LOCK");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+void guest_cpu_irq_enter(void)
+{
+    if (irq_lock_on() && guest_cpu_enabled())
+        EnterCriticalSection(&g_guest_cpu);
+}
+
+void guest_cpu_irq_leave(void)
+{
+    if (irq_lock_on() && guest_cpu_enabled())
+        LeaveCriticalSection(&g_guest_cpu);
+}
+
+static int guest_cpu_callback_enter(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APC_LOCK");
+        on = !(e && *e == '0');
+    }
+    if (on && guest_cpu_enabled() && t_guest_thread && !t_guest_held) {
+        guest_cpu_acquire();
+        t_guest_held = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static void guest_cpu_callback_leave(int took)
+{
+    if (took && t_guest_held) {
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
     }
 }
 
@@ -10019,11 +10170,59 @@ void guest_cpu_part(void)
     t_guest_thread = 0;
 }
 
+/* Kernel calls that never wait keep the guest CPU (RECOMP_CS_KEEP_CPU=0
+ * restores "every call lets go").
+ *
+ * On the Xbox an uncontended RtlEnterCriticalSection and every
+ * RtlLeaveCriticalSection are a few instructions on the calling thread: no
+ * other thread runs in between. Letting go of the guest CPU there made each
+ * lock operation a preemption point the console does not have, and code that
+ * takes a lock around only part of its work came apart: EA's stream manager
+ * (SSX 3) scans freshly read blocks for a request's end tag partly outside
+ * its lock, the reader's thread runs the same scan when it releases a chunk,
+ * and with a switch at every lock call the two interleaved -- the end tag
+ * was missed and the race load hung. Enter keeps the CPU when the lock is
+ * free (taken with a try-enter that stays held, so there is no window to lose
+ * it in) and lets go only when it has to wait. */
+static int cs_keep_cpu(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CS_KEEP_CPU");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+int  xbox_cs_try_hold(PRTL_CRITICAL_SECTION cs);    /* kernel_rtl.c */
+void xbox_cs_drop_hold(PRTL_CRITICAL_SECTION cs);
+
 /* A guest thread lets go of the guest CPU for the length of every kernel
- * call. */
+ * call that may wait. */
 static void kernel_thunk_dispatch(void)
 {
     int held = t_guest_held;
+    LONG gen = g_guest_gen;
+    int waiter = held && fair_yield_on() && g_guest_waiters > 0;
+    /* Only while nobody waits for the guest CPU: a guest thread that wants
+     * it -- a file worker with a finished read, say -- gets it at the next
+     * kernel call, as a ready higher-priority thread would on the Xbox. */
+    if (held && cs_keep_cpu() && !waiter) {
+        int slot = g_kernel_dispatch_slot;
+        ULONG ord = (slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE) ? g_slot_ordinals[slot] : 0;
+        if (ord == 294 || ord == 295) {             /* RtlLeaveCriticalSection(AndRegion) */
+            kernel_thunk_dispatch_body();
+            return;
+        }
+        if (ord == 277 || ord == 278) {             /* RtlEnterCriticalSection(AndRegion) */
+            PRTL_CRITICAL_SECTION cs = (PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(BRIDGE_MEM32(g_esp + 4));
+            if (xbox_cs_try_hold(cs)) {
+                kernel_thunk_dispatch_body();       /* nests on the hold */
+                xbox_cs_drop_hold(cs);
+                return;
+            }
+        }
+    }
     if (held) {                        /* let other guest threads run meanwhile */
         t_guest_held = 0;
         LeaveCriticalSection(&g_guest_cpu);
@@ -10031,14 +10230,15 @@ static void kernel_thunk_dispatch(void)
     t_dispatch_depth++;
     kernel_thunk_dispatch_body();
     t_dispatch_depth--;
+    if (waiter)                        /* hand over, not just offer */
+        guest_cpu_hand_over(gen);
     /* Back to guest code: take the CPU again. Only at the outermost call --
      * a guest callback a bridge runs (an APC) returns into the bridge, not to
      * the thread's own code -- and only if the thread still exists as one. */
     if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
-        EnterCriticalSection(&g_guest_cpu);
+        guest_cpu_acquire();
         t_guest_held = 1;
     }
-    (void)held;
 }
 
 static void kernel_thunk_dispatch_body(void)

@@ -210,9 +210,13 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+extern void guest_cpu_irq_enter(void);
+extern void guest_cpu_irq_leave(void);
+
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    guest_cpu_irq_enter();             /* one CPU: the routine runs alone */
     if (g_current_irql != (KIRQL)level) {
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
         g_current_irql = (KIRQL)level;
@@ -228,6 +232,7 @@ void xbox_IrqlLeaveInterrupt(int saved)
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    guest_cpu_irq_leave();
 }
 
 /*

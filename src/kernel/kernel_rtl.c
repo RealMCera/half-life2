@@ -532,6 +532,23 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+/* For the guest CPU lock (kernel_bridge.c, RECOMP_CS_KEEP_CPU): take the
+ * critical section if it is free, without blocking, so an uncontended
+ * RtlEnterCriticalSection can run without letting go of the guest CPU in
+ * between. xbox_cs_drop_hold undoes the extra hold afterwards. */
+int xbox_cs_try_hold(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    return cs && TryEnterCriticalSection(cs);
+}
+
+void xbox_cs_drop_hold(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (cs)
+        LeaveCriticalSection(cs);
+}
+
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing

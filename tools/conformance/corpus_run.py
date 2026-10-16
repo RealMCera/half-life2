@@ -169,6 +169,8 @@ volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
+RECOMP_TLS int g_loop_budget = 1 << 30;   /* loop-head yields (RECOMP_LOOP_YIELD): never due */
+void recomp_loop_yield(void) { g_loop_budget = 1 << 30; }
 
 """
 

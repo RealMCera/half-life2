@@ -2842,6 +2842,15 @@ class FunctionTranslator:
                 # otherwise produce `loc_X:` immediately before `}` and fail to
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
+                # A loop head: some block at or after this one jumps back here.
+                # The guest CPU lock (RECOMP_GUEST_LOCK) needs a preemption
+                # point there -- a guest thread polling another guest thread
+                # with no kernel call in the loop would otherwise hold the CPU
+                # forever; the console's scheduler would have switched on its
+                # quantum. RECOMP_LOOP_YIELD is a TLS countdown, cheap when
+                # the lock is off.
+                if any(p >= bb.start for p in preds.get(bb.start, ())):
+                    lines.append("RECOMP_LOOP_YIELD();")
 
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The
