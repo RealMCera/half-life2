@@ -1051,6 +1051,11 @@ static void apu_irq_stats_line(void)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef _WIN32
+    /* Each 5.3 ms frame has to be on time or the device queue runs dry;
+     * at normal priority a busy game's threads delayed it into underruns. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {

@@ -304,7 +304,7 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
  *
  * Exported as a data pointer, not a function. The Xbox kernel increments
  * this every ~1ms (approximating the Xbox tick interval).
- * Updated lazily when read, using GetTickCount.
+ * Updated lazily when read, from xbox_TickCountMs (1 ms resolution).
  * ============================================================================ */
 
 volatile ULONG xbox_KeTickCount = 0;
@@ -312,7 +312,7 @@ volatile ULONG xbox_KeTickCount = 0;
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = xbox_TickCountMs();
 }
 
 /* ============================================================================

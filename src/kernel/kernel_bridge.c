@@ -222,7 +222,7 @@ static void kernel_data_init(void)
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = xbox_TickCountMs();
 
     /* LaunchDataPage (ordinal 164).
      *
@@ -2703,21 +2703,48 @@ uint32_t xbox_VblankCount(void)
     return (uint32_t)g_vblank_total;
 }
 
+/* Milliseconds from the performance counter. GetTickCount64 moves in
+ * ~15.6 ms steps: a "16 ms" vblank scheduled with it fired every 15.6 or
+ * 31.2 ms, ~43 Hz on average -- and a title that paces its frames on vblank
+ * (SSX 3 does) had that as its frame-rate ceiling. The kernel timers use it
+ * too. */
+static double qpc_now_ms(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+static double g_next_vblank_ms;            /* for the timer thread's wait */
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static double period = 1000.0 / 60.0;
+    double now;
 
-    if (enabled < 0)
+    if (enabled < 0) {
+        /* RECOMP_VBLANK_HZ: the refresh rate (default 60). */
+        const char *hz = getenv("RECOMP_VBLANK_HZ");
         enabled = getenv("RECOMP_VBLANK") != NULL;
+        if (hz && atof(hz) >= 10.0 && atof(hz) <= 240.0)
+            period = 1000.0 / atof(hz);
+    }
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    now = qpc_now_ms();
+    if (now < g_next_vblank_ms)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    /* A steady grid; after a stall of more than 50 ms start afresh rather
+     * than delivering the missed ones back to back. */
+    if (!g_next_vblank_ms || now - g_next_vblank_ms > 50.0)
+        g_next_vblank_ms = now + period;
+    else
+        g_next_vblank_ms += period;
     InterlockedIncrement(&g_vblank_total);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
@@ -2976,21 +3003,24 @@ static void bridge_KeInitializeTimerEx(void)
  * absolute due time is treated as immediate, which is wrong in principle and
  * has not come up in practice.
  *
- * ponytail: one thread, a fixed table, and a 10 ms tick, so a due time is late
- * by up to a tick and a periodic timer drifts. Nothing here is scheduling
- * audio off a timer. A title that needs better wants the host's timer queue,
- * not a smaller sleep.
+ * One thread and a fixed table. Due times are in milliseconds with a
+ * fraction, on the performance counter; the thread sleeps until the next
+ * timer or vblank is due (at most 10 ms) and is woken when a timer is armed,
+ * and a periodic timer stays on its grid. With a 10 ms tick and
+ * GetTickCount64 instead, SSX 3's frame timer -- a one-shot re-armed every
+ * 1000/60 ms -- ran 40% of its intervals over 20 ms.
  */
 #define XBOX_MAX_TIMERS 32
 typedef struct {
     uint32_t timer_va;      /* the guest KTIMER, 0 for a free slot */
     uint32_t dpc_va;
-    long long due_ms;       /* host tick when it fires */
+    double    due_ms;       /* host time (qpc_now_ms) when it fires */
     long      period_ms;    /* 0 for one-shot */
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
+static HANDLE g_timer_wake;             /* set when a timer is armed */
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -3020,13 +3050,26 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     }
 
     for (;;) {
-        long long now;
+        double now;
         int i;
 
-        Sleep(10);
+        /* Until the next vblank or timer is due (at most 10 ms), or at once
+         * when a timer is armed. */
+        {
+            double t = qpc_now_ms(), until = t + 10.0;
+            if (g_next_vblank_ms && g_next_vblank_ms < until)
+                until = g_next_vblank_ms;
+            EnterCriticalSection(&g_timer_lock);
+            for (i = 0; i < XBOX_MAX_TIMERS; i++)
+                if (g_timers[i].timer_va && g_timers[i].due_ms < until)
+                    until = g_timers[i].due_ms;
+            LeaveCriticalSection(&g_timer_lock);
+            /* early rather than late: the loop re-checks */
+            WaitForSingleObject(g_timer_wake, until > t ? (DWORD)(until - t) : 0);
+        }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = (long long)GetTickCount64();
+        now = qpc_now_ms();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
@@ -3038,8 +3081,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             }
             fired_va = g_timers[i].timer_va;
             dpc = g_timers[i].dpc_va;
-            if (g_timers[i].period_ms > 0)
-                g_timers[i].due_ms = now + g_timers[i].period_ms;
+            if (g_timers[i].period_ms > 0)          /* on its grid, no drift */
+                g_timers[i].due_ms = now - g_timers[i].due_ms > g_timers[i].period_ms
+                                   ? now + g_timers[i].period_ms
+                                   : g_timers[i].due_ms + g_timers[i].period_ms;
             else
                 g_timers[i].timer_va = 0;      /* one-shot, done */
             LeaveCriticalSection(&g_timer_lock);
@@ -3065,12 +3110,15 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
 {
-    long long delay_ms = (due_100ns < 0) ? (-due_100ns) / 10000 : 0;
+    /* Sub-millisecond: a 1000/60 ms frame timer truncated to 16 ms runs fast
+     * and then corrects itself in jumps. */
+    double delay_ms = (due_100ns < 0) ? (double)(-due_100ns) / 10000.0 : 0.0;
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
     if (!g_timer_started) {
         InitializeCriticalSection(&g_timer_lock);
+        g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
         g_timer_started = 1;
         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
     }
@@ -3083,10 +3131,23 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (free_slot >= 0) {
         g_timers[free_slot].timer_va  = timer_va;
         g_timers[free_slot].dpc_va    = dpc_va;
-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
+        g_timers[free_slot].due_ms    = qpc_now_ms() + delay_ms;
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
+
+    /* A full table used to drop the timer without a word, and a dropped
+     * timer is a DPC that never runs: a driver state machine that just
+     * stops. */
+    if (free_slot < 0) {
+        static int reported;
+        if (reported++ < 8)
+            fprintf(stderr, "  [KERNEL] timer table full (%d): KTIMER 0x%08X "
+                            "(dpc 0x%08X, %.2f ms) dropped\n",
+                    XBOX_MAX_TIMERS, timer_va, dpc_va, delay_ms);
+    }
+    /* The timer thread sleeps until the earliest due time it knew of. */
+    SetEvent(g_timer_wake);
 
     /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
     {
