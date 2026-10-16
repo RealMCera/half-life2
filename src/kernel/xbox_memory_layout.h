@@ -582,4 +582,8 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline 
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);
 
+/* KeTickCount's clock: milliseconds at 1 ms resolution (performance
+ * counter), unlike GetTickCount's ~15.6 ms steps. */
+uint32_t xbox_TickCountMs(void);
+
 #endif /* XBOX_MEMORY_LAYOUT_H */

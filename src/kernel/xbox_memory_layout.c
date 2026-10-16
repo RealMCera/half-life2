@@ -1557,12 +1557,82 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * which silently breaks every timeout that polls it: Halo's DHCP setup
          * waits on a tick deadline that never arrives and spins forever bringing
          * up XNet. A live clock is also just the truth -- KeTickCount ticks on
-         * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
+         * hardware whether or not anyone is asleep. tick_count_thread keeps
+         * it moving while this thread is busy. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+                               + g_memory_offset) = xbox_TickCountMs();
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
+    }
+    return 0;
+}
+
+/* KeTickCount's clock: milliseconds at 1 ms resolution, from the
+ * performance counter. GetTickCount() advances in ~15.6 ms steps whatever
+ * timeBeginPeriod says, and a title pacing itself by KeTickCount sees time
+ * stand still and then jump: SSX 3's frame timer (re-armed every 1000/60 ms
+ * from it) ran 40% of its intervals at ~33 ms and the rest at ~4. Starts at
+ * GetTickCount() so the value stays plausible. */
+uint32_t xbox_TickCountMs(void)
+{
+    static LARGE_INTEGER f, t0;
+    static uint32_t base;
+    LARGE_INTEGER now;
+    if (!f.QuadPart) {
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        base = GetTickCount();
+    }
+    QueryPerformanceCounter(&now);
+    return base + (uint32_t)((now.QuadPart - t0.QuadPart) * 1000 / f.QuadPart);
+}
+
+/* Windows timing for the whole process: 1 ms timer resolution (every Sleep,
+ * wait timeout and condition-variable wait in the runtime is in ms, and at
+ * the default 15.6 ms resolution a "1 ms" wait takes ~15) -- and no power
+ * throttling: Windows 11 stops honouring timeBeginPeriod for a process whose
+ * window is not visible (minimised, covered, display asleep) and may run it
+ * under EcoQoS; SSX 3 fell from 60 to 6-23 FPS some minutes into an
+ * unattended run when the display went to sleep. */
+static void host_timing_init(void)
+{
+#if defined(_WIN32)
+    typedef struct { ULONG Version, ControlMask, StateMask; } PowerThrottlingState;
+    typedef BOOL (WINAPI *SetProcInfo)(HANDLE, int, LPVOID, DWORD);
+    typedef UINT (WINAPI *TimeBeginPeriod)(UINT);
+    SetProcInfo f = (SetProcInfo)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                        "SetProcessInformation");
+    HMODULE winmm = LoadLibraryA("winmm.dll");
+    TimeBeginPeriod tbp = winmm ? (TimeBeginPeriod)(void *)GetProcAddress(winmm, "timeBeginPeriod")
+                                : NULL;
+    if (tbp)
+        tbp(1);
+    if (f) {
+        PowerThrottlingState st;
+        st.Version = 1;
+        st.ControlMask = 0x1 | 0x4;   /* EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION */
+        st.StateMask = 0;             /* ...both off: full speed, timers honoured */
+        if (!f(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st, sizeof st)) {
+            st.ControlMask = 0x1;     /* older Windows: no timer-resolution flag */
+            f(GetCurrentProcess(), 4, &st, sizeof st);
+        }
+    }
+#endif
+}
+
+/* KeTickCount, every millisecond. nv2a_ack_thread writes it only between its
+ * polls, so it stood still for as long as that thread was busy (several ms):
+ * SSX 3's frame timer, which re-arms itself from KeTickCount, then swung
+ * between ~3 and ~30 ms intervals around the right mean. */
+static DWORD WINAPI tick_count_thread(LPVOID unused)
+{
+    volatile uint32_t *tc = (volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                                  + g_memory_offset);
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        *tc = xbox_TickCountMs();
+        Sleep(1);
     }
     return 0;
 }
@@ -1574,6 +1644,8 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    host_timing_init();
+    CloseHandle(CreateThread(NULL, 0, tick_count_thread, NULL, 0, NULL));
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
