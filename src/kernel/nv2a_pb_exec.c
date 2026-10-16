@@ -361,6 +361,25 @@ static struct {
     float    composite[16];
     int      composite_set;
     uint32_t batches_ffp;
+    /* Window clip (SET_WINDOW_CLIP_*): eight rectangles per axis, in logical
+     * pixels as sent. A pixel passes if it is inside any of them; slot 0
+     * alone, the only shape a title has sent so far, is a plain scissor and
+     * is folded into the triangle bounds (wclip_f*, real pixels). */
+    uint32_t wclip_type;
+    uint32_t wclip_h[8], wclip_v[8];
+    uint32_t wclip_h_slots, wclip_v_slots;
+    int      wclip_scissor;            /* slot 0 narrows the surface clip */
+    uint32_t wclip_fx, wclip_fw, wclip_fy, wclip_fh;
+    /* SET_CLEAR_RECT_*: what CLEAR_SURFACE fills, as sent; the max side is
+     * inclusive (the title clears 640x480 with xmax 639). */
+    int      clear_rect_set;
+    uint32_t clear_rx, clear_rw, clear_ry, clear_rh;
+    /* SET_TEXGEN_{S,T,R,Q} per stage, GL enum as sent. Only DISABLE so far;
+     * a non-disable mode silently sampling garbage is exactly the kind of
+     * wrong that should say so in the report. */
+    uint32_t texgen[4][4];
+    int      texgen_seen;
+    uint32_t tris_culled;
 } s_gpu;
 
 /* The last value written to every Kelvin method, as the GPU's register file
@@ -757,6 +776,9 @@ static void raster_triangle(const float a[2], const float b[2],
  * Legends renders its 640x480 menu into a 1280x960 surface (pitch 5120),
  * which read as an 8-bytes-per-pixel surface and drew nothing until this was
  * applied. */
+static void surface_apply_clip(void);
+static void window_clip_fold(void);
+
 static void surface_apply_clip(void)
 {
     uint32_t aa = (s_gpu.format >> 12) & 0xF;
@@ -769,6 +791,51 @@ static void surface_apply_clip(void)
     s_gpu.clip_w = ((s_gpu.clip_raw_h >> 16) & 0xFFFF) * sx;
     s_gpu.clip_y = (s_gpu.clip_raw_v & 0xFFFF) * sy;
     s_gpu.clip_h = ((s_gpu.clip_raw_v >> 16) & 0xFFFF) * sy;
+    window_clip_fold();
+}
+
+/* The window clip bounds what the surface clip already bounds. A pixel must
+ * sit inside one rectangle, both axes taken from the same slot; with slot 0
+ * the only one written -- every shape a title has sent so far -- that is a
+ * plain scissor, and it folds into the triangle bounds like the surface clip
+ * does. Several rectangles are a union the bounding box cannot express:
+ * those pass unclipped, as they do under xemu (its clear and draw paths both
+ * carry a FIXME about the window clip). Values are logical pixels; the min
+ * side is inclusive and the max exclusive, unlike SET_CLEAR_RECT_*. */
+static void window_clip_fold(void)
+{
+    uint32_t sx, sy, x0, x1, y0, y1;
+
+    s_gpu.wclip_scissor = 0;
+    /* Before the surface methods have run the fold has nothing to fold
+     * into; with no scissor set, draws between the first window-clip write
+     * and the first surface write keep the old behaviour. */
+    if (!s_gpu.clip_w || !s_gpu.clip_h || s_gpu.aa_sx == 0.0f)
+        return;
+    if (s_gpu.wclip_h_slots != 1 || s_gpu.wclip_v_slots != 1)
+        return;
+    sx = (uint32_t)s_gpu.aa_sx;
+    sy = (uint32_t)s_gpu.aa_sy;
+    x0 = (s_gpu.wclip_h[0] & 0xFFF) * sx;
+    x1 = ((s_gpu.wclip_h[0] >> 16) & 0xFFF) * sx;
+    y0 = (s_gpu.wclip_v[0] & 0xFFF) * sy;
+    y1 = ((s_gpu.wclip_v[0] >> 16) & 0xFFF) * sy;
+    if (x0 < s_gpu.clip_x) x0 = s_gpu.clip_x;
+    if (y0 < s_gpu.clip_y) y0 = s_gpu.clip_y;
+    if (x1 > s_gpu.clip_x + s_gpu.clip_w) x1 = s_gpu.clip_x + s_gpu.clip_w;
+    if (y1 > s_gpu.clip_y + s_gpu.clip_h) y1 = s_gpu.clip_y + s_gpu.clip_h;
+    if (x0 >= x1 || y0 >= y1) {
+        s_gpu.wclip_scissor = 1;       /* nothing survives: an empty scissor */
+        s_gpu.wclip_fx = s_gpu.wclip_fy = 0;
+        s_gpu.wclip_fw = s_gpu.wclip_fh = 0;
+        return;
+    }
+    s_gpu.wclip_scissor = x0 != s_gpu.clip_x || x1 != s_gpu.clip_x + s_gpu.clip_w
+                       || y0 != s_gpu.clip_y || y1 != s_gpu.clip_y + s_gpu.clip_h;
+    s_gpu.wclip_fx = x0;
+    s_gpu.wclip_fw = x1 - x0;
+    s_gpu.wclip_fy = y0;
+    s_gpu.wclip_fh = y1 - y0;
 }
 
 /* ---- Render back end (nv2a_backend.h) ------------------------------- */
@@ -947,23 +1014,47 @@ static void clear_surface(uint32_t param)
                     ((uint16_t *)base)[i] = v16;
             }
     } else
-    for (y = 0; y < s_gpu.clip_h; y++) {
-        uint8_t *row = mem + s_gpu.color_base
-                     + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
-        if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
-                p[x] = s_gpu.clear_color;
-        } else if (bpp == 2) {
-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
-                p[x] = v;
+    {
+        /* SET_CLEAR_RECT_*: the rectangle the title asked to clear, not
+         * always all of it (letterboxed frames). Same fields and parse as
+         * the swizzled path above (#212): x0 = low half, x1 = high half
+         * + 1, both halves required. Clamped to the surface's right and
+         * bottom edges -- clip_x + clip_w, clip_y + clip_h -- which a
+         * bare cw/ch bound would get wrong whenever the clip carries an
+         * offset. */
+        uint32_t x0 = s_gpu.clip_x, x1 = s_gpu.clip_x + s_gpu.clip_w;
+        uint32_t y0 = s_gpu.clip_y, y1 = s_gpu.clip_y + s_gpu.clip_h;
+        if ((s_gpu.clear_rect_set & 3) == 3) {
+            x0 = s_gpu.clear_rect_h & 0xFFFF;
+            x1 = (s_gpu.clear_rect_h >> 16) + 1;
+            y0 = s_gpu.clear_rect_v & 0xFFFF;
+            y1 = (s_gpu.clear_rect_v >> 16) + 1;
         }
+        if (x0 < s_gpu.clip_x) x0 = s_gpu.clip_x;
+        if (y0 < s_gpu.clip_y) y0 = s_gpu.clip_y;
+        if (x1 > s_gpu.clip_x + s_gpu.clip_w) x1 = s_gpu.clip_x + s_gpu.clip_w;
+        if (y1 > s_gpu.clip_y + s_gpu.clip_h) y1 = s_gpu.clip_y + s_gpu.clip_h;
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        for (y = y0; y < y1; y++) {
+            uint8_t *row = mem + s_gpu.color_base
+                         + (size_t)y * s_gpu.pitch;
+            if (bpp == 4) {
+                uint32_t *p = (uint32_t *)row + x0;
+                for (x = x0; x < x1; x++)
+                    p[x - x0] = s_gpu.clear_color;
+            } else if (bpp == 2) {
+                /* The clear value is always given as A8R8G8B8; a 16-bit surface
+                 * takes the same colour reduced to 5:6:5. */
+                uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+                                      | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                      | ((s_gpu.clear_color >> 3) & 0x001F));
+                uint16_t *p = (uint16_t *)row + x0;
+                for (x = x0; x < x1; x++)
+                    p[x - x0] = v;
+            }
+        }
+    }        }
     }
     s_gpu.clears++;
     /* Progress markers, interleaved with everything else in the log. The
@@ -2689,6 +2780,28 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         }
         return;
     }
+    /* Cull face, decided from the projected winding, as the NV2A decides
+     * facing: from the window coordinates this code is about to fill. The
+     * fill loop takes either winding, so the title's state is what tells
+     * them apart. area > 0 is the fill loop's all-edge-functions-positive
+     * side, which in window coordinates (y down) is clockwise. Front face
+     * 0x900 = CW, 0x901 = CCW, the GL enums; left unwritten it counts as
+     * CCW, the GL reset. Cull face 0x404 = FRONT, 0x405 = BACK, 0x406 =
+     * FRONT_AND_BACK, likewise. A back end culls its own (it is handed
+     * everything); this is the CPU rasteriser's copy of the test. */
+    if (s_reg[0x0308 / 4]) {                   /* SET_CULL_FACE_ENABLE */
+        int front_is_ccw = s_reg[0x03A0 / 4] != 0x900;
+        int tri_is_ccw = area < 0.0f;
+        int tri_is_front = front_is_ccw ? tri_is_ccw : !tri_is_ccw;
+        uint32_t cf = s_reg[0x039C / 4];       /* SET_CULL_FACE */
+
+        if (cf == 0x406
+         || (cf == 0x404 && tri_is_front)
+         || (cf == 0x405 && !tri_is_front)) {
+            s_gpu.tris_culled++;
+            return;
+        }
+    }
     for (k = 0; k < 3; k++) {
         if (!s_gpu.xf_seeded)
             s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
@@ -2730,6 +2843,14 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
     if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
     if (T.maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) T.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (s_gpu.wclip_scissor) {
+        if (T.minx < (int)s_gpu.wclip_fx) T.minx = (int)s_gpu.wclip_fx;
+        if (T.miny < (int)s_gpu.wclip_fy) T.miny = (int)s_gpu.wclip_fy;
+        if (T.maxx > (int)(s_gpu.wclip_fx + s_gpu.wclip_fw))
+            T.maxx = (int)(s_gpu.wclip_fx + s_gpu.wclip_fw);
+        if (T.maxy > (int)(s_gpu.wclip_fy + s_gpu.wclip_fh))
+            T.maxy = (int)(s_gpu.wclip_fy + s_gpu.wclip_fh);
+    }
     if (T.maxx > NV_ZBUF_W) T.maxx = NV_ZBUF_W;
     if (T.maxy > NV_ZBUF_H) T.maxy = NV_ZBUF_H;
     if (T.minx >= T.maxx || T.miny >= T.maxy) {
@@ -3838,8 +3959,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * ever: the title froze at the first screen whose walk was long enough to
      * enter it. So for a mirrored fence the latch carries the mirror's fence
      * bits and the marker's address, which is what a GPU that had consumed
-     * everything would report. */
-    if (method == 0x0310 && subch == 5 && nv2a_pb_dma_walk()) {
+     * everything would report. The GPU latches the marker however its ring is
+     * consumed, so the latch answers it under the segment scan too, where an
+     * unlatched 0x400B10 left the wait to the luck of a semaphore that was a
+     * multiple of 32. */
+    if (method == 0x0310 && subch == 5) {
         volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
 
         if (!r)
@@ -3860,6 +3984,39 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method, param);
         return;
     }
+    /* SET_WINDOW_CLIP_HORIZONTAL/VERTICAL: eight rectangles per axis, each
+     * dword one (min, max) pair. The methods arrive one dword at a time, so
+     * "how many the title sent" is only known as the highest slot ever
+     * written; titles reprogram the whole set every kick, which keeps that
+     * honest. Values are logical pixels, min inclusive, max exclusive. */
+    if (method >= 0x02C0 && method < 0x02C0 + 8 * 4) {
+        uint32_t slot = (method - 0x02C0) / 4;
+        s_gpu.wclip_h[slot] = param;
+        if (slot + 1 > s_gpu.wclip_h_slots)
+            s_gpu.wclip_h_slots = slot + 1;
+        window_clip_fold();
+        return;
+    }
+    if (method >= 0x02E0 && method < 0x02E0 + 8 * 4) {
+        uint32_t slot = (method - 0x02E0) / 4;
+        s_gpu.wclip_v[slot] = param;
+        if (slot + 1 > s_gpu.wclip_v_slots)
+            s_gpu.wclip_v_slots = slot + 1;
+        window_clip_fold();
+        return;
+    }
+    /* SET_TEXGEN_{S,T,R,Q}: four registers per stage, at 0x3C0 + 0x10*stage
+     * (the stages a second title sent -- S,T,R at 0x3D0, 0x3E0, 0x3F0 -- sit
+     * exactly on that stride). The CPU rasteriser passes texture coordinates
+     * through as the vertex data carries them, which is what DISABLE asks
+     * for; any other mode is recorded and reported, not generated. */
+    if (method >= 0x03C0 && method < 0x03C0 + 4 * 16) {
+        uint32_t off = method - 0x03C0;
+        s_gpu.texgen[off / 16][(off % 16) / 4] = param;
+        if (param)
+            s_gpu.texgen_seen = 1;
+        return;
+    }
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_raw_h = param;
@@ -3868,6 +4025,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_SURFACE_CLIP_VERTICAL:
         s_gpu.clip_raw_v = param;
         surface_apply_clip();
+        break;
+    case 0x02B4:                           /* SET_WINDOW_CLIP_TYPE */
+        s_gpu.wclip_type = param;
+        break;
+    case 0x1D98:                           /* SET_CLEAR_RECT_HORIZONTAL */
+        s_gpu.clear_rx = param & 0xFFFF;
+        s_gpu.clear_rw = (param >> 16) & 0xFFFF;
+        s_gpu.clear_rect_set |= 1;
+        break;
+    case 0x1D9C:                           /* SET_CLEAR_RECT_VERTICAL */
+        s_gpu.clear_ry = param & 0xFFFF;
+        s_gpu.clear_rh = (param >> 16) & 0xFFFF;
+        s_gpu.clear_rect_set |= 2;
         break;
     case NV097_SET_SURFACE_FORMAT:
         s_gpu.format = param;
@@ -3923,6 +4093,57 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x029C: s_gpu.fog_mode = param; break;
     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
+
+    /* State the executor does not model, recorded so that what a title
+     * sends every frame stops reading as unhandled: the register mirror
+     * (s_reg) holds all of these already, and the report's job is to rank
+     * what is actually missing, not to repeat state a title re-sends every
+     * kick. Each is named for the next title that needs it modelled. */
+    case 0x0100: break;                    /* NO_OPERATION; also the "wake me"
+                                              software method D3D patches in,
+                                              whose value is the fence it
+                                              waits on */
+    case 0x0110: break;                    /* WAIT_FOR_IDLE */
+    case 0x0294: break;                    /* SET_LIGHT_CONTROL */
+    case 0x0308: break;                    /* SET_CULL_FACE_ENABLE: the CPU
+                                              rasteriser culls by it */
+    case 0x0310: break;                    /* SET_DITHER_ENABLE (subch 5 uses
+                                              the same number for KickOff,
+                                              answered above) */
+    case 0x0314: break;                    /* SET_LIGHTING_ENABLE */
+    case 0x0318: break;                    /* SET_POINT_PARAMS_ENABLE */
+    case 0x031C: break;                    /* SET_POINT_SMOOTH_ENABLE */
+    case 0x0320: break;                    /* SET_LINE_SMOOTH_ENABLE */
+    case 0x0324: break;                    /* SET_POLY_SMOOTH_ENABLE */
+    case 0x0328: break;                    /* SET_SKIN_MODE */
+    case 0x032C: break;                    /* SET_STENCIL_TEST_ENABLE */
+    case 0x0330: break;                    /* SET_POLY_OFFSET_POINT_ENABLE */
+    case 0x0334: break;                    /* SET_POLY_OFFSET_LINE_ENABLE */
+    case 0x0338: break;                    /* SET_POLY_OFFSET_FILL_ENABLE */
+    case 0x0360: break;                    /* SET_STENCIL_MASK */
+    case 0x0364: break;                    /* SET_STENCIL_FUNC */
+    case 0x0368: break;                    /* SET_STENCIL_FUNC_REF */
+    case 0x036C: break;                    /* SET_STENCIL_FUNC_MASK */
+    case 0x0370: break;                    /* SET_STENCIL_OP_FAIL */
+    case 0x0374: break;                    /* SET_STENCIL_OP_ZFAIL */
+    case 0x0378: break;                    /* SET_STENCIL_OP_ZPASS */
+    case 0x037C: break;                    /* SET_SHADE_MODE: everything is
+                                              interpolated smooth so far */
+    case 0x0394: break;                    /* SET_CLIP_MIN: the register
+                                              mirror holds it; the back end
+                                              reads it as depth_min */
+    case 0x0398: break;                    /* SET_CLIP_MAX */
+    case 0x039C: break;                    /* SET_CULL_FACE: the CPU
+                                              rasteriser culls by it */
+    case 0x03A0: break;                    /* SET_FRONT_FACE */
+    case 0x03B8: break;                    /* SET_SPECULAR_ENABLE */
+    case 0x03BC: break;                    /* SET_LIGHT_ENABLE_MASK */
+    case 0x043C: break;                    /* SET_POINT_SIZE */
+    case 0x1D70: break;                    /* BACK_END_WRITE_SEMAPHORE_RELEASE
+                                              with no back end to name a
+                                              target: the title's fence is
+                                              mirrored by the runtime, so
+                                              nothing reads the release */
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
         s_gpu.zpass_count = 0;
         break;
@@ -4481,12 +4702,17 @@ void nv2a_pb_exec_report(void)
             dma_resolve(s_gpu.drawn_offset), s_gpu.color_offset,
             dma_resolve(s_gpu.color_offset));
     fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
-                    " screen-space, %u triangles fully off-surface\n",
+                    " screen-space, %u triangles fully off-surface,"
+                    " %u culled by face\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
-            s_gpu.tris_skipped_offscreen);
+            s_gpu.tris_skipped_offscreen, s_gpu.tris_culled);
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    if (s_gpu.texgen_seen)
+        fprintf(stderr, "[GPU] a texgen mode other than DISABLE is set:"
+                        " texture coordinates are passed through, not"
+                        " generated\n");
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);
