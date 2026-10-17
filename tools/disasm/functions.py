@@ -164,6 +164,7 @@ class FunctionDetector:
         # Branches out of alias bodies into unclaimed bytes. Runs last, once
         # every alias is known, because those bodies exist only from here on.
         self._pass_alias_branch_orphans()
+
         # Branches into another function's interior, measured on the final
         # bodies: the passes above can split a body after the tail-jump pass
         # has already looked at its branches.
@@ -172,7 +173,7 @@ class FunctionDetector:
         # Tail jumps and conditional branches out of bodies made after pass 6,
         # into gaps. A recovered block can itself branch into another body's
         # interior, so that pass looks once more.
-        if self._pass_late_tail_jumps():
+        if self._pass_late_tail_jumps(sections):
             self._pass_branches_into_bodies()
 
         self._build_alias_entries()
@@ -1158,7 +1159,7 @@ class FunctionDetector:
             print(f"  {added} branch target(s) inside another function recovered as alias entries")
         return added > 0
 
-    def _pass_late_tail_jumps(self) -> bool:
+    def _pass_late_tail_jumps(self, sections: Optional[List[SectionInfo]] = None) -> bool:
         """
         A tail jump into a gap from a body that pass 6 never saw.
 
@@ -1217,9 +1218,20 @@ class FunctionDetector:
             def in_gap_body(addr: int) -> bool:
                 return any(lo <= addr < hi for lo, hi in gap_bodies)
 
+            # Only instructions control can reach: bytes after a body's last
+            # jmp lie in its measured range too, and may decode as a branch.
+            entries = list(self.functions) + list(self._alias_entries)
+            for table in self.engine.jump_tables:
+                entries.extend(self.engine.jump_table_entries(table))
+            bounds = ([(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections] if sections else [(0, 1 << 32)])
+            reachable = self.engine.recursive_descent(entries, bounds)
+
             new = 0
             for lo, hi in sources:
                 for insn in self.engine.get_instructions_in_range(lo, hi):
+                    if insn.address not in reachable:
+                        continue
                     if not (insn.is_jump or insn.is_cond_jump):
                         continue
                     target = insn.jump_target

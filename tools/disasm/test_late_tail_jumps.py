@@ -81,6 +81,20 @@ class _Engine:
     def jump_table_entries(self, *args, **kwargs):
         return []
 
+    def recursive_descent(self, starts, bounds):
+        seen, work = set(), list(starts)
+        while work:
+            addr = work.pop()
+            while addr in self.instructions and addr not in seen:
+                seen.add(addr)
+                insn = self.instructions[addr]
+                if insn.jump_target is not None:
+                    work.append(insn.jump_target)
+                if insn.is_terminator:
+                    break
+                addr = insn.end_address
+        return seen
+
 
 def _detector(insns, functions, aliases=None, **engine):
     det = FunctionDetector.__new__(FunctionDetector)
@@ -102,6 +116,16 @@ class LateTailJumps(unittest.TestCase):
         self.assertTrue(det._pass_late_tail_jumps())
         self.assertIn(0x1040, det._alias_entries)
         self.assertEqual(det._alias_entries[0x1040], 0x1080)  # up to the next start
+
+    def test_bytes_after_the_last_jmp_are_not_followed(self):
+        # sub_1000 ends in jmp 0x1080; the bytes after it, still inside its
+        # measured range, decode as a jmp into the gap at 0x1040.
+        insns = [_Insn(0x1000, jmp=0x1080), _Insn(0x1004, jmp=0x1040),
+                 _Insn(0x1040), _Insn(0x1044, ret=True),
+                 _Insn(0x1080), _Insn(0x1084, ret=True)]
+        det = _detector(insns, functions=[(0x1000, 0x1008), (0x1080, 0x1088)])
+        self.assertFalse(det._pass_late_tail_jumps())
+        self.assertNotIn(0x1040, det._alias_entries)
 
     def test_jmp_from_a_gap_alias_into_a_further_gap(self):
         # A gap alias at 0x1040 tail-jumps to 0x1060, also in the gap.
