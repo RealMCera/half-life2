@@ -7609,7 +7609,14 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
         }
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
-    if (h) {
+    /* A miss is memoised too: most of a title's waits are on objects that
+     * never live in this table -- Black's D3D parks on its vblank event
+     * 165,000 times a second and that VA resolves by another path, so a
+     * memo that only remembered hits sent every one of those waits through
+     * the full scan. insert() overwrites the slot when a VA later joins
+     * the table, and remove() clears it, so a negative entry cannot
+     * outlive the truth. */
+    {
         uint32_t slot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
         g_ke_memo[slot].va = guest_va;
         g_ke_memo[slot].h  = h;
