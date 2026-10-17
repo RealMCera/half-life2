@@ -2367,11 +2367,47 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
 
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
  * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
-static int rc_stage_fetch(int st, const float c[4], float out[4])
+/* The dot-map the stage's normal texel goes through before the dot product,
+ * and the stage whose texel is that normal: both live in
+ * SET_SHADER_OTHER_STAGE_INPUT. xemu packs them as nibbles -- dot_map[1..3]
+ * in bits 0-11, input_tex[2]/[3] in bits 16-23, input_tex[1] fixed at 0 --
+ * and Black sends the register as zero, the plainest arrangement: identity
+ * map, normals from stage 0. SET_DOT_RGBMAPPING (0x1E74) is the same idea
+ * under its D3D name; xemu reads the packing above, so this does too. */
+static void dotmap_vec(int st, const float texel[4], float out[3])
+{
+    uint32_t map = (s_reg[0x1E78 / 4] >> (4 * (st - 1))) & 0xFu;
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        float x = texel[i];
+        switch (map) {
+        case 1:  x = (x * 255.0f - 128.0f) / 127.0f; break;  /* d3d  */
+        case 2:  x = x * 255.0f;
+                 x = (x >= 128.0f) ? (x - 255.5f) / 127.5f
+                                   : (x + 0.5f) / 127.5f; break; /* gl */
+        case 3:  x = x * 255.0f;
+                 x = (x >= 128.0f) ? (x - 256.0f) / 127.0f
+                                   : x / 127.0f; break;
+        default: break;                                     /* zero-to-one */
+        }
+        out[i] = x;
+    }
+}
+
+static int rc_stage_fetch(int st, const float c[4], float out[4],
+                          const float tin[4][4], float dots[4])
 {
     const Texture *t = &s_gpu.texs[st];
     uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F, j;
     float q = c[3] != 0.0f ? c[3] : 1.0f;
+    uint32_t osi = s_reg[0x1E78 / 4];
+    int in_st = st ? (int)((osi >> (16 + 4 * (st - 2 < 0 ? 0 : st - 2))) & 0xFu) : 0;
+
+    if (st == 1)
+        in_st = 0;                       /* input_tex[1] is fixed at stage 0 */
+    if (in_st > 3)
+        in_st = 0;
 
     switch (mode) {
     case 0:                                       /* NONE */
@@ -2413,9 +2449,84 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
                 return 0;
         }
         return 1;
+
+    /* ---- the dot-product family -------------------------------------
+     * A stage in one of these modes does not sample its own texture with
+     * its own coordinates. It dots its texture coordinate vector against
+     * a normal taken from ANOTHER stage's texel (which stage and through
+     * which remap: SET_SHADER_OTHER_STAGE_INPUT), and either hands the
+     * scalar on -- the later stages use the running set of dot values as
+     * their sampling coordinates -- or samples with the reflection of the
+     * coordinate vector about that normal. This is how the NV2A does
+     * per-pixel lighting: stage 0 holds the normal map, stage 1/2 compute
+     * N.L and N.H, and the light's projected texture is looked up at
+     * (N.L, N.H) -- the shard pattern Black drew when all of this read as
+     * zero. Semantics from xemu's psh.c, dot maps included. */
+    case 0x11:                                    /* DOTPRODUCT (st 1-2) */
+    case 0x0A:                                    /* DOT_ZW (st 2) */
+        if (st >= 1) {
+            float n[3];
+            dotmap_vec(st, tin[in_st], n);
+            dots[st] = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
+        }
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        return 1;
+    case 0x09:                                    /* DOT_ST (st 2) */
+        if (st >= 2) {
+            float n[3];
+            dotmap_vec(st, tin[in_st], n);
+            dots[st] = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
+            rc_texel(t, 0, dots[st - 1], dots[st], out);
+        } else {
+            out[0] = out[1] = out[2] = out[3] = 0.0f;
+        }
+        return 1;
+    case 0x0D:                                    /* DOT_STR_3D (st 3) */
+    case 0x0E: {                                  /* DOT_STR_CUBE (st 3) */
+        float n[3];
+        dotmap_vec(st, tin[in_st], n);
+        dots[st] = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
+        /* The 3D form addresses with (dot1, dot2, dot3); a 2D-bound stage
+         * takes the first two, as xemu's remapCubeTo2D does. */
+        rc_texel(t, 0, dots[1], dots[2], out);
+        return 1;
+    }
+    case 0x0B: {                                  /* DOT_RFLCT_DIFF (st 2) */
+        float n2[3];
+        dotmap_vec(st, tin[in_st], n2);
+        dots[st] = c[0] * n2[0] + c[1] * n2[1] + c[2] * n2[2];
+        /* xemu's normal here is (dot1, dot2, dot2-under-stage-3's-map); the
+         * third component only selects a cube face, and a 2D-bound stage --
+         * every case seen so far -- samples (dot1, dot2). */
+        rc_texel(t, 0, dots[1], dots[2], out);
+        return 1;
+    }
+    case 0x0C: {                                  /* DOT_RFLCT_SPEC (st 3) */
+        float n[3], e[3], r[3], nde, nn;
+        dotmap_vec(st, tin[in_st], n);
+        dots[st] = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
+        n[0] = dots[1]; n[1] = dots[2]; n[2] = dots[3];
+        e[0] = e[1] = e[2] = c[3];             /* pT.w, the eye vector path */
+        nde = n[0] * e[0] + n[1] * e[1] + n[2] * e[2];
+        nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+        if (nn == 0.0f)
+            nn = 1.0f;
+        for (j = 0; j < 3; j++)
+            r[j] = 2.0f * n[j] * nde / nn - e[j];
+        rc_texel(t, 0, r[0], r[1], out);
+        return 1;
+    }
+    case 0x0F:                                    /* DPNDNT_AR (st 1+) */
+        rc_texel(t, 0, tin[in_st][3], tin[in_st][0], out);
+        return 1;
+    case 0x10:                                    /* DPNDNT_GB (st 1+) */
+        rc_texel(t, 0, tin[in_st][1], tin[in_st][2], out);
+        return 1;
     default:
-        /* ponytail: bump-env and dot-product modes read zero; they are water
-         * and bump effects -- add them when a title's look depends on one. */
+        /* Still zero: BUMPENVMAP and BUMPENVMAP_LUM (6/7 -- water and bump
+         * effects; they need the per-stage bump matrices at 0x1E80+, not
+         * sent by anything here), BRDF (8) and DOT_RFLCT_SPEC_CONST (0x12),
+         * which xemu leaves unimplemented as well. */
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return 1;
     }
@@ -2514,6 +2625,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                     pw = l0 * T->iw[0] + l1 * T->iw[1] + l2 * T->iw[2];
                     if (T->use_rc) {
                         float d1[4], fog[4], t[4][4], out[4], tc[4];
+                        float dots[4] = {0, 0, 0, 0};
                         int st, j, keep = 1;
                         for (k = 0; k < 4; k++)
                             d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
@@ -2528,7 +2640,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             for (j = 0; j < 4; j++)
                                 tc[j] = (l0 * T->stc[0][st][j] + l1 * T->stc[1][st][j]
                                        + l2 * T->stc[2][st][j]) / pw;
-                            keep = rc_stage_fetch(st, tc, t[st]);
+                            keep = rc_stage_fetch(st, tc, t[st],
+                                                  (const float (*)[4])t, dots);
                         }
                         if (!keep)
                             continue;
@@ -4082,6 +4195,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.rc.control = param;
         s_gpu.rc_seen = 1;
         break;
+    case 0x1E74: break;                    /* SET_DOT_RGBMAPPING: the packing
+                                              xemu reads lives in
+                                              OTHER_STAGE_INPUT below; this
+                                              stops the re-sent state from
+                                              ranking as unhandled */
+    case 0x1E78: break;                    /* SET_SHADER_OTHER_STAGE_INPUT:
+                                              the register mirror holds it;
+                                              rc_stage_fetch reads it there */
     case 0x1E70: s_gpu.rc.stage_program = param; break;
     case 0x17F8: s_gpu.clip_plane_mode = param; break;
 
