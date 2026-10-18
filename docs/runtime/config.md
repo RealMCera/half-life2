@@ -184,14 +184,17 @@ section, [Input](#input), below.
 A ratio wider than 4:3 widens the picture instead of stretching it. Every
 4:3-shaped colour and depth target is allocated wider by a pad a side
 (`nv2a_host_pad`: 107 guest pixels for 640x480 at 16:9) and the title's
-columns are mapped centred in it, so the game's own perspective projection
+columns are mapped centered in it, so the game's own perspective projection
 fills the pads with more of the world. The projection is not patched: what
 the title culls at the old frustum's edge pops in at the screen's edge.
 Guest memory and the write-back keep the 640x480 centre columns, so the
 guest and the goldens see the stock frame. A window (not fullscreen) opens
 at the padded frame's shape, `nv2a_host_window_w`: 854x480 at 16:9 and
 scale 1, so the pads show 1:1; fullscreen keeps the display's size and
-letterboxes.
+letterboxes. A square target (BLiNX 2's screen-space reflections) is
+widened by the same ratio plus an eighth of its width a side, so a
+reflection read the water bumps past the frame's edge still finds the
+mirrored view instead of the target's clamped edge column.
 
 Each batch is placed by one rule table (`nv2a_aspect_place`,
 `src/kernel/nv2a_backend_common.h`), after a 2D test that runs the batch's
@@ -201,22 +204,32 @@ an exact whole number from 1 to 1024 (`nv2a_aspect_layer_w`,
 is, and BLiNX 2 draws parts of its stage HUD at a fixed view depth of 2 or 3
 and its title movie at 100:
 
-- 3D: centred; a clip box at the frame's edges reaches the target's edges.
-- 2D, not full width (HUD, menus, text): centred and scissored to the 4:3
+- 3D: centered; a clip box at the frame's edges reaches the target's edges.
+- 2D, not full width (HUD, menus, text): centered and scissored to the 4:3
   frame, so pieces the title parks off-screen never show in the pads. With
   `display.hud = "edges"` the batch's triangles are grouped into pieces
   and a piece in the outer third moves to its side's new edge, unscaled;
-  a middle piece touching one that moved goes with it, and a menu or
-  story screen (a full-width picture, or a piece a third of the frame)
-  keeps every piece centred.
+  a middle piece touching one that moved goes with it, and a menu,
+  story or loading screen keeps every piece centered: a frame with a
+  full-width picture, a piece over a third of the frame, or pieces that
+  together cover the frame, counted a frame's width to each side (half
+  keeps a screen that was one last frame, while its panels slide out).
+  Each piece counts as a share of its own target, since one frame draws
+  into the 640x480 frame and its smaller post buffers alike. A triangle
+  far off the frame (a sprite behind the eye, projected to thousands of
+  pixels) joins no piece, is left centered and does not count.
 - 2D, full width, sampling only render targets, nothing, or a guest
   texture no wider than a quarter of the frame (fades, post passes):
-  stretched over the whole target.
+  stretched over the whole target. On a square target that is the ratio's
+  pad only (`nv2a_host_pad_ratio`), not the overscan, so a full-width copy
+  between the frame and a square lines up, and reads of a padded square
+  by such a pass take the same columns.
 - 2D, full width over a wider guest texture (a movie, a still):
   `display.movie`.
 
 `RECOMP_TRACE=aspect` prints one `[aspect.program]` line per program,
-texture and placement, and the target size per flip.
+texture and placement, the target size per flip, and an
+`[aspect.layout]` line for each frame that becomes a layout screen.
 
 ### What the render and present keys do
 
@@ -280,7 +293,7 @@ presenters read them at start.
   CPU backend ignores it.
 - **`present.filter`.** `nearest` is the stock letterbox. `linear` is the
   same letterbox with bilinear filtering. `integer` shows the frame at the
-  largest whole multiple that fits, centred on black; a frame larger than
+  largest whole multiple that fits, centered on black; a frame larger than
   the window (2x in a small window) is fitted with linear filtering instead
   of cropped. The SDL window (macOS, Linux, every backend) and the D3D11
   window follow it. The D3D11 window also follows resizes now; at stock it

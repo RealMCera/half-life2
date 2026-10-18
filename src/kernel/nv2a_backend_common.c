@@ -940,13 +940,15 @@ unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
     return s_host_opts.aniso;
 }
 
-uint32_t nv2a_host_pad(uint32_t w, uint32_t h)
+/* The width a w x h target widens to under display.aspect, or 0 when it
+ * keeps its own. */
+static double host_wide(uint32_t w, uint32_t h)
 {
     unsigned aw = s_host_opts.aspect_w, ah = s_host_opts.aspect_h;
     double wide;
 
     if (!aw || !ah || !w || !h)
-        return 0;
+        return 0.0;
     /* Square: the title's screen-space reflections (BLiNX 2's hub pit and
      * stage 1-1 water) draw the mirrored 4:3 view into a 512 or 256 square
      * and sample it projected from the frame, u = screen x / 640. A wide
@@ -958,11 +960,38 @@ uint32_t nv2a_host_pad(uint32_t w, uint32_t h)
         wide = (double)w * 3.0 * aw / (4.0 * ah);
     /* 4:3 within 1%: 3w is 4h give or take 1% of 4h. */
     else if (3.0 * w < 4.0 * h * 0.99 || 3.0 * w > 4.0 * h * 1.01)
-        return 0;
+        return 0.0;
     else
         wide = (double)h * aw / ah;
-    if (wide <= (double)w)
+    return wide > (double)w ? wide : 0.0;
+}
+
+uint32_t nv2a_host_pad_ratio(uint32_t w, uint32_t h)
+{
+    double wide = host_wide(w, h);
+
+    return wide > 0.0 ? (uint32_t)((wide - (double)w) / 2.0 + 0.5) : 0u;
+}
+
+uint32_t nv2a_host_pad(uint32_t w, uint32_t h)
+{
+    double wide = host_wide(w, h);
+
+    if (wide <= 0.0)
         return 0;
+    /* Overscan, squares only: the water bumps its reflection read (1-1's
+     * BUMPENVMAP matrices move u by up to 0.106 of the square's width at
+     * full-scale du, dv), so at the frame's edge it reads past the ratio's
+     * pad and the clamped edge column shows as the effect ending at the
+     * viewport's edge. An eighth of the width a side covers that offset
+     * with five texels of a 256 square to spare. The mirrored view is
+     * drawn through the square's own pad, so the extra columns hold more
+     * of it, and every read goes through nv2a_rt_guest_read, so the stock
+     * columns stay where they were. A stretched pass keeps to the ratio's
+     * pad (nv2a_host_pad_ratio), so a full-width copy between the frame and
+     * a square lines up as before. */
+    if (w == h)
+        return (uint32_t)((wide - (double)w) / 2.0 + (double)w / 8.0 + 0.5);
     return (uint32_t)((wide - (double)w) / 2.0 + 0.5);
 }
 
@@ -971,19 +1000,33 @@ uint32_t nv2a_host_window_w(uint32_t w, uint32_t h, unsigned scale)
     return (w + 2u * nv2a_host_pad(w, h)) * scale;
 }
 
+/* The pad a stretch spans on a target padded by pad: the ratio's
+ * (nv2a_host_pad_ratio), or pad itself when the ratio gives none, as for a
+ * pad passed in under other options. */
+static uint32_t stretch_pad(uint32_t w, uint32_t h, uint32_t pad)
+{
+    uint32_t r = nv2a_host_pad_ratio(w, h);
+
+    return r && r < pad ? r : pad;
+}
+
 void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t pad,
                      int place)
 {
     float pw = (float)(w + 2u * pad), k;
 
-    (void)h;
     if (!pad)
         return;
     switch (place) {
-    case NV2A_PLACE_STRETCH:
-        o->c[0] = 2.0f / (float)w;
-        o->c[4] = -1.0f;
+    case NV2A_PLACE_STRETCH: {
+        /* 0..w over the ratio's pad, r a side: the whole target unless a
+         * square's overscan lies beyond it, which a stretch leaves alone
+         * so the frame's picture is not zoomed into it. */
+        uint32_t r = stretch_pad(w, h, pad);
+        o->c[0] = 2.0f * (float)(w + 2u * r) / ((float)w * pw);
+        o->c[4] = 2.0f * (float)(pad - r) / pw - 1.0f;
         break;
+    }
     case NV2A_PLACE_LEFT:
     case NV2A_PLACE_RIGHT:
         /* x + pad + s over a pw-wide target is (2 s - w) / pw at x 0, s =
@@ -1012,7 +1055,13 @@ void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad
     out[1] = box[1] * n;
     out[3] = box[3] * n;
     switch (pad ? place : NV2A_PLACE_STRETCH) {
-    case NV2A_PLACE_STRETCH:
+    case NV2A_PLACE_STRETCH: {
+        /* With the mapping: 0..w over the ratio's pad (nv2a_aspect_map). */
+        uint32_t r = stretch_pad(w, h, pad);
+        out[0] = (uint32_t)(((uint64_t)(pad - r) * w + (uint64_t)box[0] * (w + 2u * r)) * n / w);
+        out[2] = (uint32_t)(((uint64_t)(pad - r) * w + (uint64_t)box[2] * (w + 2u * r)) * n / w);
+        break;
+    }
     case NV2A_PLACE_COVER:
         /* Scaled by pw / w with the mapping; COVER's y overflow is clipped by
          * the viewport, so its box is the stretched one. */
@@ -1038,7 +1087,6 @@ void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad
         }
         break;
     }
-    (void)h;
 }
 
 unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,

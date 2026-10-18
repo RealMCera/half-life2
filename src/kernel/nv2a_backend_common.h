@@ -1279,10 +1279,15 @@ unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
  * 0 unless display.aspect is set and the target is 4:3 within 1% (the frame
  * and its half-size post buffers), then round((h * aw/ah - w) / 2): 107 for
  * 640x480 at 16:9 (an 854-wide target), 53 for 320x240. A square target
- * (screen-space reflections) is widened by the same ratio,
- * round(w * (3aw / 4ah - 1) / 2): 51 for 512x512 at 16:10, 85 at 16:9.
- * Other shapes keep theirs. */
+ * (screen-space reflections) is widened by the same ratio plus w/8 of
+ * overscan for bumped reads, round(w * (3aw / 4ah - 1) / 2 + w / 8): 115
+ * for 512x512 at 16:10, 149 at 16:9. Other shapes keep theirs. */
 uint32_t nv2a_host_pad(uint32_t w, uint32_t h);
+/* The ratio's share of nv2a_host_pad, without a square's overscan: what a
+ * stretched pass spans (nv2a_aspect_map, nv2a_aspect_box,
+ * nv2a_rt_stretch_read), so a full-width copy between the frame and a
+ * square keeps lining up. Equal to nv2a_host_pad for other shapes. */
+uint32_t nv2a_host_pad_ratio(uint32_t w, uint32_t h);
 
 /* Width of the window for a guest w x h frame shown `scale` times larger:
  * the padded target's, (w + 2 nv2a_host_pad) * scale, so a 16:9 window
@@ -1379,6 +1384,23 @@ static inline void nv2a_rt_guest_read(uint32_t w, uint32_t pad, float *scale, fl
     *off = (float)pad / pw;
 }
 
+/* Hor+: how a stretched batch reads a padded w x h render target: across
+ * its ratio's pad (nv2a_host_pad_ratio), as a stretch draws into it, so the
+ * whole target except a square's overscan columns. Returns 0 when that is
+ * the whole target (nothing to change). */
+static inline int nv2a_rt_stretch_read(uint32_t w, uint32_t h, uint32_t pad, float *scale,
+                                       float *off)
+{
+    uint32_t r = nv2a_host_pad_ratio(w, h);
+    float pw = (float)(w + 2u * pad);
+
+    if (!r || r >= pad)
+        return 0;
+    *scale = (float)(w + 2u * r) / pw;
+    *off = (float)(pad - r) / pw;
+    return 1;
+}
+
 /* display.hud=edges: where a HUD piece spanning lo_x..hi_x of a w-wide
  * frame goes, by its centre: in the left third it moves out to the left
  * edge, in the right third to the right edge, else (centred text, the
@@ -1455,10 +1477,24 @@ int nv2a_aspect_full_tris(const float (*xy)[2], const uint32_t *idx, uint32_t nt
 /* display.hud=edges stays off on a 2D screen: a menu, a loading or story
  * screen laid out over a full-frame picture would come apart if its pieces
  * moved. A frame is one when it draws a full-width 2D batch over a guest
- * texture (the backends call this) or a piece covering a third of the
- * frame (nv2a_aspect_anchor_tris sees it); every piece of that frame from
- * then on and of the next is centred. */
+ * texture (the backends call this), a piece covering a third of the frame,
+ * or pieces that add up to the whole frame, each counted as a share of its
+ * own target (nv2a_aspect_anchor_tris sees those: BLiNX 2's loading screen
+ * is dozens of batches of one 128-pixel tile each, some parked off-screen
+ * to slide in); every piece of that frame from then on and of the next is
+ * centred. A triangle off the layer on its own joins no piece and is
+ * centred. */
 void nv2a_aspect_layout_note(uint64_t frame);
+/* RECOMP_TRACE=aspect: an [aspect.layout] line for each frame that
+ * becomes a layout screen, with the rule (a full-width picture, or the
+ * piece and the frame's cover so far). The backends set it. */
+void nv2a_aspect_trace_set(int on);
+/* A HUD piece's box b (x0, y0, x1, y1) on a w x h frame: its area within
+ * the frame (*in) and within the frame widened by a frame to each side
+ * (*ext), both over the frame's rows. Returns 0 for a box not on the
+ * frame's layer -- wider than 4w, taller than 4h, or clear of the widened
+ * frame -- which nv2a_aspect_anchor_tris leaves centred and uncounted. */
+int nv2a_aspect_piece_cover(const float b[4], uint32_t w, uint32_t h, float *in, float *ext);
 unsigned nv2a_aspect_anchor_tris(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
                                  uint32_t w, uint32_t h, uint64_t frame, uint8_t *place);
 
@@ -1474,7 +1510,8 @@ void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t 
  * the guest columns: a HUD piece slid off-screen (x < 0) must not show in
  * the pads. A centred 3D batch's clip edges at 0 and w reach out to the
  * target's edges, so the world fills the pads. A stretched or covering one
- * scales with the mapping. pad 0 gives nv2a_host_box's result. */
+ * scales with the mapping (a stretch over the ratio's pad only,
+ * nv2a_host_pad_ratio). pad 0 gives nv2a_host_box's result. */
 void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad,
                      unsigned n, int place, int two_d, uint32_t out[4]);
 

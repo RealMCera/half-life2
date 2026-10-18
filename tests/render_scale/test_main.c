@@ -132,22 +132,22 @@ int main(void)
         CHECK(nv2a_host_pad(640, 480) == 107);
         CHECK(nv2a_host_pad(320, 240) == 53);
         /* Square (screen-space reflections): widened by the frame's ratio,
-         * w * (16/9 / (4/3) - 1) / 2. */
-        CHECK(nv2a_host_pad(256, 256) == 43);
-        CHECK(nv2a_host_pad(512, 512) == 85);
+         * w * (16/9 / (4/3) - 1) / 2, plus the w/8 overscan. */
+        CHECK(nv2a_host_pad(256, 256) == 75);
+        CHECK(nv2a_host_pad(512, 512) == 149);
         CHECK(nv2a_host_pad(512, 256) == 0);      /* other shapes keep theirs */
         CHECK(nv2a_host_pad(640, 464) == 0);      /* Burnout 3's clip: not 4:3 */
         CHECK(nv2a_host_pad(0, 480) == 0);
         /* Small squares round down to no pad until the share is half a
-         * pixel: 1 and 2 get 0, 4 gets 1, 16 gets 3. */
-        CHECK(nv2a_host_pad(1, 1) == 0 && nv2a_host_pad(2, 2) == 0);
-        CHECK(nv2a_host_pad(4, 4) == 1 && nv2a_host_pad(16, 16) == 3);
+         * pixel: 1 gets 0, 2 and 4 get 1, 16 gets 5. */
+        CHECK(nv2a_host_pad(1, 1) == 0 && nv2a_host_pad(2, 2) == 1);
+        CHECK(nv2a_host_pad(4, 4) == 1 && nv2a_host_pad(16, 16) == 5);
         {
             /* A reflection read from the frame's pads lands in the square's
-             * pads: frame u = -pad/w and 1 + pad/w reach the padded square's
-             * left and right edges. Both pads are whole pixels, so the edge
-             * is met within a texel (0.6 for 640 and 512 at 16:9), not
-             * exactly. */
+             * pads: frame u = -pad/w and 1 + pad/w reach w/8 in from the
+             * padded square's left and right edges (the overscan a bumped
+             * read has to spare). Both pads are whole pixels, so that is
+             * met within a texel, not exactly. */
             static const uint32_t sq[2] = { 512, 256 };
             static const uint32_t ratio[2][2] = { { 16, 9 }, { 16, 10 } };
             int r, q;
@@ -159,8 +159,9 @@ int main(void)
                     float sc, off, pw = (float)(sq[q] + 2u * sp);
                     float ul = -(float)fp / 640.0f, ur = 1.0f + (float)fp / 640.0f;
                     nv2a_rt_guest_read(sq[q], sp, &sc, &off);
-                    CHECK(fabsf((ul * sc + off) * pw) <= 1.0f);
-                    CHECK(fabsf((ur * sc + off) * pw - pw) <= 1.0f);
+                    float os = (float)sq[q] / 8.0f;
+                    CHECK(fabsf((ul * sc + off) * pw - os) <= 1.0f);
+                    CHECK(fabsf((ur * sc + off) * pw - (pw - os)) <= 1.0f);
                     /* the stock columns are unchanged: u 0..1 is texels sp..sp+w */
                     CHECK(fabsf(off * pw - (float)sp) < 1e-3f);
                     CHECK(fabsf((sc + off) * pw - (float)(sp + sq[q])) < 1e-3f);
@@ -175,13 +176,13 @@ int main(void)
         o.aspect_w = 16; o.aspect_h = 10;
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_pad(640, 480) == 64);
-        CHECK(nv2a_host_pad(512, 512) == 51);
-        CHECK(nv2a_host_pad(256, 256) == 26);
+        CHECK(nv2a_host_pad(512, 512) == 115);
+        CHECK(nv2a_host_pad(256, 256) == 58);
         CHECK(nv2a_host_window_w(640, 480, 1) == 768);
         o.aspect_w = 21; o.aspect_h = 9;
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_window_w(640, 480, 1) == 1120);
-        CHECK(nv2a_host_pad(512, 512) == 192);
+        CHECK(nv2a_host_pad(512, 512) == 256);
         o.aspect_w = 4; o.aspect_h = 3;
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_pad(640, 480) == 0);
@@ -259,6 +260,41 @@ int main(void)
         nv2a_aspect_box(part, 640, 480, 107, 2, NV2A_PLACE_RIGHT, 1, out);
         CHECK(out[0] == 460 && out[2] == 1068);
 
+        /* A stretch on a padded square spans the ratio's pad only (85 of
+         * 149 at 16:9, 810 wide): a full-width copy of the frame into it,
+         * or of it into the frame, lines up with the frame's pads, and the
+         * overscan columns stay out of it. */
+        {
+            struct nv2a_host_opts o;
+            static const uint32_t sbox[4] = { 0, 0, 512, 512 };
+            float sc, off;
+            memset(&o, 0, sizeof o);
+            o.aspect_w = 16; o.aspect_h = 9;
+            nv2a_host_opts_set(&o);
+            CHECK(nv2a_host_pad(512, 512) == 149 && nv2a_host_pad_ratio(512, 512) == 85);
+            CHECK(nv2a_host_pad_ratio(640, 480) == 107 && nv2a_host_pad_ratio(512, 256) == 0);
+            nv2a_vp_consts_fill(&v, 0x128, 512, 512, 149, &c0);
+            c = c0;
+            nv2a_aspect_map(&c, 512, 512, 149, NV2A_PLACE_STRETCH);
+            CHECK(fabsf(c.c[4] - (128.0f / 810.0f - 1.0f)) < 1e-6f);          /* x 0 at column 64 */
+            CHECK(fabsf(512.0f * c.c[0] + c.c[4] - (1.0f - 128.0f / 810.0f)) < 1e-6f);
+            nv2a_aspect_box(sbox, 512, 512, 149, 2, NV2A_PLACE_STRETCH, 1, out);
+            CHECK(out[0] == 128 && out[2] == 1492 && out[3] == 1024);
+            /* The frame's left pad edge, read the guest way, is that column. */
+            nv2a_rt_guest_read(512, 149, &sc, &off);
+            CHECK(fabsf((-107.0f / 640.0f * sc + off) * 810.0f - 64.0f) <= 1.0f);
+            CHECK(nv2a_rt_stretch_read(512, 512, 149, &sc, &off)
+                  && fabsf(sc - 682.0f / 810.0f) < 1e-6f && fabsf(off - 64.0f / 810.0f) < 1e-6f);
+            CHECK(!nv2a_rt_stretch_read(640, 480, 107, &sc, &off));   /* the frame: whole */
+            /* The frame itself still stretches over all of its pads. */
+            c = c0;
+            nv2a_vp_consts_fill(&v, 0x128, 640, 480, 107, &c);
+            nv2a_aspect_map(&c, 640, 480, 107, NV2A_PLACE_STRETCH);
+            CHECK(c.c[0] == 2.0f / 640.0f && c.c[4] == -1.0f);
+            memset(&o, 0, sizeof o);
+            nv2a_host_opts_set(&o);
+        }
+
         /* The placement rules. */
         CHECK(nv2a_aspect_full_width(0, 640, 640) && nv2a_aspect_full_width(-1, 641, 640));
         CHECK(!nv2a_aspect_full_width(3, 640, 640) && !nv2a_aspect_full_width(0, 637, 640));
@@ -302,7 +338,7 @@ int main(void)
         static float xy[64][2];
         static uint32_t idx[96];
         uint8_t pl[32];
-        unsigned runs, t;
+        unsigned runs, t, u;
 
         /* One quad in the left corner: one piece, one run. */
         quad(xy, idx, 0, 16, 80, 16, 48);
@@ -377,6 +413,110 @@ int main(void)
         quad(xy, idx, 1, 16, 96, 16, 30);
         CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 23, pl) == 1
               && pl[2] == NV2A_PLACE_CENTRE);
+
+        /* Off the frame's layer: BLiNX 2's 1-1 draws 2-triangle quads that
+         * project thousands of pixels out (x 119131..125785). Not counted,
+         * not a layout screen: the HUD beside it keeps its side this frame
+         * and the next. */
+        {
+            static const float art[2][4] = { { 119131, -45001, 125785, -38347 },
+                                             { -5.99e7f, -10, 8.3e7f, 20 } };
+            float in, ext, b[4] = { 16, 16, 96, 80 };
+            CHECK(!nv2a_aspect_piece_cover(art[0], 640, 480, &in, &ext));
+            CHECK(!nv2a_aspect_piece_cover(art[1], 640, 480, &in, &ext));
+            CHECK(nv2a_aspect_piece_cover(b, 640, 480, &in, &ext) && in == 80 * 64 && ext == in);
+            b[0] = -600; b[2] = -500;            /* parked off-screen: ext only */
+            CHECK(nv2a_aspect_piece_cover(b, 640, 480, &in, &ext) && in == 0 && ext == 100 * 64);
+        }
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        quad(xy, idx, 1, 119131, 125785, -45001, -38347);
+        runs = nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 40, pl);
+        CHECK(pl[0] == NV2A_PLACE_LEFT && pl[2] == NV2A_PLACE_CENTRE);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 41, pl) == 1
+              && pl[0] == NV2A_PLACE_LEFT);
+
+        /* A screen tiled from many batches of one tile each (the loading
+         * screen's 128-pixel panels): no piece covers a third, together
+         * they cover the frame. The tile that completes it flags the frame;
+         * the next frame is centred from its first tile. */
+        for (t = 0; t < 20; t++) {
+            float x = 128.0f * (float)(t % 5u), y = 120.0f * (float)(t / 5u);
+            quad(xy, idx, 0, x, x + 128, y, y + 120);
+            nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 50, pl);
+            if (t == 0)
+                CHECK(pl[0] == NV2A_PLACE_LEFT);
+        }
+        CHECK(pl[0] == NV2A_PLACE_CENTRE);
+        quad(xy, idx, 0, 0, 128, 0, 96);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 51, pl) == 1
+              && pl[0] == NV2A_PLACE_CENTRE);
+        /* Panels parked off-screen to slide in count too: almost nothing
+         * on the frame, five frame-tall panels outside it. */
+        for (t = 0; t < 5; t++) {
+            float x = t & 1u ? 640.0f + 128.0f * (float)t : -128.0f * (float)(t + 1u);
+            quad(xy, idx, 0, x, x + 128, 0, 480);
+            nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 60, pl);
+        }
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 61, pl) == 1
+              && pl[0] == NV2A_PLACE_CENTRE);
+        /* Sliding out: half the frame keeps a screen that was one last
+         * frame (91: three panels), so the HUD is centred through 92; less
+         * than half (92: one quad) ends it, and 93 moves again. */
+        for (u = 90; u < 92; u++)
+            for (t = 0; t < (u == 90 ? 5u : 3u); t++) {
+                float x = t & 1u ? 640.0f + 128.0f * (float)t : -128.0f * (float)(t + 1u);
+                quad(xy, idx, 0, x, x + 128, 0, 480);
+                nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, u, pl);
+            }
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 92, pl) == 1
+              && pl[0] == NV2A_PLACE_CENTRE);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 93, pl) == 1
+              && pl[0] == NV2A_PLACE_LEFT);
+        /* A busy HUD (a dialogue box, the mission list: up to half the
+         * frame in BLiNX 2) is not a screen. */
+        quad(xy, idx, 0, 16, 336, 16, 256);
+        quad(xy, idx, 1, 320, 624, 280, 464);
+        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 70, pl);
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 71, pl) == 1
+              && pl[0] == NV2A_PLACE_LEFT);
+        /* The cover is a share of each piece's own target: a quarter of
+         * the 640x480 frame and a quarter of each of two 320x240 post
+         * buffers is three quarters, not 160% of a 320x240 one. */
+        quad(xy, idx, 0, 16, 336, 16, 256);
+        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 100, pl);
+        quad(xy, idx, 0, 8, 168, 8, 128);
+        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 320, 240, 100, pl);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 320, 240, 100, pl) == 1
+              && pl[0] == NV2A_PLACE_LEFT);
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 101, pl) == 1
+              && pl[0] == NV2A_PLACE_LEFT);
+        /* A quad crossing the eye plane (+-1e8) in the HUD's own batch and
+         * on its rows joins no piece: the HUD keeps its side, the quad is
+         * centred. */
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        quad(xy, idx, 1, -1e8f, 1e8f, 20, 60);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 110, pl) == 2
+              && pl[0] == NV2A_PLACE_LEFT && pl[1] == NV2A_PLACE_LEFT
+              && pl[2] == NV2A_PLACE_CENTRE && pl[3] == NV2A_PLACE_CENTRE);
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 111, pl) == 1
+              && pl[0] == NV2A_PLACE_LEFT);
+        /* Placements are recorded on layout frames too, so the cluster's
+         * centre-third piece is on its side on the first frame that moves
+         * again (82), not one frame later. */
+        nv2a_aspect_layout_note(80);
+        quad(xy, idx, 0, 16, 96, 16, 80);
+        quad(xy, idx, 1, 90, 290, 16, 80);
+        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 80, pl);
+        quad(xy, idx, 0, 290, 316, 30, 60);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 81, pl) == 1
+              && pl[0] == NV2A_PLACE_CENTRE);
+        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 82, pl) == 1
+              && pl[0] == NV2A_PLACE_LEFT);
 
         /* Full width by triangle: a full-screen quad is; the four corner
          * triangles of one batch, whose bounds are the screen, are not. */

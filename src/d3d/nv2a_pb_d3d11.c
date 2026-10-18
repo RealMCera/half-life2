@@ -2362,20 +2362,24 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
                                                            : nv2a_host_opts()->movie_mode);
     }
     /* A batch sampling a padded target the stock way reads it whole, pads
-     * and all, which is what a stretched pass wants. Any other reads its
+     * and all, which is what a stretched pass wants, short of a square's
+     * overscan (nv2a_rt_stretch_read). Any other reads its
      * guest columns (nv2a_rt_guest_read; tex_scale.w, rt_offset), on an
      * unpadded target too: Burnout 3's 640x464 frame has no pad, but the
      * squares it samples do. */
-    if (hp->place != NV2A_PLACE_STRETCH && hp->place != NV2A_PLACE_COVER)
-        for (n = 0; n < 4; n++) {
-            const RenderTarget *src = s_stage_rt[n];
-            if (src && src->pad) {
-                float sc, off;
-                nv2a_rt_guest_read(src->w, src->pad, &sc, &off);
-                pc.tex_scale[n][0] *= sc;
-                pc.tex_scale[n][3] = off;
-            }
-        }
+    for (n = 0; n < 4; n++) {
+        const RenderTarget *src = s_stage_rt[n];
+        float sc, off;
+        if (!src || !src->pad)
+            continue;
+        if (hp->place != NV2A_PLACE_STRETCH && hp->place != NV2A_PLACE_COVER)
+            nv2a_rt_guest_read(src->w, src->pad, &sc, &off);
+        /* Not a square's overscan: a stretch spans the ratio's pad. */
+        else if (!nv2a_rt_stretch_read(src->w, src->h, src->pad, &sc, &off))
+            continue;
+        pc.tex_scale[n][0] *= sc;
+        pc.tex_scale[n][3] = off;
+    }
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */
     } else if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
@@ -3018,7 +3022,7 @@ static int aspect_trace(void)
 {
     static int on = -1;
     if (on < 0)
-        on = recomp_env(RENV_ASPECT_TRACE) != NULL;
+        nv2a_aspect_trace_set(on = recomp_env(RENV_ASPECT_TRACE) != NULL);
     return on;
 }
 

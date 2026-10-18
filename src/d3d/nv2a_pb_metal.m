@@ -1959,7 +1959,7 @@ static int aspect_trace(void)
 {
     static int on = -1;
     if (on < 0)
-        on = recomp_env(RENV_ASPECT_TRACE) != NULL;
+        nv2a_aspect_trace_set(on = recomp_env(RENV_ASPECT_TRACE) != NULL);
     return on;
 }
 
@@ -2266,20 +2266,24 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         if (two_d && rt->pad && aspect_trace())
             aspect_log(ve ? ve->hash : 0, count, nidx / 3u, lo_x, hi_x, rt, place, runs);
         /* A batch sampling a padded target the stock way reads it whole,
-         * pads and all, which is what a stretched pass wants. Any other
-         * reads its guest columns (nv2a_rt_guest_read; tex_scale.w,
+         * pads and all, which is what a stretched pass wants, short of a
+         * square's overscan (nv2a_rt_stretch_read). Any other reads its
+         * guest columns (nv2a_rt_guest_read; tex_scale.w,
          * rt_offset), on an unpadded target too: Burnout 3's 640x464 frame
          * has no pad, but the squares it samples do. */
-        if (place != NV2A_PLACE_STRETCH && place != NV2A_PLACE_COVER)
-            for (k = 0; k < 4; k++) {
-                const RenderTarget *src = srcs[k];
-                if (src && src->pad) {
-                    float sc, off;
-                    nv2a_rt_guest_read(src->w, src->pad, &sc, &off);
-                    mpc.b.tex_scale[k][0] *= sc;
-                    mpc.b.tex_scale[k][3] = off;
-                }
-            }
+        for (k = 0; k < 4; k++) {
+            const RenderTarget *src = srcs[k];
+            float sc, off;
+            if (!src || !src->pad)
+                continue;
+            if (place != NV2A_PLACE_STRETCH && place != NV2A_PLACE_COVER)
+                nv2a_rt_guest_read(src->w, src->pad, &sc, &off);
+            /* Not a square's overscan: a stretch spans the ratio's pad. */
+            else if (!nv2a_rt_stretch_read(src->w, src->h, src->pad, &sc, &off))
+                continue;
+            mpc.b.tex_scale[k][0] *= sc;
+            mpc.b.tex_scale[k][3] = off;
+        }
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
         nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
 
