@@ -237,7 +237,76 @@ static int          g_cs_table_full;
  */
 static CRITICAL_SECTION g_cs_single;
 static INIT_ONCE g_cs_single_once = INIT_ONCE_STATIC_INIT;
-static int g_cs_single_mode = -1;
+static int g_cs_single_mode = -1;   /* 0 shadow, 1 single, 2 guest-struct */
+
+/* ---- the guest-struct mode ---------------------------------------------
+ *
+ * The shadow mode maps every guest lock onto a host CRITICAL_SECTION --
+ * correct, and it costs a host Enter and Leave per call, which a title
+ * whose loader locks per block parsed pays a million times over (three
+ * quarters of the process inside ntdll).
+ *
+ * This mode runs the lock on the guest's own bytes. The Xbox layout,
+ * MEASURED from the structures the titles actually hand over (dumped at
+ * first use -- see RECOMP_CS_DUMP): a 28-byte structure with the type/
+ * size header and a self-linked LIST_ENTRY first, then the lock state:
+ *
+ *   +0x00  USHORT Type (=1), USHORT Size       0x00040001 as measured
+ *   +0x04  reserved (zero)
+ *   +0x08  LIST_ENTRY Flink/Blink (self-linked when initialised)
+ *   +0x10  LONG LockCount    (-1 = free)
+ *   +0x14  LONG RecursionCount
+ *   +0x18  HANDLE OwningThread
+ *
+ * Not the NT layout: the state sits at +0x10, not +0x04. Structures that
+ * do not read as critical sections at all (the XDK hands some over as
+ * plain tokens) fall back to the shadow, classified once per address --
+ * the fast path's writes keep its own classification true, and a shadow
+ * address is never written by it. Waits sleep on a host semaphore, one
+ * per lock, memoised like everything else in this file. The owner field
+ * holds the taking thread's TIB address: a guest pointer every thread
+ * that runs guest code has. Off by default (RECOMP_CS_MODE=guest). */
+extern ptrdiff_t g_xbox_mem_offset;   /* fully declared below */
+
+static uint32_t xbox_cs_guest_tid(void)
+{
+    return g_fs_base ? g_fs_base : (uint32_t)GetCurrentThreadId();
+}
+
+#define CS_SEM_TABLE 1024u
+static struct { uint32_t key; HANDLE sem; } g_cs_sem_memo[CS_SEM_TABLE];
+
+static HANDLE xbox_cs_sem(uint32_t cs_va)
+{
+    uint32_t slot = (cs_va >> 4) & (CS_SEM_TABLE - 1u);
+    HANDLE h;
+
+    if (g_cs_sem_memo[slot].key == cs_va)
+        return g_cs_sem_memo[slot].sem;
+    h = CreateSemaphoreW(NULL, 0, 0x7FFFFFFF, NULL);
+    if (!h)
+        return NULL;
+    g_cs_sem_memo[slot].key = cs_va;
+    g_cs_sem_memo[slot].sem = h;
+    return h;
+}
+
+/* One classification bit per address: fast (guest bytes) or shadow. */
+#define CS_CLASS_SIZE 1024u
+static struct { uint32_t key; uint8_t fast; } g_cs_class[CS_CLASS_SIZE];
+
+static int cs_class_fast(uint32_t va)
+{
+    uint32_t slot = (va >> 4) & (CS_CLASS_SIZE - 1u);
+    return g_cs_class[slot].key == va && g_cs_class[slot].fast;
+}
+
+static void cs_class_mark(uint32_t va)
+{
+    uint32_t slot = (va >> 4) & (CS_CLASS_SIZE - 1u);
+    g_cs_class[slot].key = va;
+    g_cs_class[slot].fast = 1;
+}
 
 static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -250,7 +319,9 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
     if (g_cs_single_mode < 0) {
         const char* mode = getenv("RECOMP_CS_MODE");
-        g_cs_single_mode = (mode && !strcmp(mode, "single")) ? 1 : 0;
+        g_cs_single_mode = !mode ? 0
+                       : !strcmp(mode, "single") ? 1
+                       : !strcmp(mode, "guest") ? 2 : 0;
         if (g_cs_single_mode)
             fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
                             "shares one recursive lock\n");
@@ -472,6 +543,57 @@ static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
 
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
+    if (g_cs_single_mode == 2) {           /* guest-struct mode */
+        uint8_t* g = (uint8_t*)CriticalSection;
+        uint32_t gva = (uint32_t)((uintptr_t)g - (uintptr_t)g_xbox_mem_offset);
+        volatile LONG* lock = (volatile LONG*)(g + 0x10);
+        uint32_t* rec  = (uint32_t*)(g + 0x14);
+        volatile uint32_t* owner = (volatile uint32_t*)(g + 0x18);
+        uint32_t me = xbox_cs_guest_tid();
+        LONG v = InterlockedCompareExchange(lock, 0, -1);
+        if (v == -1) {                     /* was free: ours */
+            cs_class_mark(gva);
+            *owner = me;
+            *rec = 1;
+            return;
+        }
+        if (cs_class_fast(gva)) {
+            if (*owner == me) {            /* ours: recurse */
+                InterlockedIncrement(lock);
+                (*rec)++;
+                return;
+            }
+            {
+                LONG v2 = InterlockedIncrement(lock);
+                if (v2 == 0 || *owner == me) {
+                    if (*owner != me) { *owner = me; *rec = 1; }
+                    else (*rec)++;
+                    return;
+                }
+                HANDLE sem = xbox_cs_sem(gva);
+                if (sem) {
+                    WaitForSingleObject(sem, INFINITE);
+                    *owner = me;
+                    *rec = 1;
+                }
+            }
+            return;
+        }
+        if (v == 0 && *owner == 0 && *rec == 0
+                  && *(volatile uint32_t*)(g + 0x08) == 0) {
+            /* Statically zeroed, never announced: claim by ownership. The
+             * list entry being nulled too keeps the claim conservative --
+             * an initialised one is self-linked, not zero. */
+            if (InterlockedCompareExchange((volatile LONG*)owner,
+                                           (LONG)me, 0) == 0) {
+                cs_class_mark(gva);
+                *rec = 1;
+                return;
+            }
+        }
+        /* Not ours and not a fast-classified lock: the shadow owns it. */
+    }
+    {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (!cs)
         return;
@@ -522,10 +644,34 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
                            - (uintptr_t)g_xbox_mem_offset));
         fflush(stderr);
     }
+    }
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
+    if (g_cs_single_mode == 2
+        && cs_class_fast((uint32_t)((uintptr_t)CriticalSection
+                                    - (uintptr_t)g_xbox_mem_offset))) {
+        uint8_t* g = (uint8_t*)CriticalSection;
+        uint32_t gva = (uint32_t)((uintptr_t)g - (uintptr_t)g_xbox_mem_offset);
+        volatile LONG* lock = (volatile LONG*)(g + 0x10);
+        uint32_t* rec  = (uint32_t*)(g + 0x14);
+        volatile uint32_t* owner = (volatile uint32_t*)(g + 0x18);
+        if (*owner != xbox_cs_guest_tid())
+            return;                        /* not ours: ignore, as the shadow does */
+        if (--(*rec) == 0) {
+            *owner = 0;
+            if (InterlockedDecrement(lock) >= 0) {  /* waiters pending */
+                HANDLE sem = xbox_cs_sem(gva);
+                if (sem)
+                    ReleaseSemaphore(sem, 1, NULL);
+            }
+        } else {
+            InterlockedDecrement(lock);
+        }
+        return;
+    }
+    {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (cs) {
         InterlockedIncrement(&g_cs_leaves);
@@ -533,10 +679,22 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
     }
+    }
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
+    if (g_cs_single_mode == 2) {
+        uint8_t* g = (uint8_t*)CriticalSection;
+        *(uint32_t*)(g + 0x00) = 0x00040001u;   /* Type 1, Size 4 (as measured) */
+        *(uint32_t*)(g + 0x04) = 0;
+        *(uint32_t*)(g + 0x08) = (uint32_t)((uintptr_t)g + 0x08 - (uintptr_t)g_xbox_mem_offset);  /* Flink: self */
+        *(uint32_t*)(g + 0x0C) = (uint32_t)((uintptr_t)g + 0x08 - (uintptr_t)g_xbox_mem_offset);  /* Blink: self */
+        *(uint32_t*)(g + 0x10) = (uint32_t)-1;  /* LockCount: free */
+        *(uint32_t*)(g + 0x14) = 0;              /* RecursionCount */
+        *(uint32_t*)(g + 0x18) = 0;              /* OwningThread */
+        return;
+    }
     /* Creating the shadow here is not required -- Enter does it -- but doing
      * it now keeps the first Enter off the exclusive path. */
     (void)xbox_cs_shadow(CriticalSection);
