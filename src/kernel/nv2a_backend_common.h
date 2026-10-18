@@ -1221,7 +1221,7 @@ struct nv2a_host_opts {
     unsigned pack_off;          /* NV2A_PACK_OFF_* bits: 0 = every kind on */
     int      present_surface;   /* enum nv2a_present_surface */
     /* display.aspect as a ratio, 0:0 = stock (4:3, no padding): 4:3-shaped
-     * targets get hor+ padding (nv2a_host_pad). */
+     * and square targets get hor+ padding (nv2a_host_pad). */
     unsigned aspect_w, aspect_h;
     int      hud_mode;          /* enum nv2a_hud_mode: display.hud */
     int      movie_mode;        /* enum nv2a_movie_mode: display.movie */
@@ -1277,9 +1277,11 @@ unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
                           int bump_source);
 /* Hor+ padding of a guest w x h colour target, guest pixels on each side:
  * 0 unless display.aspect is set and the target is 4:3 within 1% (the frame
- * and its half-size post buffers; not the square shadow, environment or
- * post targets, which keep their shape), then round((h * aw/ah - w) / 2):
- * 107 for 640x480 at 16:9 (an 854-wide target), 53 for 320x240. */
+ * and its half-size post buffers), then round((h * aw/ah - w) / 2): 107 for
+ * 640x480 at 16:9 (an 854-wide target), 53 for 320x240. A square target
+ * (screen-space reflections) is widened by the same ratio,
+ * round(w * (3aw / 4ah - 1) / 2): 51 for 512x512 at 16:10, 85 at 16:9.
+ * Other shapes keep theirs. */
 uint32_t nv2a_host_pad(uint32_t w, uint32_t h);
 
 /* Width of the window for a guest w x h frame shown `scale` times larger:
@@ -1344,7 +1346,8 @@ static inline int nv2a_aspect_layer_w(float w)
  * vertex at one nv2a_aspect_layer_w); full_w: nv2a_aspect_full_width;
  * guest_tex: a stage samples a guest texture (not a render target), and
  * nv2a_aspect_picture says it is one; flat_rt: a stage samples a render
- * target without pads (a 256x256 blur, a 512x512 reflection). A full-width
+ * target without pads, one neither 4:3 nor square (a 512x256 shadow or
+ * blur buffer; squares are padded, nv2a_host_pad). A full-width
  * pass that samples only padded render targets, or nothing, is stretched
  * (its source is padded too, or it is a flat fade); one over an unpadded
  * target is centred, since stretching it would widen a 4:3 picture over
@@ -1361,6 +1364,19 @@ static inline int nv2a_aspect_place(int two_d, int full_w, int guest_tex, int fl
         return flat_rt ? NV2A_PLACE_CENTRE : NV2A_PLACE_STRETCH;
     return movie_mode == NV2A_MOVIE_FIT ? NV2A_PLACE_STRETCH
          : movie_mode == NV2A_MOVIE_FILL ? NV2A_PLACE_COVER : NV2A_PLACE_CENTRE;
+}
+
+/* Hor+: how a batch that is not stretched reads a padded render target.
+ * The target's guest columns sit pad in from the left of w + 2 pad, so a
+ * read at u (0..1 over the stock target) is taken to u * scale + off. A
+ * read past 0..1 lands in the pads: a screen-space reflection sampled from
+ * the frame's pad finds the mirrored pass's pad, since both are padded by
+ * the same share of their width (nv2a_host_pad). */
+static inline void nv2a_rt_guest_read(uint32_t w, uint32_t pad, float *scale, float *off)
+{
+    float pw = (float)(w + 2u * pad);
+    *scale = (float)w / pw;
+    *off = (float)pad / pw;
 }
 
 /* display.hud=edges: where a HUD piece spanning lo_x..hi_x of a w-wide

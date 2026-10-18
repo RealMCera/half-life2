@@ -112,9 +112,11 @@ int main(void)
     CHECK(nv2a_host_size(4096, 4096, 4, 4096, &hw, &hh) == 1 && hw == 4096);
 
     /* Hor+ padding: none at stock; at 16:9 the 4:3-shaped targets get
-     * round((h*16/9 - w)/2) a side and the others nothing; the mapping
+     * round((h*16/9 - w)/2) a side, square ones the same ratio and the
+     * others nothing; the mapping
      * constants centre the guest columns in the padded width. */
     CHECK(nv2a_host_pad(640, 480) == 0);
+    CHECK(nv2a_host_pad(512, 512) == 0);
     CHECK(nv2a_host_window_w(640, 480, 1) == 640);   /* stock window */
     CHECK(nv2a_host_window_w(640, 480, 3) == 1920);
     {
@@ -129,23 +131,61 @@ int main(void)
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_pad(640, 480) == 107);
         CHECK(nv2a_host_pad(320, 240) == 53);
-        CHECK(nv2a_host_pad(256, 256) == 0);
-        CHECK(nv2a_host_pad(512, 512) == 0);
+        /* Square (screen-space reflections): widened by the frame's ratio,
+         * w * (16/9 / (4/3) - 1) / 2. */
+        CHECK(nv2a_host_pad(256, 256) == 43);
+        CHECK(nv2a_host_pad(512, 512) == 85);
+        CHECK(nv2a_host_pad(512, 256) == 0);      /* other shapes keep theirs */
         CHECK(nv2a_host_pad(640, 464) == 0);      /* Burnout 3's clip: not 4:3 */
         CHECK(nv2a_host_pad(0, 480) == 0);
+        /* Small squares round down to no pad until the share is half a
+         * pixel: 1 and 2 get 0, 4 gets 1, 16 gets 3. */
+        CHECK(nv2a_host_pad(1, 1) == 0 && nv2a_host_pad(2, 2) == 0);
+        CHECK(nv2a_host_pad(4, 4) == 1 && nv2a_host_pad(16, 16) == 3);
+        {
+            /* A reflection read from the frame's pads lands in the square's
+             * pads: frame u = -pad/w and 1 + pad/w reach the padded square's
+             * left and right edges. Both pads are whole pixels, so the edge
+             * is met within a texel (0.6 for 640 and 512 at 16:9), not
+             * exactly. */
+            static const uint32_t sq[2] = { 512, 256 };
+            static const uint32_t ratio[2][2] = { { 16, 9 }, { 16, 10 } };
+            int r, q;
+            for (r = 0; r < 2; r++) {
+                o.aspect_w = ratio[r][0]; o.aspect_h = ratio[r][1];
+                nv2a_host_opts_set(&o);
+                for (q = 0; q < 2; q++) {
+                    uint32_t fp = nv2a_host_pad(640, 480), sp = nv2a_host_pad(sq[q], sq[q]);
+                    float sc, off, pw = (float)(sq[q] + 2u * sp);
+                    float ul = -(float)fp / 640.0f, ur = 1.0f + (float)fp / 640.0f;
+                    nv2a_rt_guest_read(sq[q], sp, &sc, &off);
+                    CHECK(fabsf((ul * sc + off) * pw) <= 1.0f);
+                    CHECK(fabsf((ur * sc + off) * pw - pw) <= 1.0f);
+                    /* the stock columns are unchanged: u 0..1 is texels sp..sp+w */
+                    CHECK(fabsf(off * pw - (float)sp) < 1e-3f);
+                    CHECK(fabsf((sc + off) * pw - (float)(sp + sq[q])) < 1e-3f);
+                }
+            }
+            o.aspect_w = 16; o.aspect_h = 9;
+            nv2a_host_opts_set(&o);
+        }
         /* The window takes the padded target's shape, even and at scale. */
         CHECK(nv2a_host_window_w(640, 480, 1) == 854);
         CHECK(nv2a_host_window_w(640, 480, 2) == 1708);
         o.aspect_w = 16; o.aspect_h = 10;
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_pad(640, 480) == 64);
+        CHECK(nv2a_host_pad(512, 512) == 51);
+        CHECK(nv2a_host_pad(256, 256) == 26);
         CHECK(nv2a_host_window_w(640, 480, 1) == 768);
         o.aspect_w = 21; o.aspect_h = 9;
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_window_w(640, 480, 1) == 1120);
+        CHECK(nv2a_host_pad(512, 512) == 192);
         o.aspect_w = 4; o.aspect_h = 3;
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_pad(640, 480) == 0);
+        CHECK(nv2a_host_pad(512, 512) == 0);
         CHECK(nv2a_host_window_w(640, 480, 1) == 640);
         o.aspect_w = 16; o.aspect_h = 9;
         nv2a_host_opts_set(&o);
@@ -233,6 +273,10 @@ int main(void)
         CHECK(nv2a_aspect_place(1, 1, 0, 1, NV2A_MOVIE_BLACK) == NV2A_PLACE_CENTRE);
         CHECK(nv2a_aspect_place(1, 1, 0, 1, NV2A_MOVIE_FIT) == NV2A_PLACE_CENTRE);
         CHECK(nv2a_aspect_place(0, 1, 0, 1, NV2A_MOVIE_BLACK) == NV2A_PLACE_CENTRE);
+        /* A full-width 2D pass over a padded square that samples no
+         * unpadded target (a blur step between padded squares) is stretched
+         * over the square's pads like the frame's post passes. */
+        CHECK(nv2a_aspect_place(1, 1, 0, 0, NV2A_MOVIE_BLACK) == NV2A_PLACE_STRETCH);
         /* The 16x16 fade texture is no picture; a 1024-wide movie frame and
          * a 256-wide backdrop are. */
         CHECK(!nv2a_aspect_picture(16, 640) && !nv2a_aspect_picture(160, 640));

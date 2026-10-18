@@ -1023,6 +1023,25 @@ static void test_enhance_init(void)
         CHECK(strstr(out, "display.aspect=16:9x is not a W:H ratio") != NULL);
     }
 
+    /* display.hud: "centered" and "edges"; the old spelling "centred" is
+     * no alias, it is reported and the default (centered) is used. */
+    recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
+    recomp_env_set(RENV_DISPLAY_HUD, "edges");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->hud_mode == NV2A_HUD_EDGES);
+    recomp_env_set(RENV_DISPLAY_HUD, "centered");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->hud_mode == NV2A_HUD_CENTRED);
+    {
+        const char *out;
+        recomp_env_set(RENV_DISPLAY_HUD, "edges");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->hud_mode == NV2A_HUD_EDGES);
+        capture_begin();
+        recomp_env_set(RENV_DISPLAY_HUD, "centred");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->hud_mode == NV2A_HUD_CENTRED);
+        out = capture_end();
+        CHECK(strstr(out, "RECOMP_DISPLAY_HUD=centred is not one of centered|edges") != NULL);
+    }
+    recomp_env_set(RENV_DISPLAY_HUD, NULL);
+
     /* present.pacing: sleep by default (no file, no variable), spin from
      * the file, env over file, and a bad value reported with the file
      * answering: the file says spin, so the fallback is visible. */

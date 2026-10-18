@@ -156,7 +156,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
 | `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
 | `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
-| `display.hud` | string | `"centred"`, `"edges"`: with a wide aspect, the 2D HUD stays in the 4:3 frame or its corner and side pieces move out to the screen edges | `"centred"` | `RECOMP_DISPLAY_HUD` |
+| `display.hud` | string | `"centered"`, `"edges"`: with a wide aspect, the 2D HUD stays in the 4:3 frame or its corner and side pieces move out to the screen edges | `"centered"` | `RECOMP_DISPLAY_HUD` |
 | `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |

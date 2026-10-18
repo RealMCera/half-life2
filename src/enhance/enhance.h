@@ -17,7 +17,7 @@
  *                       timing): how lowered guest spin waits wait
  *                       (kernel_pacing.h)
  *   display.aspect      4:3 (stock) or a wider W:H: Hor+ (Metal, D3D11)
- *   display.hud         centred | edges: the HUD with a wide aspect
+ *   display.hud         centered | edges: the HUD with a wide aspect
  *   display.movie       black | fit | fill: full-screen movies with a wide aspect
  *
  * Logs one line with the values in force, e.g.

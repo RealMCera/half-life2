@@ -947,10 +947,20 @@ uint32_t nv2a_host_pad(uint32_t w, uint32_t h)
 
     if (!aw || !ah || !w || !h)
         return 0;
+    /* Square: the title's screen-space reflections (BLiNX 2's hub pit and
+     * stage 1-1 water) draw the mirrored 4:3 view into a 512 or 256 square
+     * and sample it projected from the frame, u = screen x / 640. A wide
+     * frame reads u past [0, 1] in its pads, which clamps to the square's
+     * edge columns: a seam at the 4:3 boundary. Padded by the frame's
+     * ratio, the square holds the wider view; batches sampling it through
+     * rt_offset read the same texels in [0, 1] as stock. */
+    if (w == h)
+        wide = (double)w * 3.0 * aw / (4.0 * ah);
     /* 4:3 within 1%: 3w is 4h give or take 1% of 4h. */
-    if (3.0 * w < 4.0 * h * 0.99 || 3.0 * w > 4.0 * h * 1.01)
+    else if (3.0 * w < 4.0 * h * 0.99 || 3.0 * w > 4.0 * h * 1.01)
         return 0;
-    wide = (double)h * aw / ah;
+    else
+        wide = (double)h * aw / ah;
     if (wide <= (double)w)
         return 0;
     return (uint32_t)((wide - (double)w) / 2.0 + 0.5);

@@ -66,7 +66,7 @@ static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 /* textures.font / textures.text: words, as the menu shows them. */
 static const char *const s_onoff[] = { "off", "on", NULL };
 /* Indexes match enum nv2a_hud_mode / nv2a_movie_mode. */
-static const char *const s_hud[] = { "centred", "edges", NULL };
+static const char *const s_hud[] = { "centered", "edges", NULL };
 static const char *const s_movie[] = { "black", "fit", "fill", NULL };
 
 int xbox_enhance_init(const char *root, const char *title)
@@ -125,7 +125,7 @@ int xbox_enhance_init(const char *root, const char *title)
         snprintf(surface_txt, sizeof surface_txt, "%s", s_surface[surface]);
     }
 
-    /* Hor+: "W:H" wider than 4:3 pads the 4:3-shaped targets (nv2a_host_pad)
+    /* Hor+: "W:H" wider than 4:3 pads the 4:3-shaped and square targets (nv2a_host_pad)
      * and the title's frame sits centred in them; 4:3 is stock. The GPU
      * backends honour it; the CPU rasteriser draws 4:3 (it says so). The
      * HUD and movie keys only matter with a wide aspect, but are read

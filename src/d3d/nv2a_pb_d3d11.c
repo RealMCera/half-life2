@@ -2355,22 +2355,27 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
                 flat_rt = 1;
         }
         hp->guest_tex = guest_tex;
+        /* A square target is a reflection, glow or shadow map, never a
+         * movie: display.movie applies to the frame only. */
         hp->place = nv2a_aspect_place(hp->two_d, hp->full_w, guest_tex, flat_rt,
-                                      nv2a_host_opts()->movie_mode);
-        /* A batch sampling a padded target the stock way reads it whole,
-         * pads and all, which is what a stretched pass wants. Any other
-         * reads its guest columns, pad*n in from the left: scale x by
-         * w/(w+2pad) and add pad/(w+2pad) (tex_scale.w, rt_offset). */
-        if (hp->place != NV2A_PLACE_STRETCH && hp->place != NV2A_PLACE_COVER)
-            for (n = 0; n < 4; n++) {
-                const RenderTarget *src = s_stage_rt[n];
-                if (src && src->pad) {
-                    float pw = (float)(src->w + 2u * src->pad);
-                    pc.tex_scale[n][0] *= (float)src->w / pw;
-                    pc.tex_scale[n][3] = (float)src->pad / pw;
-                }
-            }
+                                      s_cur->w == s_cur->h ? NV2A_MOVIE_BLACK
+                                                           : nv2a_host_opts()->movie_mode);
     }
+    /* A batch sampling a padded target the stock way reads it whole, pads
+     * and all, which is what a stretched pass wants. Any other reads its
+     * guest columns (nv2a_rt_guest_read; tex_scale.w, rt_offset), on an
+     * unpadded target too: Burnout 3's 640x464 frame has no pad, but the
+     * squares it samples do. */
+    if (hp->place != NV2A_PLACE_STRETCH && hp->place != NV2A_PLACE_COVER)
+        for (n = 0; n < 4; n++) {
+            const RenderTarget *src = s_stage_rt[n];
+            if (src && src->pad) {
+                float sc, off;
+                nv2a_rt_guest_read(src->w, src->pad, &sc, &off);
+                pc.tex_scale[n][0] *= sc;
+                pc.tex_scale[n][3] = off;
+            }
+        }
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */
     } else if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
@@ -3265,7 +3270,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             tris = 0;
         }
     }
-    edges = tris && nv2a_host_opts()->hud_mode == NV2A_HUD_EDGES;
+    /* Edges anchoring is for the frame's HUD; a square target (a
+     * reflection or glow map) keeps every batch where it is. */
+    edges = tris && rt->w != rt->h && nv2a_host_opts()->hud_mode == NV2A_HUD_EDGES;
     if (rt->pad && !d->program && (vs->inputs & 1u)) {
         for (k = 0; k < count; k++) {
             float o[4];

@@ -2166,7 +2166,9 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 tris = 0;
             }
         }
-        edges = tris && nv2a_host_opts()->hud_mode == NV2A_HUD_EDGES;
+        /* Edges anchoring is for the frame's HUD; a square target (a
+         * reflection or glow map) keeps every batch where it is. */
+        edges = tris && rt->w != rt->h && nv2a_host_opts()->hud_mode == NV2A_HUD_EDGES;
         if (rt->pad && !d->program && nf4 > 0 && s_vtx_attr[0] == 0 && count) {
             lo_x = hi_x = vf[0];
             for (i = 0; i < count; i++) {
@@ -2231,8 +2233,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             if (textured)
                 s_draws_tex++;
         }
+        /* A square target is a reflection, glow or shadow map, never a
+         * movie: display.movie applies to the frame only. */
         place = rt->pad ? nv2a_aspect_place(two_d, full_w, guest_tex, flat_rt,
-                                            nv2a_host_opts()->movie_mode)
+                                            rt->w == rt->h ? NV2A_MOVIE_BLACK
+                                                           : nv2a_host_opts()->movie_mode)
                         : NV2A_PLACE_CENTRE;
         /* display.hud=edges: a centred 2D batch's pieces each to their
          * side; one placement for the whole batch is the common case (a
@@ -2262,15 +2267,17 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             aspect_log(ve ? ve->hash : 0, count, nidx / 3u, lo_x, hi_x, rt, place, runs);
         /* A batch sampling a padded target the stock way reads it whole,
          * pads and all, which is what a stretched pass wants. Any other
-         * reads its guest columns, pad*n in from the left: scale x by
-         * w/(w+2pad) and add pad/(w+2pad) (tex_scale.w, rt_offset). */
+         * reads its guest columns (nv2a_rt_guest_read; tex_scale.w,
+         * rt_offset), on an unpadded target too: Burnout 3's 640x464 frame
+         * has no pad, but the squares it samples do. */
         if (place != NV2A_PLACE_STRETCH && place != NV2A_PLACE_COVER)
             for (k = 0; k < 4; k++) {
                 const RenderTarget *src = srcs[k];
                 if (src && src->pad) {
-                    float pw = (float)(src->w + 2u * src->pad);
-                    mpc.b.tex_scale[k][0] *= (float)src->w / pw;
-                    mpc.b.tex_scale[k][3] = (float)src->pad / pw;
+                    float sc, off;
+                    nv2a_rt_guest_read(src->w, src->pad, &sc, &off);
+                    mpc.b.tex_scale[k][0] *= sc;
+                    mpc.b.tex_scale[k][3] = off;
                 }
             }
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
