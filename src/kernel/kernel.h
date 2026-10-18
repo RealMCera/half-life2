@@ -561,6 +561,10 @@ void xbox_path_init(const char* game_dir, const char* save_dir);
  * before xbox_path_init has run. */
 int xbox_path_save_dir_utf8(char *out, size_t n);
 
+/* The game folder xbox_path_init was given, as UTF-8, the same way. The
+ * console's own identity is looked for beside it (xbox_console_id.c). */
+int xbox_path_game_dir_utf8(char *out, size_t n);
+
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on
@@ -581,6 +585,10 @@ typedef char  xbox_host_char;
 const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
+
+/* "\Device\Harddisk0\PartitionN\" (1-5, trailing separator): a volume's
+ * root directory (kernel_path.c). */
+int xbox_path_is_volume_root(const char *xbox_path);
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)

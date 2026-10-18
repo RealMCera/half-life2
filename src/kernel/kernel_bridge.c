@@ -32,6 +32,8 @@
 #include "platform/host_main.h"    /* host_relaunch_self: a quick reboot into this title */
 #include "recomp_config.h"         /* recomp_config_title_id */
 #include "xbox_nic.h"
+#include "xbox_console_id.h"
+#include <stdarg.h>
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -208,13 +210,22 @@ static void kernel_data_init(void)
     /* XboxKrnlVersion (ordinal 324) - XBOX_KRNL_VERSION
      *   +0: USHORT Major (1)
      *   +2: USHORT Minor (0)
-     *   +4: USHORT Build (5849 = XDK version)
-     *   +6: USHORT Qfe (0)
-     */
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
+     *   +4: USHORT Build
+     *   +6: USHORT Qfe
+     *
+     * 1.0.5838.1, the last retail kernel (every 1.6 console runs it). This
+     * was 5849, an XDK build no retail console ever reported, and Xbox Live
+     * sends the kernel version with its sign-in: a version the service does
+     * not know can be answered "update required". RECOMP_XBOX_KERNEL_BUILD
+     * overrides the build. */
+    {
+        const char *b = getenv("RECOMP_XBOX_KERNEL_BUILD");
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) =
+            (uint16_t)(b && *b ? strtoul(b, NULL, 10) : 5838);
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 1;
+    }
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
@@ -336,8 +347,18 @@ static void kernel_data_init(void)
     /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
 
-    /* XboxHDKey (ordinal 323) - 16 bytes of zeros (no key) */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
+    /* XboxHDKey (ordinal 323): the player's own console's when its identity
+     * is there (xbox_console_id.c), else zeros. Insignia refuses a console
+     * whose key is zero; titles sign console-bound saves with it. */
+    {
+        const XboxConsoleId *id = xbox_ConsoleId();
+        uint8_t hd_key[16] = { 0 };
+        if (id && id->have_hd_key)
+            memcpy(hd_key, id->hd_key, 16);
+        memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset),
+               hd_key, 16);
+        memcpy(xbox_HDKey, hd_key, 16);
+    }
 
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
@@ -364,9 +385,14 @@ static void kernel_data_init(void)
      * HalRandGather reads the bytes for entropy. Build the struct and its text
      * inside the kernel data area so both are addressable. */
     {
+        /* The console's own drive when its backup says (EvoX's hddinfo.txt):
+         * the drive belongs with the HDD key, as on the console. */
+        const XboxConsoleId *id = xbox_ConsoleId();
         struct { uint32_t str_off, buf_off; const char *text; } d[] = {
-            { KDATA_DISK_MODEL_STR,  KDATA_DISK_MODEL_BUF,  "XBOXRECOMP VIRTUAL HDD" },
-            { KDATA_DISK_SERIAL_STR, KDATA_DISK_SERIAL_BUF, "XR0000000000" },
+            { KDATA_DISK_MODEL_STR,  KDATA_DISK_MODEL_BUF,
+              id && id->disk_model[0] ? id->disk_model : "XBOXRECOMP VIRTUAL HDD" },
+            { KDATA_DISK_SERIAL_STR, KDATA_DISK_SERIAL_BUF,
+              id && id->disk_serial[0] ? id->disk_serial : "XR0000000000" },
             /* XeImageFileName (ordinal 326). Declared but never filled in, so
              * its Buffer held whatever was in the page -- Half-Life 2's CRT
              * reads it while working out the running image's path, took the
@@ -443,6 +469,10 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 
 /* Guest return address of the call currently in a bridge. */
 RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
+/* RECOMP_XC_TRACE: the crypto and identity calls (defined with the crypto
+ * bridges, used above them too). */
+static void xc_trace(const char *name, const char *fmt, ...);
 
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
@@ -776,7 +806,8 @@ static void bridge_NtClose(void)
     }
 
     /* Close real handles but skip fake/synthetic ones */
-    if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
+    if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u &&
+            (raw_handle & 0xFFFFFFF0u) != 0xDEAD0100u) {   /* symbolic links */
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
             /* Closed here rather than through xbox_NtClose, so the file
@@ -1360,6 +1391,8 @@ static void bridge_ExQueryNonVolatileSetting(void)
         result_va ? (PULONG)&BRIDGE_MEM32(result_va) : NULL);
 
     g_eax = (uint32_t)st;
+    xc_trace("ExQueryNonVolatile", "index 0x%02X, %u bytes -> 0x%08X",
+             value_index, value_length, (uint32_t)st);
 }
 
 /* HalReturnToFirmware(Routine) - the title asking to reboot or quit.
@@ -1420,6 +1453,93 @@ static void bridge_HalReturnToFirmware(void)
                     *(const uint32_t *)(mem + a));
         }
         fflush(stderr);
+    }
+
+    /* A quick reboot into another image (XLaunchNewImage with a path, or a
+     * page naming another title), when that image is recompiled too: the
+     * launch map says which host executable it is, by the Xbox path's end
+     * (file name, or a longer tail) or by title ID:
+     *
+     *   launch_map = update.xbe=/path/xodash_update_recomp;55530013=/path/rs3_recomp|/path/game
+     *                                                   [RECOMP_LAUNCH_MAP]
+     *
+     * An entry may name the image's game folder after a '|'; without one the
+     * launched executable finds its own, and RECOMP_GAME_DIR is cleared.
+     *
+     * Its page goes along in RECOMP_LAUNCH_DATA, as for a relaunch into this
+     * title, and so does the rest of the environment (the save folder, the
+     * console identity, the network). This is how a title hands off to the
+     * dashboard's online updater (XOnlineTitleUpdate) and the updater hands
+     * back. */
+    {
+        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+        const char *map = recomp_config_lookup("RECOMP_LAUNCH_MAP", "launch_map");
+
+        if (routine == 2 && page &&
+            (BRIDGE_MEM8(page + 8) != 0 || BRIDGE_MEM32(page + 4) != recomp_config_title_id())) {
+            char xpath[520], key[600], exe[1024], tid[16];
+            const char *e = map;
+            uint32_t i, plen;
+
+            for (i = 0; i < sizeof(xpath) - 1; i++) {
+                uint8_t c = BRIDGE_MEM8(page + 8 + i);
+                if (!c) break;
+                xpath[i] = (char)c;
+            }
+            xpath[i] = 0;
+            plen = i;
+            snprintf(tid, sizeof tid, "%08X", BRIDGE_MEM32(page + 4));
+            exe[0] = 0;
+            while (e && *e && !exe[0]) {
+                const char *semi = strchr(e, ';'), *eq = strchr(e, '=');
+                size_t klen, vlen;
+                if (!eq || (semi && eq > semi)) { e = semi ? semi + 1 : NULL; continue; }
+                klen = (size_t)(eq - e);
+                vlen = semi ? (size_t)(semi - eq - 1) : strlen(eq + 1);
+                if (klen < sizeof key && vlen < sizeof exe) {
+                    memcpy(key, e, klen);
+                    key[klen] = 0;
+                    if ((klen == 8 && _stricmp(key, tid) == 0) ||
+                        (plen >= klen && klen > 0 && _stricmp(xpath + plen - klen, key) == 0)) {
+                        memcpy(exe, eq + 1, vlen);
+                        exe[vlen] = 0;
+                    }
+                }
+                e = semi ? semi + 1 : NULL;
+            }
+            if (exe[0]) {
+                static char hex[2 * 0x1000 + 1];
+                /* "exe|game folder": the image's own files. Without one the
+                 * launched executable finds its game folder itself, so this
+                 * title's RECOMP_GAME_DIR must not follow it there. */
+                char *bar = strchr(exe, '|');
+                if (bar)
+                    *bar++ = 0;
+                for (i = 0; i < 0x1000; i++)
+                    snprintf(hex + 2 * i, 3, "%02X", BRIDGE_MEM8(page + i));
+#ifdef _WIN32
+                SetEnvironmentVariableA("RECOMP_LAUNCH_DATA", hex);
+                SetEnvironmentVariableA("RECOMP_RELAUNCH_COUNT", "0");
+                SetEnvironmentVariableA("RECOMP_GAME_DIR", bar && *bar ? bar : NULL);
+#else
+                setenv("RECOMP_LAUNCH_DATA", hex, 1);
+                setenv("RECOMP_RELAUNCH_COUNT", "0", 1);
+                if (bar && *bar)
+                    setenv("RECOMP_GAME_DIR", bar, 1);
+                else
+                    unsetenv("RECOMP_GAME_DIR");
+#endif
+                fprintf(stderr, "  [KERNEL] HalReturnToFirmware: launching '%s' (title %s)"
+                                " as %s, with its launch data (launch_map)\n",
+                        xpath, tid, exe);
+                fflush(stderr);
+                host_launch_other(exe);
+                fprintf(stderr, "  [KERNEL] could not start %s; exiting instead\n", exe);
+            } else if (xpath[0]) {
+                fprintf(stderr, "  [KERNEL] HalReturnToFirmware: '%s' (title %s) has no"
+                                " recompiled image in launch_map\n", xpath, tid);
+            }
+        }
     }
 
     /* A quick reboot into the same title. XLaunchNewImage with no path (or
@@ -3697,6 +3817,7 @@ static void bridge_RtlNtStatusToDosError(void)
      * the buffer and gave up. The complete table was already written; nothing
      * called it. */
     g_eax = (uint32_t)xbox_RtlNtStatusToDosError((NTSTATUS)STACK_ARG(0));
+    xc_trace("RtlNtStatusToDosError", "0x%08X -> %u", STACK_ARG(0), g_eax);
 }
 
 /* ── File I/O bridge helpers ─────────────────────────────── */
@@ -5015,6 +5136,28 @@ static void bridge_NtQueryVolumeInformationFile(void)
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FS_INFORMATION_CLASS)infoclass);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    /* A free-space check decides from this, so the first few are said:
+     * which volume, what class, and the answer. */
+    {
+        static int said;
+        if (said < 12) {
+            said++;
+#ifdef _WIN32
+            fprintf(stderr, "  [FILE] volume query class %u -> 0x%08X", infoclass, g_eax);
+#else
+            {
+                const char *p = w32_handle_path(handle);
+                fprintf(stderr, "  [FILE] volume query class %u on %s -> 0x%08X", infoclass,
+                        p ? p : "?", g_eax);
+            }
+#endif
+            if (infoclass == 3 && g_eax == 0 && length >= 24)   /* FileFsSizeInformation */
+                fprintf(stderr, ": %u total, %u free units of %u x %u bytes",
+                        BRIDGE_MEM32(info_va), BRIDGE_MEM32(info_va + 8),
+                        BRIDGE_MEM32(info_va + 16), BRIDGE_MEM32(info_va + 20));
+            fprintf(stderr, "\n");
+        }
+    }
 }
 
 /* ── NtQueryFullAttributesFile (ordinal 210, 2 args = 8 bytes) */
@@ -5083,23 +5226,55 @@ static void bridge_NtQueryDirectoryFile(void)
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
+/* Targets of the symbolic links opened lately, by handle 0xDEAD0100 + slot.
+ * Titles open a link, query it and close it at once. */
+static char s_link_target[16][64];
+static unsigned s_link_next;
+
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
 static void bridge_NtOpenSymbolicLinkObject(void)
 {
     uint32_t handle_va = STACK_ARG(0);
-    /* arg1: POBJECT_ATTRIBUTES - ignored, we return a synthetic handle.
-     * Written raw (untagged) so NtClose recognises it and skips it. */
-    if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0001u;
+    const char *name = bridge_get_xbox_path(STACK_ARG(1));
+    const char *target = NULL;
+    size_t n = name ? strlen(name) : 0;
+
+    /* The link's own target: a title's XFormatUtilityDrive opens \??\Z:,
+     * asks where it points and formats that. Every link used to answer
+     * \Device\CdRom0, so the 5960 online updater, wiping its cache drive at
+     * the end of an install, formatted the DVD drive, failed, and called
+     * the install out of disk space. D: is the DVD drive, as XAPI links it. */
+    if (name)
+        target = xbox_LookupSymbolicLink(name);
+    if (!target && n >= 2 && (name[n - 2] == 'D' || name[n - 2] == 'd') && name[n - 1] == ':')
+        target = "\\Device\\CdRom0";
+    if (!target) {
+        /* A console says STATUS_OBJECT_NAME_NOT_FOUND. Every link answered
+         * \Device\CdRom0 for long enough that a title may lean on it, so a
+         * name the table does not know keeps that answer, and is said. */
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [KERNEL] NtOpenSymbolicLinkObject: '%s' is no link here; "
+                            "answering \\Device\\CdRom0 as before\n", name ? name : "?");
+        target = "\\Device\\CdRom0";
+    }
+    {
+        unsigned slot = s_link_next++ & 15u;
+        snprintf(s_link_target[slot], sizeof s_link_target[slot], "%s", target);
+        /* Written raw (untagged): NtClose knows this range and skips it. */
+        if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0100u | slot;
+    }
     g_eax = STATUS_SUCCESS;
 }
 
 /* ── NtQuerySymbolicLinkObject (ordinal 215, 3 args = 12 bytes) */
 static void bridge_NtQuerySymbolicLinkObject(void)
 {
-    /* uint32_t handle = STACK_ARG(0); */
+    uint32_t handle = STACK_ARG(0);
     uint32_t target_va = STACK_ARG(1);
     uint32_t retlen_va = STACK_ARG(2);
-    const char* target = "\\Device\\CdRom0";
+    const char* target = (handle & 0xFFFFFFF0u) == 0xDEAD0100u
+                       ? s_link_target[handle & 15u] : "\\Device\\CdRom0";
     USHORT len = (USHORT)strlen(target);
 
     if (retlen_va) BRIDGE_MEM32(retlen_va) = (uint32_t)len;
@@ -6270,6 +6445,7 @@ static void bridge_RtlTimeFieldsToTime(void)
 static void bridge_PhyGetLinkState(void)
 {
     g_eax = (uint32_t)xbox_PhyGetLinkState((BOOLEAN)STACK_ARG(0));
+    xc_trace("PhyGetLinkState", "verify %u -> 0x%08X", STACK_ARG(0) & 0xFF, g_eax);
 }
 
 /* ── PhyInitialize (ordinal 253, 2 args) */
@@ -6288,15 +6464,65 @@ static void bridge_RtlTimeToTimeFields(void)
     g_eax = 0;
 }
 
+/* ── RECOMP_XC_TRACE=1: the console's crypto and identity, call by call ──
+ *
+ * Xbox Live's client (XOnline, lifted with the title) signs in through the
+ * kernel's crypto and the console's identity, and when it gives up before
+ * sending anything, these calls are the trail: which ran, from where, on
+ * what lengths, and what they answered. Never the data -- it is keys and
+ * sign-in material. A run of the same call from the same place prints once
+ * with a count. RECOMP_XC_TRACE_BUDGET lines (default 3000). */
+static void xc_trace(const char *name, const char *fmt, ...)
+{
+    static int on = -1;
+    static long left;
+    static const char *last_name;
+    static uint32_t last_caller;
+    static unsigned long repeats;
+    uint32_t caller = g_xbox_kernel_caller;
+    va_list ap;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_XC_TRACE");
+        const char *b = getenv("RECOMP_XC_TRACE_BUDGET");
+        on = e && *e && strcmp(e, "0") != 0;
+        left = b && *b ? strtol(b, NULL, 0) : 3000;
+    }
+    if (!on)
+        return;
+    if (name == last_name && caller == last_caller) {
+        repeats++;
+        return;
+    }
+    if (repeats) {
+        fprintf(stderr, "[XC]   ... and %lu more\n", repeats);
+        repeats = 0;
+    }
+    last_name = name;
+    last_caller = caller;
+    if (left <= 0)
+        return;
+    left--;
+    fprintf(stderr, "[XC] %-22s from 0x%08X ", name, caller);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    if (left == 0)
+        fprintf(stderr, "[XC] budget spent (RECOMP_XC_TRACE_BUDGET)\n");
+}
+
 /* ── XcSHAInit / XcSHAUpdate / XcSHAFinal (ordinals 335-337) */
 static void bridge_XcSHAInit(void)
 {
+    xc_trace("XcSHAInit", "");
     xbox_XcSHAInit((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)));
     g_eax = 0;
 }
 
 static void bridge_XcSHAUpdate(void)
 {
+    xc_trace("XcSHAUpdate", "%u bytes", STACK_ARG(2));
     xbox_XcSHAUpdate((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                      (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)),
                      STACK_ARG(2));
@@ -6305,6 +6531,7 @@ static void bridge_XcSHAUpdate(void)
 
 static void bridge_XcSHAFinal(void)
 {
+    xc_trace("XcSHAFinal", "");
     xbox_XcSHAFinal((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                     (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)));
     g_eax = 0;
@@ -6313,6 +6540,7 @@ static void bridge_XcSHAFinal(void)
 /* ── XcRC4Key / XcRC4Crypt (ordinals 338-339) */
 static void bridge_XcRC4Key(void)
 {
+    xc_trace("XcRC4Key", "key %u bytes", STACK_ARG(1));
     xbox_XcRC4Key((PXBOX_RC4_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                   STACK_ARG(1),
                   (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
@@ -6321,6 +6549,7 @@ static void bridge_XcRC4Key(void)
 
 static void bridge_XcRC4Crypt(void)
 {
+    xc_trace("XcRC4Crypt", "%u bytes", STACK_ARG(1));
     xbox_XcRC4Crypt((PXBOX_RC4_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                     STACK_ARG(1),
                     (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
@@ -6330,16 +6559,46 @@ static void bridge_XcRC4Crypt(void)
 /* ── XcHMAC (ordinal 340, 7 args) */
 static void bridge_XcHMAC(void)
 {
+    uint32_t data_va = STACK_ARG(2), data_len = STACK_ARG(3), out_va = STACK_ARG(6);
+
     xbox_XcHMAC((const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1),
-                (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
+                (const UCHAR*)XBOX_TO_NATIVE(data_va), data_len,
                 (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
-                (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(6)));
+                (UCHAR*)XBOX_TO_NATIVE(out_va));
     g_eax = 0;
+    /* A signature check is an HMAC of a record compared with the bytes kept
+     * beside it. Whether the answer matches those bytes (the 12 before the
+     * data, as an account sector keeps them, or the 8 after, as an account
+     * record does) says whether the check will pass -- without printing
+     * either. */
+    if (data_len >= 64 && data_va >= 12 && out_va) {
+        const uint8_t *out = (const uint8_t *)XBOX_TO_NATIVE(out_va);
+        const uint8_t *data = (const uint8_t *)XBOX_TO_NATIVE(data_va);
+        /* Fingerprints, not data: the first 4 bytes of SHA-1 of the data,
+         * of the 12 bytes after it, and of the answer's first 12, so a run
+         * can be matched against the disk's sectors without showing them. */
+        XBOX_SHA_CONTEXT c;
+        uint8_t h_data[20], h_after[20], h_out[20];
+        xbox_XcSHAInit(&c); xbox_XcSHAUpdate(&c, data, data_len); xbox_XcSHAFinal(&c, h_data);
+        xbox_XcSHAInit(&c); xbox_XcSHAUpdate(&c, data + data_len, 12); xbox_XcSHAFinal(&c, h_after);
+        xbox_XcSHAInit(&c); xbox_XcSHAUpdate(&c, out, 12); xbox_XcSHAFinal(&c, h_out);
+        xc_trace("XcHMAC", "key %u, data %u + %u bytes; the 12 before %s, the 8 after %s "
+                 "[data %02x%02x%02x%02x, after %02x%02x%02x%02x, out %02x%02x%02x%02x, data at 0x%08X]",
+                 STACK_ARG(1), data_len, STACK_ARG(5),
+                 memcmp(out, data - 12, 12) == 0 ? "MATCH" : "differ",
+                 memcmp(out, data + data_len, 8) == 0 ? "MATCH" : "differ",
+                 h_data[0], h_data[1], h_data[2], h_data[3],
+                 h_after[0], h_after[1], h_after[2], h_after[3],
+                 h_out[0], h_out[1], h_out[2], h_out[3], data_va);
+    } else {
+        xc_trace("XcHMAC", "key %u, data %u + %u bytes", STACK_ARG(1), data_len, STACK_ARG(5));
+    }
 }
 
 /* ── XcDESKeyParity (ordinal 346, 2 args) */
 static void bridge_XcDESKeyParity(void)
 {
+    xc_trace("XcDESKeyParity", "%u bytes", STACK_ARG(1));
     xbox_XcDESKeyParity((PUCHAR)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1));
     g_eax = 0;
 }
@@ -6582,6 +6841,7 @@ static void bridge_MmDeleteKernelStack(void)
 static void bridge_XcPKGetKeyLen(void)
 {
     g_eax = (uint32_t)xbox_XcPKGetKeyLen(XBOX_TO_NATIVE(STACK_ARG(0)));
+    xc_trace("XcPKGetKeyLen", "-> %u (stub)", g_eax);
 }
 
 static void bridge_XcPKDecPrivate(void)
@@ -6594,6 +6854,7 @@ static void bridge_XcPKEncPublic(void)
 {
     g_eax = (uint32_t)xbox_XcPKEncPublic(XBOX_TO_NATIVE(STACK_ARG(0)),
         XBOX_TO_NATIVE(STACK_ARG(1)), XBOX_TO_NATIVE(STACK_ARG(2)));
+    xc_trace("XcPKEncPublic", "-> %u (stub)", g_eax);
 }
 
 static void bridge_XcVerifyPKCS1Signature(void)
@@ -6601,10 +6862,12 @@ static void bridge_XcVerifyPKCS1Signature(void)
     g_eax = (uint32_t)xbox_XcVerifyPKCS1Signature(
         XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)),
         XBOX_TO_NATIVE(STACK_ARG(2)));
+    xc_trace("XcVerifyPKCS1Signature", "key at 0x%08X -> %u (always TRUE)", STACK_ARG(1), g_eax);
 }
 
 static void bridge_XcModExp(void)
 {
+    xc_trace("XcModExp", "%u dwords", STACK_ARG(4));
     g_eax = (uint32_t)xbox_XcModExp((PULONG)XBOX_TO_NATIVE(STACK_ARG(0)),
         (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)),
         (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)),
@@ -6613,6 +6876,7 @@ static void bridge_XcModExp(void)
 
 static void bridge_XcKeyTable(void)
 {
+    xc_trace("XcKeyTable", "cipher %u", STACK_ARG(0));
     xbox_XcKeyTable(STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
         (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
     g_eax = 0;
@@ -6620,6 +6884,7 @@ static void bridge_XcKeyTable(void)
 
 static void bridge_XcBlockCrypt(void)
 {
+    xc_trace("XcBlockCrypt", "cipher %u, %s", STACK_ARG(0), STACK_ARG(4) ? "encrypt" : "decrypt");
     xbox_XcBlockCrypt(STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
         XBOX_TO_NATIVE(STACK_ARG(2)), XBOX_TO_NATIVE(STACK_ARG(3)),
         STACK_ARG(4));
@@ -6628,6 +6893,8 @@ static void bridge_XcBlockCrypt(void)
 
 static void bridge_XcBlockCryptCBC(void)
 {
+    xc_trace("XcBlockCryptCBC", "cipher %u, %u bytes, %s", STACK_ARG(0), STACK_ARG(1),
+             STACK_ARG(5) ? "encrypt" : "decrypt");
     xbox_XcBlockCryptCBC(STACK_ARG(0), STACK_ARG(1),
         XBOX_TO_NATIVE(STACK_ARG(2)), XBOX_TO_NATIVE(STACK_ARG(3)),
         XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
