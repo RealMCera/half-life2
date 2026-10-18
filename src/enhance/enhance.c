@@ -65,6 +65,9 @@ static const char *const s_pacing[] = { "spin", "sleep", NULL };
 static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 /* textures.font / textures.text: words, as the menu shows them. */
 static const char *const s_onoff[] = { "off", "on", NULL };
+/* Indexes match enum nv2a_hud_mode / nv2a_movie_mode. */
+static const char *const s_hud[] = { "centred", "edges", NULL };
+static const char *const s_movie[] = { "black", "fit", "fill", NULL };
 
 int xbox_enhance_init(const char *root, const char *title)
 {
@@ -122,14 +125,28 @@ int xbox_enhance_init(const char *root, const char *title)
         snprintf(surface_txt, sizeof surface_txt, "%s", s_surface[surface]);
     }
 
-    /* Hor+ is a later slice; a file or env that asks for it must not be
-     * ignored silently. */
+    /* Hor+: "W:H" wider than 4:3 pads the 4:3-shaped targets (nv2a_host_pad)
+     * and the title's frame sits centred in them; 4:3 is stock. The GPU
+     * backends honour it; the CPU rasteriser draws 4:3 (it says so). The
+     * HUD and movie keys only matter with a wide aspect, but are read
+     * either way so they are never reported unused. */
     aspect = enhance_cfg_string("display.aspect", "4:3");
     if (strcmp(aspect, "4:3") != 0) {
-        fprintf(stderr, LOGP "display.aspect=%s not implemented yet (hor+ is a"
-                " later slice); using 4:3\n", aspect);
-        aspect = "4:3";
+        unsigned aw = 0, ah = 0;
+        int end = 0;
+        /* the whole value: "16:9x" is a typo, not 16:9 */
+        if (sscanf(aspect, "%u:%u%n", &aw, &ah, &end) == 2 && !aspect[end]
+                && aw && ah && aw * 3u > ah * 4u) {
+            o.aspect_w = aw;
+            o.aspect_h = ah;
+        } else {
+            fprintf(stderr, LOGP "display.aspect=%s is not a W:H ratio wider than"
+                    " 4:3; using 4:3\n", aspect);
+            aspect = "4:3";
+        }
     }
+    o.hud_mode = enhance_cfg_choice("display.hud", s_hud, NV2A_HUD_CENTRED);
+    o.movie_mode = enhance_cfg_choice("display.movie", s_movie, NV2A_MOVIE_BLACK);
 
     /* The pack's kinds a player can turn off; read whether or not a pack
      * is configured, so the keys are never reported unused. */
@@ -143,6 +160,9 @@ int xbox_enhance_init(const char *root, const char *title)
             " present.fullscreen=%d present.pacing=%s present.surface=%s"
             " (display.aspect=%s)\n", o.render_scale, o.aniso,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], surface_txt, aspect);
+    if (o.aspect_w)
+        fprintf(stderr, LOGP "display.aspect=%s display.hud=%s display.movie=%s\n", aspect,
+                s_hud[o.hud_mode], s_movie[o.movie_mode]);
     load_tex_pack(&o);
     enhance_input_init();
     /* No enhance_cfg_report_unused() here: the title reads its own keys

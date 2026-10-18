@@ -156,8 +156,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("        float2 ds = round(x%d.bg * 255.0);\n", 8 + in);
             EMIT("        ds = (ds >= 128.0 ? ds - 256.0 : ds) / 127.0;\n");
             EMIT("        ds = float2(dot(ds, bump[%d].xw), dot(ds, bump[%d].yz));\n", i, i);
-            EMIT("        x%d = tex%d.Sample(samp%d, (i.tc%d.xy + ds) * tex_scale[%d].xy);\n",
-                 8 + i, i, i, i, i);
+            if (state->rt_offset)
+                EMIT("        x%d = tex%d.Sample(samp%d, (i.tc%d.xy + ds) * tex_scale[%d].xy"
+                     " + float2(tex_scale[%d].w, 0.0));\n", 8 + i, i, i, i, i, i);
+            else
+                EMIT("        x%d = tex%d.Sample(samp%d, (i.tc%d.xy + ds) * tex_scale[%d].xy);\n",
+                     8 + i, i, i, i, i);
             if (m == NV2A_TEXMODE_BUMPENVMAP_LUM)
                 /* luminance: the input's unsigned red; it scales the whole
                  * texel, alpha too, as xemu's t = t * lum */
@@ -176,8 +180,14 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                      " uv /= i.tc%d.w;\n", i, i, i, i);
             if (state->rect_snap)
                 EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, tex_scale[%d]);\n", i);
-            EMIT("        x%d = tex%d.Sample(samp%d, uv * tex_scale[%d].xy);\n",
-                 8 + i, i, i, i);
+            if (state->rt_offset)
+                /* hor+: tex_scale.w moves a centred batch's read into the
+                 * guest columns of a padded render target (0 elsewhere). */
+                EMIT("        x%d = tex%d.Sample(samp%d, uv * tex_scale[%d].xy"
+                     " + float2(tex_scale[%d].w, 0.0));\n", 8 + i, i, i, i, i);
+            else
+                EMIT("        x%d = tex%d.Sample(samp%d, uv * tex_scale[%d].xy);\n",
+                     8 + i, i, i, i);
             EMIT("    }\n");
         }
         EMIT("    if (alpha_only[%d] == 2u) x%d.a = 1.0;\n"

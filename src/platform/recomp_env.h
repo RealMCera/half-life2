@@ -72,6 +72,8 @@ extern "C" {
     X(RENDER_SCALE,      CONFIG, "RECOMP_RENDER_SCALE",      NULL, "enhancements: render.scale, internal resolution factor (1 = stock)") \
     X(RENDER_ANISO,      CONFIG, "RECOMP_RENDER_ANISO",      NULL, "enhancements: render.aniso, anisotropic filtering on mipmapped textures, 0/1 (stock) or 2..16") \
     X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
+    X(DISPLAY_HUD,       CONFIG, "RECOMP_DISPLAY_HUD",       NULL, "enhancements: display.hud, where the HUD goes on a wide display.aspect: centred (default, the 4:3 layout) or edges (corner pieces out to the new edges)") \
+    X(DISPLAY_MOVIE,     CONFIG, "RECOMP_DISPLAY_MOVIE",     NULL, "enhancements: display.movie, the sides of a 4:3 movie or still on a wide display.aspect: black (default, pillarbox), fit (stretched to the width), fill (scaled to cover, top and bottom cropped)") \
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, sleep (default: lowered spin waits sleep) or spin (stock busy-wait, the console-original timing)") \
@@ -123,6 +125,7 @@ extern "C" {
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
+    X(ASPECT_TRACE,      TRACE, "aspect",          NULL,                       "display.aspect: the 2D batches of each vertex program, texture and placement, once each ([aspect.program]), and the padded target per flip") \
     X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
     X(TEX_LOG,           TRACE, "tex",             "RECOMP_TEX_LOG",           "texture format survey; =2 also every texture") \
     X(TEX_STATE,         TRACE, "tex_state",       "RECOMP_TEX_STATE",         "texture-state methods seen, in the report") \
@@ -217,6 +220,7 @@ extern "C" {
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \
+    X(METAL_HOST_DUMP,   DEBUG, "metal_host_dump", NULL,                       "=prefix: Metal host-size frame dumps (render.scale, display.aspect) as <prefix>host_NNNNN.bmp, every fb_dump_flips flip") \
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \
     X(METAL_FB_GUARD,    DEBUG, "metal_fb_guard",  NULL,                       "trap title reads of the last Metal present surface; a read switches to metal_writeback=always") \
     X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \

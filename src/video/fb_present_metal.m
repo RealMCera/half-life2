@@ -157,7 +157,7 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             /* Letterboxed like nv2a_present_rect's fit; fbm_present keeps
              * the drawable at the frame's size. */
             s_layer.contentsGravity = kCAGravityResizeAspect;
-            w = 640 * (int)nv2a_host_render_scale();
+            w = (int)nv2a_host_window_w(640, 480, nv2a_host_render_scale());
             h = 480 * (int)nv2a_host_render_scale();
         } else {
             SDL_Metal_GetDrawableSize(win, &w, &h);

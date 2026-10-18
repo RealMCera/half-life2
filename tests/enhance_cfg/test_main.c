@@ -1012,6 +1012,16 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_RENDER_SCALE, NULL);
     recomp_env_set(RENV_DISPLAY_ASPECT, "16:9");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
+    CHECK(o->aspect_w == 16 && o->aspect_h == 9);
+    /* the whole value is the ratio: trailing junk is reported, 4:3 used */
+    {
+        const char *out;
+        capture_begin();
+        recomp_env_set(RENV_DISPLAY_ASPECT, "16:9x");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->aspect_w == 0 && o->aspect_h == 0);
+        out = capture_end();
+        CHECK(strstr(out, "display.aspect=16:9x is not a W:H ratio") != NULL);
+    }
 
     /* present.pacing: sleep by default (no file, no variable), spin from
      * the file, env over file, and a bad value reported with the file

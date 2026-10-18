@@ -66,6 +66,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <math.h>
 #include <stddef.h>
 #include "recomp_env.h"
 #include <stdint.h>
@@ -207,7 +208,9 @@ static const char s_msl[] =
     "        float2 uv = i.t0.xy;\n"
     "        if (pc.tex_mode.x == 1u && i.t0.w != 0.0 && i.t0.w != 1.0) uv /= i.t0.w;\n"
     "        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);\n"
-    "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy, bias(pc.tex_bias.x));\n"
+    /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */
+    "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy + float2(pc.tex_scale[0].w, 0.0),"
+    " bias(pc.tex_bias.x));\n"
     "    }\n"
     "    if (nv2a_clip_kills(pc.clip_mode.x, i.t0)) discard_fragment();\n"
     "    if (pc.atest.z != 0u) {\n"
@@ -259,7 +262,9 @@ static NSUInteger    s_vb_size, s_vb_pos, s_ib_size, s_ib_pos;
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
                 s_draws_culled, s_draws_tex, s_tex_uploads, s_tex_rehash,
-                s_tex_changed, s_flushes, s_writebacks, s_cmd_errors;
+                s_tex_changed, s_flushes, s_writebacks, s_cmd_errors,
+                s_draws_stretch,   /* hor+: batches placed off-centre (nv2a_aspect_place) */
+                s_draws_runs;      /* hor+ edges: batches drawn in runs (nv2a_aspect_anchor_tris) */
 
 /* ---- render targets: one per guest surface --------------------------------- */
 
@@ -270,7 +275,9 @@ static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
 #define DT_MAX 4
 typedef struct {
     uint32_t       zeta, w, h;
-    uint32_t       hw, hh;     /* host size: w x h at render.scale */
+    uint32_t       hw, hh;     /* host size: (w + 2 pad) x h at render.scale */
+    uint32_t       pad;        /* hor+ padding, guest pixels a side (nv2a_host_pad) */
+    unsigned       n;          /* the render.scale factor used */
     id<MTLTexture> tex;
     uint64_t       last_use;
     int            fresh;      /* contents undefined: the next pass clears */
@@ -286,7 +293,9 @@ typedef struct {
     uint32_t       offset;     /* color_offset, as the title set it */
     uint32_t       addr;       /* its guest address (nv2a_pb_dma_resolve) */
     uint32_t       w, h;       /* guest size: the cache key, the mapping */
-    uint32_t       hw, hh;     /* host size: the texture (render.scale) */
+    uint32_t       hw, hh;     /* host size: the texture, (w + 2 pad) * n x h * n */
+    uint32_t       pad;        /* hor+ padding, guest pixels a side (nv2a_host_pad) */
+    unsigned       n;          /* the render.scale factor used */
     id<MTLTexture> tex;
     uint64_t       last_use;
     DepthTarget   *dt;         /* the depth buffer its passes attach, or NULL */
@@ -661,7 +670,9 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         [e->tex release];
         memset(e, 0, sizeof *e);
     }
-    nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &e->hw, &e->hh);
+    e->pad = nv2a_host_pad(w, h);
+    e->n = nv2a_host_size(w + 2u * e->pad, h, nv2a_host_render_scale(), METAL_MAX_DIM,
+                          &e->hw, &e->hh);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
                                                             width:e->hw height:e->hh mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
@@ -702,7 +713,7 @@ static id<MTLTexture> rt_texture_new(uint32_t hw, uint32_t hh)
  * surface is 32-bit, as the CPU path draws over whatever memory holds; 0 when
  * it is not (the texture is left as made). */
 static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w,
-                    uint32_t h, uint32_t hw, uint32_t hh)
+                    uint32_t h, uint32_t pad, uint32_t hw, uint32_t hh)
 {
     const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + addr;
 
@@ -713,11 +724,12 @@ static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                  withBytes:src bytesPerRow:pitch];
     } else {
-        /* Scaled: the guest bytes, each pixel an n x n block. */
-        unsigned n = hw / w;
-        uint8_t *up = (uint8_t *)malloc((size_t)hw * hh * 4u);
+        /* Scaled or padded: the guest bytes, each pixel an n x n block,
+         * centred; the hor+ pads start black (calloc). */
+        unsigned n = hw / (w + 2u * pad);
+        uint8_t *up = (uint8_t *)calloc((size_t)hw * hh, 4u);
         if (up) {
-            nv2a_upscale_nearest32(src, pitch, w, h, n, up, hw * 4u);
+            nv2a_upscale_nearest32(src, pitch, w, h, n, up + (size_t)pad * n * 4u, hw * 4u);
             [tex replaceRegion:MTLRegionMake2D(0, 0, hw, hh) mipmapLevel:0
                      withBytes:up bytesPerRow:hw * 4u];
             free(up);
@@ -736,12 +748,13 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
 {
     static int said;
     id<MTLTexture> tex;
-    uint32_t hw, hh;
+    uint32_t hw, hh, pad;
     unsigned n;
     int keep;
 
-    n = nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
-    keep = rt->hw == rt->w * n && rt->hh == rt->h * n;
+    pad = nv2a_host_pad(w, h);
+    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
+    keep = rt->pad == pad && rt->hw == (rt->w + 2u * pad) * n && rt->hh == rt->h * n;
     if (!keep)
         rt_sync(rt, rt->pitch);
     /* An encoder must not outlive its attachment's swap, and the passes
@@ -750,7 +763,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     tex = rt_texture_new(hw, hh);
     if (!tex)
         return 0;
-    if (!rt_seed(tex, rt->addr, rt->pitch, w, h, hw, hh)) {
+    if (!rt_seed(tex, rt->addr, rt->pitch, w, h, pad, hw, hh)) {
         /* A new texture's contents are undefined: a 16-bit surface's margin
          * starts black, as D3D11's does. */
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -783,6 +796,8 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     rt->h = h;
     rt->hw = hw;
     rt->hh = hh;
+    rt->pad = pad;
+    rt->n = n;
     /* The cached depth buffer is the old size; begin_pass would attach it to
      * the larger colour texture. The next depth draw attaches one at the
      * grown size (depth_target), fresh. */
@@ -800,7 +815,8 @@ static RenderTarget *surface(void)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
-    uint32_t hw, hh;
+    uint32_t hw, hh, pad;
+    unsigned n;
     int i;
 
     if (!g->color_offset || !w || !h || w > 4096 || h > 4096)
@@ -885,7 +901,8 @@ static RenderTarget *surface(void)
             rt_free(free_rt);
         }
     }
-    nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
+    pad = nv2a_host_pad(w, h);
+    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
     free_rt->tex = rt_texture_new(hw, hh);
     if (!free_rt->tex)
         return NULL;
@@ -895,10 +912,12 @@ static RenderTarget *surface(void)
     free_rt->h = h;
     free_rt->hw = hw;
     free_rt->hh = hh;
+    free_rt->pad = pad;
+    free_rt->n = n;
     free_rt->pitch = g->pitch;
     free_rt->last_use = s_tick;
     rt_own_reset(free_rt);   /* the bytes the seed reads, or would */
-    rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, hw, hh);
+    rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, pad, hw, hh);
     if (hw != w)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
                 g->color_offset, w, h, hw, hh);
@@ -979,10 +998,13 @@ static void metal_on_clear(uint32_t param)
             float fc[4] = {(float)c[0], (float)c[1], (float)c[2], (float)c[3]};
             MTLViewport vp = {0.0, 0.0, (double)rt->hw, (double)rt->hh, 0.0, 1.0};
             MTLScissorRect sr;
-            sr.x = (NSUInteger)((uint64_t)b[0] * rt->hw / rt->w);
-            sr.y = (NSUInteger)((uint64_t)b[1] * rt->hh / rt->h);
-            sr.width = (NSUInteger)((uint64_t)b[2] * rt->hw / rt->w) - sr.x;
-            sr.height = (NSUInteger)((uint64_t)b[3] * rt->hh / rt->h) - sr.y;
+            uint32_t hb[4];
+            /* As a 3D draw's clip: an edge at 0 or w reaches the pads. */
+            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, NV2A_PLACE_CENTRE, 0, hb);
+            sr.x = hb[0];
+            sr.y = hb[1];
+            sr.width = hb[2] - hb[0];
+            sr.height = hb[3] - hb[1];
             [s_enc setRenderPipelineState:pso];
             if (s_enc_dt)
                 [s_enc setDepthStencilState:depth_state(0, 0)];
@@ -1640,6 +1662,7 @@ typedef struct {
     uint32_t        hash;
     uint16_t        inputs;
     int             used, bad;
+    struct nv2a_aspect_gate hp;   /* hor+: is this program 2D */
     id<MTLFunction> fn;
 } VsEntry;
 static VsEntry s_vs[VS_MAX];
@@ -1675,6 +1698,8 @@ static VsEntry *vs_cache(void)
         e = &s_vs[i];
         e->used = 1;
         e->hash = hash;
+        e->hp.two_d = -1;
+        e->hp.n = 0;
         e->bad = 1;
         d3d8_vsh_parse(&v->prog[v->start][0], NV2A_VSH_SLOTS - (int)v->start, &parsed);
         snprintf(what, sizeof what, "program %08X", hash);
@@ -1748,7 +1773,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     key[34] = v->rc_fcw1;
     key[35] = modes;
     /* render.scale changes at run time: each scale class has its own text */
-    key[36] = nv2a_host_render_scale() > 1;
+    key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u);
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -1757,7 +1782,8 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
-    st.rect_snap = (int)key[36];   /* nv2a_snap_uv; in the hash via st */
+    st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in the hash via st */
+    st.rt_offset = (int)(key[36] >> 1);    /* hor+: tex_scale.w, nv2a_aspect_place */
     for (n = 0; n < 4; n++)
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
     st.bump_on = 1;
@@ -1911,6 +1937,8 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
         [b endEncoding];
     }
     s_self.offset = self->offset;
+    s_self.pad = self->pad;
+    s_self.n = self->n;
     s_self_copies++;
     {
         static int said;
@@ -1923,6 +1951,48 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 
 /* ---- draws ------------------------------------------------------------------- */
 
+/* RECOMP_TRACE=aspect: one line per vertex program (0: pass-through) and
+ * placement the first time a 2D batch of it is placed, with what it
+ * samples: the inventory display.aspect's rules and any per-program
+ * override are judged by. */
+static int aspect_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_ASPECT_TRACE) != NULL;
+    return on;
+}
+
+static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
+                       float hi_x, const RenderTarget *rt, int place, unsigned runs)
+{
+    static const char *const names[] = { "centre", "stretch", "left", "right", "cover" };
+    /* Said once per program, stage-0 texture and placement: the XDK's
+     * fixed function is one program for most of the 2D, so the texture
+     * tells the pieces apart. An open-addressed set; full, it stops. */
+    enum { SET = 4096 };
+    static uint64_t set[SET];
+    static unsigned used;
+    const Stage *t0 = &s_stage[0];
+    RenderTarget *src;
+    uint64_t key = ((uint64_t)hash << 32 | (t0->mode ? t0->offset : 0)) * 0x9E3779B97F4A7C15ull
+                   + (uint64_t)place * 2u + (runs > 1) + 1u;
+    unsigned h = (unsigned)(key >> 52) & (SET - 1u);
+    while (set[h] && set[h] != key)
+        h = (h + 1u) & (SET - 1u);
+    if (set[h] || used >= SET / 2u)
+        return;
+    set[h] = key;
+    used++;
+    src = !t0->mode || t0->mode == 4 ? NULL : rt_texture(t0, (RenderTarget *)rt);
+    fprintf(stderr, "[aspect.program] %08X flip %llu: %u vertices %u tris x %g..%g on %ux%u"
+            " pad %u, stage 0 %s 0x%08X fmt %X %ux%u -> %s%s (%u runs)\n", hash,
+            (unsigned long long)s_presents, count, ntri, lo_x, hi_x, rt->w, rt->h, rt->pad,
+            !t0->mode || t0->mode == 4 ? "none" : src ? "rt" : "tex", t0->offset,
+            t0->color, t0->width, t0->height, names[place],
+            runs > 1 ? " split" : "", runs);
+}
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -1930,6 +2000,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
      * NV_MAX_INDICES. */
     static uint32_t *idx;
     static uint32_t idx_cap;
+    static float (*hxy)[2];        /* hor+: a 2D batch's vertex x, y (edges, full width) */
+    static uint32_t hxy_cap;
+    static uint8_t *tplace;        /* hor+ edges: each triangle's placement */
+    static uint32_t tplace_cap;
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     enum nv2a_topology topo;
@@ -1946,6 +2020,12 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     void *ip;
     int cull = 0, cull_all = 0;
     unsigned bump_src;
+    int full_w = 0, guest_tex = 0, flat_rt = 0, two_d = 0, have_x = 0, tris = 0, edges = 0;
+    int place = NV2A_PLACE_CENTRE;
+    unsigned runs = 1;          /* hor+ edges: draws of one placement each */
+    float lo_x = 0, hi_x = 0;   /* hor+: a 2D batch's x range, surface pixels */
+    const RenderTarget *srcs[4] = { NULL, NULL, NULL, NULL };
+    VsEntry *ve = NULL;
     /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
@@ -1971,6 +2051,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 s_draws_skipped++;
                 return;
             }
+            ve = e;
             vfn = e->fn;
             for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
                 if (e->inputs & (1u << i))
@@ -2070,7 +2151,49 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         memcpy(ip, idx, (size_t)nidx * 4u);
 
-        nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
+        /* Hor+: which batches are 2D, and their x range (nv2a_aspect_place
+         * decides from it). A pass-through batch is 2D, its positions in
+         * surface pixels; a program batch is 2D when its own output is
+         * orthographic (nv2a_aspect_scan). */
+        full_w = 0;
+        tris = rt->pad && topo == NV2A_TOPO_TRIANGLES;
+        if (tris && count > hxy_cap) {
+            float (*grown)[2] = (float (*)[2])realloc(hxy, (size_t)count * sizeof *hxy);
+            if (grown) {
+                hxy = grown;
+                hxy_cap = count;
+            } else {
+                tris = 0;
+            }
+        }
+        edges = tris && nv2a_host_opts()->hud_mode == NV2A_HUD_EDGES;
+        if (rt->pad && !d->program && nf4 > 0 && s_vtx_attr[0] == 0 && count) {
+            lo_x = hi_x = vf[0];
+            for (i = 0; i < count; i++) {
+                float x = vf[(size_t)i * nf4 * 4u];
+                if (x < lo_x) lo_x = x;
+                if (x > hi_x) hi_x = x;
+                if (tris) {
+                    hxy[i][0] = x;
+                    hxy[i][1] = vf[(size_t)i * nf4 * 4u + 1];
+                }
+            }
+            two_d = have_x = 1;
+        } else if (rt->pad && d->program && ve && count) {
+            two_d = have_x = nv2a_aspect_scan(&ve->hp, (const uint32_t (*)[4])v->prog, v->start,
+                                              (float (*)[4])(uintptr_t)v->c, vf, nf4, slot,
+                                              count, edges ? hxy : NULL, &lo_x, &hi_x);
+            /* Full-width bounds: every vertex, for the per-triangle test
+             * (a 2D program is scanned every batch, so the gate passes). */
+            if (have_x && tris && !edges && nv2a_aspect_full_width(lo_x, hi_x, rt->w))
+                nv2a_aspect_scan(&ve->hp, (const uint32_t (*)[4])v->prog, v->start,
+                                 (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, count, hxy,
+                                 &lo_x, &hi_x);
+        }
+        if (have_x)
+            full_w = nv2a_aspect_full_width(lo_x, hi_x, rt->w)
+                     && (!tris || nv2a_aspect_full_tris((const float (*)[2])hxy, idx,
+                                                        nidx / 3u, rt->w));
 
         /* Depth: the zeta surface's buffer, attached to this target's
          * passes from now on (a new pass if the open one lacks it). */
@@ -2095,14 +2218,63 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 if ((src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
                     nv2a_ps_consts_rt(&mpc.b, k, t, src->w, src->h);
+                    srcs[k] = src;
+                    if (!src->pad)
+                        flat_rt = 1;
                     s_rtt_binds++;
                 } else {
                     stex[k] = tex_bind(t);
+                    if (nv2a_aspect_picture(t->width, rt->w))
+                        guest_tex = 1;
                 }
             }
             if (textured)
                 s_draws_tex++;
         }
+        place = rt->pad ? nv2a_aspect_place(two_d, full_w, guest_tex, flat_rt,
+                                            nv2a_host_opts()->movie_mode)
+                        : NV2A_PLACE_CENTRE;
+        /* display.hud=edges: a centred 2D batch's pieces each to their
+         * side; one placement for the whole batch is the common case (a
+         * piece a batch), else the batch is drawn in runs. */
+        if (edges && two_d && full_w && guest_tex)
+            nv2a_aspect_layout_note(s_presents);
+        if (place == NV2A_PLACE_CENTRE && two_d && edges && !full_w) {
+            uint32_t ntri = nidx / 3u;
+            if (ntri > tplace_cap) {
+                uint8_t *grown = (uint8_t *)realloc(tplace, ntri);
+                if (grown) {
+                    tplace = grown;
+                    tplace_cap = ntri;
+                }
+            }
+            if (ntri <= tplace_cap) {
+                runs = nv2a_aspect_anchor_tris((const float (*)[2])hxy, idx, ntri, rt->w,
+                                               rt->h, s_presents, tplace);
+                place = tplace[0];
+                if (runs > 1)
+                    s_draws_runs++;
+            }
+        }
+        if (place != NV2A_PLACE_CENTRE)
+            s_draws_stretch++;
+        if (two_d && rt->pad && aspect_trace())
+            aspect_log(ve ? ve->hash : 0, count, nidx / 3u, lo_x, hi_x, rt, place, runs);
+        /* A batch sampling a padded target the stock way reads it whole,
+         * pads and all, which is what a stretched pass wants. Any other
+         * reads its guest columns, pad*n in from the left: scale x by
+         * w/(w+2pad) and add pad/(w+2pad) (tex_scale.w, rt_offset). */
+        if (place != NV2A_PLACE_STRETCH && place != NV2A_PLACE_COVER)
+            for (k = 0; k < 4; k++) {
+                const RenderTarget *src = srcs[k];
+                if (src && src->pad) {
+                    float pw = (float)(src->w + 2u * src->pad);
+                    mpc.b.tex_scale[k][0] *= (float)src->w / pw;
+                    mpc.b.tex_scale[k][3] = (float)src->pad / pw;
+                }
+            }
+        nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
+        nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
 
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
@@ -2130,7 +2302,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 s_draws_skipped++;
                 return;
             }
-            nv2a_host_box(b, rt->w, rt->h, rt->hw, rt->hh, hb);
+            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, place, two_d, hb);
             sr.x = hb[0];
             sr.y = hb[1];
             sr.width = hb[2] - hb[0];
@@ -2161,8 +2333,34 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setFragmentSamplerState:sampler(&s_stage[k], bump_src >> k & 1)
                                      atIndex:k];
         }
-        [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
-                         indexBuffer:s_ib indexBufferOffset:ib_off];
+        if (runs <= 1) {
+            [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
+                             indexBuffer:s_ib indexBufferOffset:ib_off];
+        } else {
+            /* hor+ edges: each run of triangles with one placement, in
+             * order, with its own mapping and scissor. */
+            uint32_t t0 = 0, t1, ntri = nidx / 3u, b[4], hb[4];
+            int have_box = nv2a_draw_box(g, rt->w, rt->h, b);
+            while (have_box && t0 < ntri) {
+                struct nv2a_vp_consts rc;
+                MTLScissorRect sr;
+                for (t1 = t0 + 1; t1 < ntri && tplace[t1] == tplace[t0]; t1++)
+                    ;
+                nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &rc);
+                nv2a_aspect_map(&rc, rt->w, rt->h, rt->pad, tplace[t0]);
+                [s_enc setVertexBytes:&rc length:sizeof rc atIndex:d->program ? 2 : 1];
+                nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, tplace[t0], 1, hb);
+                sr.x = hb[0];
+                sr.y = hb[1];
+                sr.width = hb[2] - hb[0];
+                sr.height = hb[3] - hb[1];
+                [s_enc setScissorRect:sr];
+                [s_enc drawIndexedPrimitives:ptype indexCount:(t1 - t0) * 3u
+                                   indexType:MTLIndexTypeUInt32 indexBuffer:s_ib
+                           indexBufferOffset:ib_off + (NSUInteger)t0 * 12u];
+                t0 = t1;
+            }
+        }
         s_draws++;
     }
 }
@@ -2281,8 +2479,9 @@ static void write_back_scaled(RenderTarget *rt, const uint8_t *px, uint32_t addr
                               uint32_t pitch)
 {
     uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + addr;
-    uint32_t bpp = pitch / rt->w, w = rt->w, n = rt->hw / rt->w, y, x;
+    uint32_t bpp = pitch / rt->w, w = rt->w, n = rt->n, y, x;
 
+    px += (size_t)rt->pad * n * 4u;   /* hor+: the guest columns, centred */
     if (bpp >= 4) {
         nv2a_downscale_box32(px, rt->hw * 4u, w, rt->h, n, dst, pitch);
     } else if (bpp == 2) {
@@ -2932,6 +3131,16 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     p_cull = s_draws_culled; p_clears = s_clears; p_tex = s_draws_tex;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
     p_fl = s_flushes;
+    if (rt && rt->pad && aspect_trace()) {
+        static uint64_t p_stretch, p_runs;
+        fprintf(stderr, LOGP "flip %llu hor+: target %ux%u pad %u (%ux%u host),"
+                " %llu batches off-centre, %llu split\n", (unsigned long long)s_presents,
+                rt->w, rt->h, rt->pad, rt->hw, rt->hh,
+                (unsigned long long)(s_draws_stretch - p_stretch),
+                (unsigned long long)(s_draws_runs - p_runs));
+        p_stretch = s_draws_stretch;
+        p_runs = s_draws_runs;
+    }
 }
 
 static void prof_flip_end(uint64_t t_flip0)
@@ -2970,13 +3179,64 @@ static void prof_flip_end(uint64_t t_flip0)
     }
 }
 
+/* RECOMP_DEBUG=metal_host_dump=<prefix>: the frame as drawn, host size,
+ * every fb_dump_flips flip (20), <prefix>host_NNNNN.bmp by present count. A
+ * guest-size dump (fb_dump) shows only the centre of a padded target. */
+static int host_dump_due(void)
+{
+    static const char *prefix;
+    static int every = -1;
+    if (every < 0) {
+        const char *e = recomp_env(RENV_FB_DUMP_FLIPS);
+        prefix = recomp_env(RENV_METAL_HOST_DUMP);
+        every = e ? atoi(e) : 0;
+        if (every <= 0)
+            every = 20;
+    }
+    return prefix && ((s_presents + 1) % (uint64_t)every) == 0;
+}
+
+static void host_dump(RenderTarget *rt, uint32_t hcw, uint32_t hch)
+{
+    const uint8_t *px = host_readback(rt);
+    char path[1024];
+    uint8_t hdr[54];
+    uint32_t row = hcw * 3u, padb = (4u - (row & 3u)) & 3u, size, y, x;
+    FILE *f;
+
+    if (!px || !hcw || !hch)
+        return;
+    snprintf(path, sizeof path, "%shost_%05llu.bmp", recomp_env(RENV_METAL_HOST_DUMP),
+             (unsigned long long)(s_presents + 1));
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    size = 54u + (row + padb) * hch;
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &size, 4);
+    hdr[10] = 54; hdr[14] = 40;
+    memcpy(hdr + 18, &hcw, 4);
+    memcpy(hdr + 22, &hch, 4);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, sizeof hdr, f);
+    for (y = hch; y-- > 0; ) {
+        const uint8_t *s = px + (size_t)y * rt->hw * 4u;
+        for (x = 0; x < hcw; x++)
+            fwrite(s + (size_t)x * 4u, 1, 3, f);
+        if (padb)
+            fwrite(hdr + 1, 1, padb, f);   /* zero bytes of the header */
+    }
+    fclose(f);
+}
+
 static void metal_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
     uint32_t addr = surface_offset ? nv2a_pb_dma_resolve(surface_offset) : 0;
     const uint8_t *hpx = NULL;   /* a scaled rt's host pixels (host_readback) */
     uint64_t t_flip0 = prof_on() ? prof_now() : 0, t;
-    int always = wb_always(), win = 0, layer = 0;
+    int always = wb_always(), win = 0, layer = 0, hdump = 0;
     uint32_t cw = 0, ch = 0, hcw = 0, hch = 0;   /* the frame, guest and host */
 
     guard_open();
@@ -2987,8 +3247,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             rt = present_target(surface_offset);
             if (rt) {
                 present_extent(rt, &cw, &ch);
-                hcw = (uint32_t)((uint64_t)cw * rt->hw / rt->w);
-                hch = (uint32_t)((uint64_t)ch * rt->hh / rt->h);
+                hcw = (cw + 2u * rt->pad) * rt->n;
+                hch = ch * rt->n;
                 s_shown_w = cw;
                 s_shown_h = ch;
             }
@@ -2997,12 +3257,15 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
              * presenter's back slot (fb_present_metal.m), below. */
             layer = win && s_layer;
             wb = rt && addr && pitch && pitch >= rt->w * 2u && always;
-            if (rt && (wb || (win && !layer)))
+            hdump = rt && host_dump_due();
+            if (rt && (wb || hdump || (win && !layer)))
                 rt_managed_sync(rt);
             t = prof_t();
             flush(1);
             occ_settle(1);
             prof_add(&s_pa.wait, t);
+            if (hdump)
+                host_dump(rt, hcw, hch);
             if (layer) {
                 /* After the wait, in a command buffer of its own that nobody
                  * waits for: the flip's wait never includes the copy, nor a

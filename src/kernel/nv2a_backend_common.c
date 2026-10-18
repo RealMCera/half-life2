@@ -400,15 +400,17 @@ void nv2a_ps_consts_rt(struct nv2a_ps_consts *pc, int n,
 }
 
 void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
-                         uint32_t w, uint32_t h, struct nv2a_vp_consts *o)
+                         uint32_t w, uint32_t h, uint32_t pad,
+                         struct nv2a_vp_consts *o)
 {
     uint32_t func, abs_, edge_one;
+    float pw = (float)(w + 2u * pad);
 
-    o->c[0] = 2.0f / (float)w;
+    o->c[0] = 2.0f / pw;
     o->c[1] = -2.0f / (float)h;
     o->c[2] = 1.0f / nv2a_zmax(surface_format);
     o->c[3] = 0.0f;
-    o->c[4] = -1.0f;
+    o->c[4] = -(float)w / pw;
     o->c[5] = 1.0f;
     o->c[6] = 0.0f;
     o->c[7] = 0.0f;
@@ -936,6 +938,97 @@ unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
     if (!mip || !min_linear || t->cube || bump_source)
         return 0;
     return s_host_opts.aniso;
+}
+
+uint32_t nv2a_host_pad(uint32_t w, uint32_t h)
+{
+    unsigned aw = s_host_opts.aspect_w, ah = s_host_opts.aspect_h;
+    double wide;
+
+    if (!aw || !ah || !w || !h)
+        return 0;
+    /* 4:3 within 1%: 3w is 4h give or take 1% of 4h. */
+    if (3.0 * w < 4.0 * h * 0.99 || 3.0 * w > 4.0 * h * 1.01)
+        return 0;
+    wide = (double)h * aw / ah;
+    if (wide <= (double)w)
+        return 0;
+    return (uint32_t)((wide - (double)w) / 2.0 + 0.5);
+}
+
+uint32_t nv2a_host_window_w(uint32_t w, uint32_t h, unsigned scale)
+{
+    return (w + 2u * nv2a_host_pad(w, h)) * scale;
+}
+
+void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t pad,
+                     int place)
+{
+    float pw = (float)(w + 2u * pad), k;
+
+    (void)h;
+    if (!pad)
+        return;
+    switch (place) {
+    case NV2A_PLACE_STRETCH:
+        o->c[0] = 2.0f / (float)w;
+        o->c[4] = -1.0f;
+        break;
+    case NV2A_PLACE_LEFT:
+    case NV2A_PLACE_RIGHT:
+        /* x + pad + s over a pw-wide target is (2 s - w) / pw at x 0, s =
+         * -pad (exactly -1) or +pad. */
+        o->c[4] = place == NV2A_PLACE_LEFT ? -1.0f : ((float)(2u * pad) - (float)w) / pw;
+        break;
+    case NV2A_PLACE_COVER:
+        k = pw / (float)w;
+        o->c[0] = 2.0f / (float)w;
+        o->c[4] = -1.0f;
+        o->c[1] *= k;
+        o->c[5] *= k;
+        break;
+    default:
+        break;
+    }
+}
+
+void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad,
+                     unsigned n, int place, int two_d, uint32_t out[4])
+{
+    uint32_t pw = w + 2u * pad;
+
+    if (n < 1)
+        n = 1;
+    out[1] = box[1] * n;
+    out[3] = box[3] * n;
+    switch (pad ? place : NV2A_PLACE_STRETCH) {
+    case NV2A_PLACE_STRETCH:
+    case NV2A_PLACE_COVER:
+        /* Scaled by pw / w with the mapping; COVER's y overflow is clipped by
+         * the viewport, so its box is the stretched one. */
+        out[0] = (uint32_t)((uint64_t)box[0] * pw * n / w);
+        out[2] = (uint32_t)((uint64_t)box[2] * pw * n / w);
+        break;
+    case NV2A_PLACE_LEFT:
+        out[0] = box[0] * n;
+        out[2] = box[2] * n;
+        break;
+    case NV2A_PLACE_RIGHT:
+        out[0] = (box[0] + 2u * pad) * n;
+        out[2] = (box[2] + 2u * pad) * n;
+        break;
+    default:
+        out[0] = (box[0] + pad) * n;
+        out[2] = (box[2] + pad) * n;
+        if (!two_d) {
+            if (box[0] == 0)
+                out[0] = 0;
+            if (box[2] >= w)
+                out[2] = pw * n;
+        }
+        break;
+    }
+    (void)h;
 }
 
 unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,

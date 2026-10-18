@@ -49,6 +49,8 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("render.scale", RENV_RENDER_SCALE);
     enhance_cfg_bind_env("render.aniso", RENV_RENDER_ANISO);
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
+    enhance_cfg_bind_env("display.hud", RENV_DISPLAY_HUD);
+    enhance_cfg_bind_env("display.movie", RENV_DISPLAY_MOVIE);
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
     enhance_cfg_bind_env("present.pacing", RENV_PRESENT_PACING);

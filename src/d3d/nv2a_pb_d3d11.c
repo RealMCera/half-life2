@@ -197,6 +197,8 @@ static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
  * mode); counted apart from s_draws_skipped, which means "could not draw". */
 static uint64_t s_draws_culled;
 static uint64_t s_draws_bconst;   /* drawn with a CONSTANT_* blend factor */
+static uint64_t s_draws_stretch;  /* hor+: batches placed off-centre (nv2a_aspect_place) */
+static uint64_t s_draws_runs;     /* hor+ edges: batches drawn in runs (nv2a_aspect_anchor_tris) */
 static uint64_t s_tex_uploads, s_tex_rehash, s_tex_changed;
 static uint64_t s_tex_mip_uploads;   /* uploads with more than one level */
 static uint64_t s_vb_native, s_vb_expanded;  /* vertex bytes copied / made */
@@ -216,7 +218,9 @@ typedef struct {
     uint32_t                offset;     /* color_offset, as the title set it */
     uint32_t                addr;       /* ... resolved to a guest address */
     UINT                    w, h;       /* guest size: the key, the mapping */
-    UINT                    hw, hh;     /* host size: the texture (render.scale) */
+    UINT                    hw, hh;     /* host size: the texture, (w + 2 pad) * n x h * n */
+    UINT                    pad;        /* hor+ padding, guest pixels a side (nv2a_host_pad) */
+    unsigned                n;          /* the render.scale factor used */
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;      /* for render-to-texture, made lazily */
@@ -243,6 +247,7 @@ typedef struct {
     int                 used;
     int                 bad;      /* failed to compile: skip its batches */
     uint16_t            inputs;   /* ATTR slots the shader reads */
+    struct nv2a_aspect_gate hp;   /* hor+: is this program 2D */
     ID3D11VertexShader *vs;
     ID3DBlob           *code;     /* for input layouts made later */
     struct {
@@ -403,7 +408,8 @@ static const char s_ps_src[] =
     "        float2 uv = i.oT0.xy;\n"
     "        if (tex_mode.x == 1u && i.oT0.w != 0.0 && i.oT0.w != 1.0) uv /= i.oT0.w;\n"
     "        uv = nv2a_snap_uv(uv, i.oPos.xy, tex_scale[0]);\n"
-    "        float4 t = tex0.Sample(samp0, uv * tex_scale[0].xy);\n"
+    /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */
+    "        float4 t = tex0.Sample(samp0, uv * tex_scale[0].xy + float2(tex_scale[0].w, 0.0));\n"
     "        if (alpha_only.x == 2u) t.a = 1.0;\n"
     "        c *= t;\n"
     "    }\n"
@@ -453,10 +459,12 @@ static int init(void)
     HRESULT hr;
     WNDCLASSA wc;
     wchar_t title[192];
-    RECT r = {0, 0, 640, 480};
+    /* display.aspect: a window of the padded frame's shape (854x480 at
+     * 16:9), so the pads are on screen at 1:1. */
+    RECT r = {0, 0, (LONG)nv2a_host_window_w(640, 480, 1), 480};
     int full = nv2a_host_opts()->fullscreen;
     int internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
-    UINT bw = 640, bh = 480;
+    UINT bw = (UINT)r.right, bh = 480;
 
     if (tried)
         return !s_failed;
@@ -484,7 +492,7 @@ static int init(void)
          * compositor (gamescope) fits it to its output with its own filter.
          * The screen size is not asked: under gamescope it is the output,
          * and a surface that large leaves FSR nothing to upscale. */
-        bw = 640u * nv2a_host_render_scale();
+        bw = nv2a_host_window_w(640, 480, nv2a_host_render_scale());
         bh = 480u * nv2a_host_render_scale();
         r.right = (LONG)bw;
         r.bottom = (LONG)bh;
@@ -494,7 +502,7 @@ static int init(void)
         bw = (UINT)GetSystemMetrics(SM_CXSCREEN);
         bh = (UINT)GetSystemMetrics(SM_CYSCREEN);
         if (!bw || !bh) {
-            bw = 640;
+            bw = nv2a_host_window_w(640, 480, 1);
             bh = 480;
             full = 0;
         }
@@ -686,9 +694,11 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
     ID3D11Texture2D *tex = NULL;
     ID3D11RenderTargetView *rtv = NULL;
     D3D11_BOX b;
-    UINT hw, hh;
+    UINT hw, hh, pad, dx = 0;
+    unsigned n;
 
-    nv2a_host_size(w, h, nv2a_host_render_scale(), D3D11_MAX_DIM, &hw, &hh);
+    pad = nv2a_host_pad(w, h);
+    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_render_scale(), D3D11_MAX_DIM, &hw, &hh);
     memset(&td, 0, sizeof td);
     td.Width = hw;
     td.Height = hh;
@@ -706,14 +716,19 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
         return 0;
     }
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rtv, black);
-    b.left = 0;
+    /* The guest columns move with a change of hor+ padding (a 640x464
+     * clip growing to 4:3 gains pads): column 0 stays column 0. */
+    b.left = rt->pad > pad ? (rt->pad - pad) * n : 0;
+    if (pad > rt->pad)
+        dx = (pad - rt->pad) * n;
     b.top = 0;
     b.front = 0;
-    b.right = rt->hw < hw ? rt->hw : hw;
+    b.right = rt->hw < hw - dx ? rt->hw : hw - dx;
     b.bottom = rt->hh < hh ? rt->hh : hh;
     b.back = 1;
-    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)tex, 0, 0, 0, 0,
-                                              (ID3D11Resource *)rt->tex, 0, &b);
+    if (b.right > b.left)
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)tex, 0, dx, 0, 0,
+                                                  (ID3D11Resource *)rt->tex, 0, &b);
     s_grows++;
     if (said++ < 20)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target grown to %ux%u\n",
@@ -730,6 +745,8 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
     rt->h = h;
     rt->hw = hw;
     rt->hh = hh;
+    rt->pad = pad;
+    rt->n = n;
     if (alias_check_on() && rt->pitch)
         nv2a_rt_own_reset(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
                           rt->addr, rt->pitch, h, (uint32_t)s_presents);
@@ -833,8 +850,9 @@ static RenderTarget *surface(void)
                     free_rt->w, free_rt->h, g->color_offset, RT_MAX);
         rt_release(free_rt);
     }
-    nv2a_host_size(w, h, nv2a_host_render_scale(), D3D11_MAX_DIM,
-                   &free_rt->hw, &free_rt->hh);
+    free_rt->pad = nv2a_host_pad(w, h);
+    free_rt->n = nv2a_host_size(w + 2u * free_rt->pad, h, nv2a_host_render_scale(),
+                                D3D11_MAX_DIM, &free_rt->hw, &free_rt->hh);
     {
         D3D11_TEXTURE2D_DESC td;
         memset(&td, 0, sizeof td);
@@ -885,7 +903,7 @@ static RenderTarget *surface(void)
 typedef struct {
     uint32_t                zeta;
     UINT                    w, h;       /* guest size, as its colour target's */
-    UINT                    hw, hh;     /* host size (render.scale) */
+    UINT                    hw, hh;     /* host size (render.scale, hor+ pads) */
     ID3D11Texture2D        *tex;
     ID3D11DepthStencilView *dsv;
     uint64_t                last_use;
@@ -921,7 +939,8 @@ static DepthTarget *depth_target(UINT w, UINT h)
         ID3D11Texture2D_Release(e->tex);
         memset(e, 0, sizeof *e);
     }
-    nv2a_host_size(w, h, nv2a_host_render_scale(), D3D11_MAX_DIM, &e->hw, &e->hh);
+    nv2a_host_size(w + 2u * nv2a_host_pad(w, h), h, nv2a_host_render_scale(), D3D11_MAX_DIM,
+                   &e->hw, &e->hh);
     memset(&td, 0, sizeof td);
     td.Width = e->hw;
     td.Height = e->hh;
@@ -1051,11 +1070,16 @@ static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const fl
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
         return;
     }
-    /* Host pixels: the target is rt->hw x rt->hh for rt->w x rt->h. */
-    r.left = (LONG)((uint64_t)x0 * rt->hw / rt->w);
-    r.top = (LONG)((uint64_t)y0 * rt->hh / rt->h);
-    r.right = (LONG)((uint64_t)x1 * rt->hw / rt->w);
-    r.bottom = (LONG)((uint64_t)y1 * rt->hh / rt->h);
+    /* Host pixels, as a 3D draw's clip: the guest columns pad*n in, an
+     * edge at 0 or w reaching the hor+ pads (nv2a_aspect_box). */
+    {
+        uint32_t hb[4];
+        nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, NV2A_PLACE_CENTRE, 0, hb);
+        r.left = (LONG)hb[0];
+        r.top = (LONG)hb[1];
+        r.right = (LONG)hb[2];
+        r.bottom = (LONG)hb[3];
+    }
     ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)rt->rtv, c, &r, 1);
     s_partial_clears++;
 }
@@ -1103,6 +1127,19 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
           + (size_t)index * a->stride;
     }
     return nv2a_vtx_decode(a->type, a->size, p, out);
+}
+
+/* Input i of one vertex as the shader sees it: the stream's element, its
+ * one element at stride 0, or the SET_VERTEX_DATA value when it has none
+ * (the stream upload in d3d11_on_draw, for nv2a_aspect_scan). */
+static void vtx_input(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
+                      unsigned i, uint32_t index, float out[4])
+{
+    const VertexAttr *a = &d->attr[i];
+
+    if (a->size && a->stride ? fetch(d, a, index, out) : a->size && fetch(d, a, 0, out))
+        return;
+    memcpy(out, v->inl[i], 16);
 }
 
 /* The DXGI format a stream can be read in as it is, so its bytes are copied
@@ -1261,6 +1298,8 @@ static VsEntry *vertex_shader(int program)
     e->used = 1;
     e->hash = hash;
     e->bad = 1;
+    e->hp.two_d = -1;
+    e->hp.n = 0;
 
     if (program) {
         d3d8_vsh_parse(&v->prog[v->start][0],
@@ -2113,6 +2152,7 @@ static RenderTarget *rt_self_copy(RenderTarget *rt)
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_self.tex,
                                      (ID3D11Resource *)rt->tex);
     s_self.offset = rt->offset;
+    s_self.pad = rt->pad;   /* the copy has the frame's pads (Metal's s_self too) */
     s_self.addr = rt->addr;
     s_self.last_draw = rt->last_draw;
     s_self.last_clear = rt->last_clear;
@@ -2247,7 +2287,17 @@ static ID3D11PixelShader *debug_ps(void)
 static PsConsts s_cb_ps_shadow;
 static int      s_cb_ps_ok;
 
-static ID3D11PixelShader *setup_pixel(void)
+/* Hor+ (display.aspect): a batch's placement needs to know whether a stage
+ * samples a guest texture, which only the stage binding below finds out;
+ * d3d11_on_draw fills two_d and full_w, setup_pixel the placement (as
+ * Metal's metal_on_draw does in one place). */
+struct aspect_batch {
+    int two_d, full_w;
+    int place;          /* nv2a_aspect_place, before HUD anchoring */
+    int guest_tex;      /* a stage samples a guest picture (nv2a_aspect_picture) */
+};
+
+static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     ID3D11ShaderResourceView *srv[4];
@@ -2293,6 +2343,33 @@ static ID3D11PixelShader *setup_pixel(void)
             srv[n] = s_black_srv;
         }
         smp[n] = sampler(t, bump_src >> n & 1);
+    }
+    hp->place = NV2A_PLACE_CENTRE;
+    if (s_cur && s_cur->pad) {
+        int guest_tex = 0, flat_rt = 0;
+        for (n = 0; n < 4; n++) {
+            if (s_stage[n].mode && s_stage[n].mode != 4 && !s_stage_rt[n]
+                && nv2a_aspect_picture(s_stage[n].width, s_cur->w))
+                guest_tex = 1;
+            if (s_stage_rt[n] && !s_stage_rt[n]->pad)
+                flat_rt = 1;
+        }
+        hp->guest_tex = guest_tex;
+        hp->place = nv2a_aspect_place(hp->two_d, hp->full_w, guest_tex, flat_rt,
+                                      nv2a_host_opts()->movie_mode);
+        /* A batch sampling a padded target the stock way reads it whole,
+         * pads and all, which is what a stretched pass wants. Any other
+         * reads its guest columns, pad*n in from the left: scale x by
+         * w/(w+2pad) and add pad/(w+2pad) (tex_scale.w, rt_offset). */
+        if (hp->place != NV2A_PLACE_STRETCH && hp->place != NV2A_PLACE_COVER)
+            for (n = 0; n < 4; n++) {
+                const RenderTarget *src = s_stage_rt[n];
+                if (src && src->pad) {
+                    float pw = (float)(src->w + 2u * src->pad);
+                    pc.tex_scale[n][0] *= (float)src->w / pw;
+                    pc.tex_scale[n][3] = (float)src->pad / pw;
+                }
+            }
     }
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */
@@ -2350,7 +2427,7 @@ static ID3D11PixelShader *setup_pixel(void)
         key[34] = v->rc_fcw1;
         key[35] = modes;
         /* render.scale changes at run time: each scale class has its own text */
-        key[36] = nv2a_host_render_scale() > 1;
+        key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u);
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -2358,7 +2435,8 @@ static ID3D11PixelShader *setup_pixel(void)
                                      v->rc_aocw, v->rc_ctl, v->rc_fcw0,
                                      v->rc_fcw1, modes, &st);
             st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
-            st.rect_snap = (int)key[36];   /* nv2a_snap_uv; in rc_hash via st */
+            st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in rc_hash via st */
+            st.rt_offset = (int)(key[36] >> 1);    /* hor+: tex_scale.w, nv2a_aspect_place */
             for (n = 0; n < 4; n++)
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
             st.bump_on = 1;
@@ -2443,7 +2521,7 @@ static uint32_t read_pixel(RenderTarget *rt, int x, int y)
         return 0xDEADBEEFu;
     /* Guest coordinates; a scaled target holds the pixel's first sample at
      * N times them. */
-    return read_tex_pixel(rt->tex, (UINT)x * (rt->hw / rt->w), (UINT)y * (rt->hh / rt->h));
+    return read_tex_pixel(rt->tex, ((UINT)x + rt->pad) * rt->n, (UINT)y * rt->n);
 }
 
 /* The first three vertices of the bound batch through the VS, read back by
@@ -2764,7 +2842,8 @@ static ID3D11PixelShader *px_shader(int pass)
         "float2 uvof(float4 t, uint n, float2 pos) {\n"
         "    float2 uv = t.xy;\n"
         "    if (tex_mode[n] == 1u && t.w != 0.0 && t.w != 1.0) uv /= t.w;\n"
-        "    return nv2a_snap_uv(uv, pos, tex_scale[n]) * tex_scale[n].xy;\n"
+        "    return nv2a_snap_uv(uv, pos, tex_scale[n]) * tex_scale[n].xy\n"
+    "         + float2(tex_scale[n].w, 0.0);\n"
         "}\n"
         "PO main(VS_OUT i) {\n"
         "    PO o;\n"
@@ -2872,8 +2951,8 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
             if (s_px_x[n] < 0 || s_px_y[n] < 0
                     || (UINT)s_px_x[n] >= rt->w || (UINT)s_px_y[n] >= rt->h)
                 continue;
-            b.left = (UINT)s_px_x[n] * (rt->hw / rt->w); b.right = b.left + 1;
-            b.top = (UINT)s_px_y[n] * (rt->hh / rt->h); b.bottom = b.top + 1;
+            b.left = ((UINT)s_px_x[n] + rt->pad) * rt->n; b.right = b.left + 1;
+            b.top = (UINT)s_px_y[n] * rt->n; b.bottom = b.top + 1;
             b.front = 0; b.back = 1;
             for (k = 0; k < 8; k++)
                 ID3D11DeviceContext_CopySubresourceRegion(
@@ -2930,14 +3009,97 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
     }
 }
 
+static int aspect_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_ASPECT_TRACE) != NULL;
+    return on;
+}
+
+/* RECOMP_ASPECT_TRACE: each 2D batch's placement, once per program,
+ * stage-0 texture and placement (Metal's aspect_log, same line). */
+static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
+                       float hi_x, const RenderTarget *rt, int place, unsigned runs)
+{
+    static const char *const names[] = { "centre", "stretch", "left", "right", "cover" };
+    enum { SET = 4096 };
+    static uint64_t set[SET];
+    static unsigned used;
+    const Stage *t0 = &s_stage[0];
+    uint64_t key = ((uint64_t)hash << 32 | (t0->mode ? t0->offset : 0)) * 0x9E3779B97F4A7C15ull
+                   + (uint64_t)place * 2u + (runs > 1) + 1u;
+    unsigned h = (unsigned)(key >> 52) & (SET - 1u);
+    while (set[h] && set[h] != key)
+        h = (h + 1u) & (SET - 1u);
+    if (set[h] || used >= SET / 2u)
+        return;
+    set[h] = key;
+    used++;
+    fprintf(stderr, "[aspect.program] %08X flip %llu: %u vertices %u tris x %g..%g on %ux%u"
+            " pad %u, stage 0 %s 0x%08X fmt %X %ux%u -> %s%s (%u runs)\n", hash,
+            (unsigned long long)s_presents, count, ntri, lo_x, hi_x, rt->w, rt->h, rt->pad,
+            !t0->mode || t0->mode == 4 ? "none" : s_stage_rt[0] ? "rt" : "tex", t0->offset,
+            t0->color, t0->width, t0->height, names[place],
+            runs > 1 ? " split" : "", runs);
+}
+
+/* The pixels->NDC mapping at b2 and the scissor for one placement
+ * (nv2a_aspect_map, nv2a_aspect_box; with pad 0 both are stock). cb is
+ * the surface clip (nv2a_draw_box). */
+static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
+                   const RenderTarget *rt, int place, int two_d, const uint32_t cb[4])
+{
+    static uint8_t vp_shadow[80];
+    static int vp_ok;
+    D3D11_MAPPED_SUBRESOURCE m;
+    struct nv2a_vp_consts vc;
+    D3D11_RECT sr;
+    uint32_t hb[4];
+    uint8_t vp[80];
+
+    nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
+    nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
+    memcpy(vp, vc.c, sizeof vc.c);
+    memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
+    if (memo_on() && vp_ok && !memcmp(vp_shadow, vp, sizeof vp)) {
+        /* unchanged */
+    } else if (SUCCEEDED(ID3D11DeviceContext_Map(
+            s_ctx, (ID3D11Resource *)s_cb_vp, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, vp, sizeof vp);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_vp, 0);
+        memcpy(vp_shadow, vp, sizeof vp);
+        vp_ok = 1;
+    }
+    nv2a_aspect_box(cb, rt->w, rt->h, rt->pad, rt->n, place, two_d, hb);
+    sr.left = (LONG)hb[0];
+    sr.top = (LONG)hb[1];
+    sr.right = (LONG)hb[2];
+    sr.bottom = (LONG)hb[3];
+    if (!sc_on() || memcmp(&s_sc.sr, &sr, sizeof sr)) {
+        ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sr);
+        s_sc.sr = sr;
+    }
+}
+
 static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 {
     /* As Metal's: at most three list entries per index, grown to the
      * largest batch so far rather than sized to NV_MAX_INDICES. */
     static uint32_t *idx;
     static uint32_t idx_cap;
+    static float (*hxy)[2];        /* hor+: a 2D batch's vertex x, y (edges, full width) */
+    static uint32_t hxy_cap;
+    static float *hvf;             /* hor+: a program batch's inputs, for the scan */
+    static size_t hvf_cap;
+    static uint8_t *tplace;        /* hor+ edges: each triangle's placement */
+    static uint32_t tplace_cap;
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    struct aspect_batch hp = {0, 0, NV2A_PLACE_CENTRE, 0};
+    int have_x = 0, tris = 0, edges = 0;
+    unsigned runs = 1;             /* hor+ edges: draws of one placement each */
+    float lo_x = 0, hi_x = 0;      /* hor+: a 2D batch's x range, surface pixels */
     D3D11_PRIMITIVE_TOPOLOGY topo;
     ID3D11Buffer *vbs[NV2A_VS_MAX_INPUTS];
     UINT strides[NV2A_VS_MAX_INPUTS], offs[NV2A_VS_MAX_INPUTS];
@@ -3088,17 +3250,77 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     memcpy(p, idx, nidx * 4u);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ib, 0);
 
-    /* Constants: the program's c[192] at b1 and the pixels->NDC mapping. */
+    /* Hor+: which batches are 2D, and their x range (nv2a_aspect_place
+     * decides from it), as metal_on_draw does. A pass-through batch is 2D,
+     * its positions in surface pixels; a program batch is 2D when its own
+     * output is orthographic (nv2a_aspect_scan). Its inputs are gathered
+     * as float4 only when the gate is due to run it. */
+    tris = rt->pad && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    if (tris && count > hxy_cap) {
+        float (*grown)[2] = (float (*)[2])realloc(hxy, (size_t)count * sizeof *hxy);
+        if (grown) {
+            hxy = grown;
+            hxy_cap = count;
+        } else {
+            tris = 0;
+        }
+    }
+    edges = tris && nv2a_host_opts()->hud_mode == NV2A_HUD_EDGES;
+    if (rt->pad && !d->program && (vs->inputs & 1u)) {
+        for (k = 0; k < count; k++) {
+            float o[4];
+            vtx_input(d, v, 0, lo + k, o);
+            if (!k || o[0] < lo_x) lo_x = o[0];
+            if (!k || o[0] > hi_x) hi_x = o[0];
+            if (tris) {
+                hxy[k][0] = o[0];
+                hxy[k][1] = o[1];
+            }
+        }
+        hp.two_d = have_x = 1;
+    } else if (rt->pad && d->program && nv2a_aspect_due(&vs->hp)) {
+        int slot[NV2A_VS_MAX_INPUTS];
+        unsigned nf4 = 0;
+        for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+            if (vs->inputs & (1u << i))
+                slot[nf4++] = (int)i;
+        if ((size_t)count * nf4 * 4u > hvf_cap) {
+            float *grown = (float *)realloc(hvf, (size_t)count * nf4 * 16u);
+            if (grown) {
+                hvf = grown;
+                hvf_cap = (size_t)count * nf4 * 4u;
+            }
+        }
+        if ((size_t)count * nf4 * 4u <= hvf_cap) {
+            for (k = 0; k < count; k++)
+                for (i = 0; i < nf4; i++)
+                    vtx_input(d, v, (unsigned)slot[i], lo + k, hvf + ((size_t)k * nf4 + i) * 4u);
+            hp.two_d = have_x = nv2a_aspect_scan(&vs->hp, (const uint32_t (*)[4])v->prog,
+                                                 v->start, (float (*)[4])(uintptr_t)v->c,
+                                                 hvf, nf4, slot, count, edges ? hxy : NULL,
+                                                 &lo_x, &hi_x);
+            /* Full-width bounds: every vertex, for the per-triangle test
+             * (a 2D program is scanned every batch, so the gate passes). */
+            if (have_x && tris && !edges && nv2a_aspect_full_width(lo_x, hi_x, rt->w))
+                nv2a_aspect_scan(&vs->hp, (const uint32_t (*)[4])v->prog, v->start,
+                                 (float (*)[4])(uintptr_t)v->c, hvf, nf4, slot, count, hxy,
+                                 &lo_x, &hi_x);
+        }
+    } else if (rt->pad && d->program) {
+        /* not due: count the batch so the gate's cadence holds */
+        nv2a_aspect_scan(&vs->hp, NULL, 0, NULL, NULL, 0, NULL, 0, NULL, &lo_x, &hi_x);
+    }
+    if (have_x)
+        hp.full_w = nv2a_aspect_full_width(lo_x, hi_x, rt->w)
+                    && (!tris || nv2a_aspect_full_tris((const float (*)[2])hxy, idx,
+                                                       nidx / 3u, rt->w));
+
+    /* Constants: the program's c[192] at b1. The pixels->NDC mapping at b2
+     * waits for the placement (setup_pixel, below). */
     {
         static uint8_t consts_shadow[sizeof v->c];
-        static uint8_t vp_shadow[80];
-        static int consts_ok, vp_ok;
+        static int consts_ok;
         D3D11_MAPPED_SUBRESOURCE m;
-        struct nv2a_vp_consts vc;
-        uint8_t vp[80];
-        nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
-        memcpy(vp, vc.c, sizeof vc.c);
-        memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
         if (!d->program
                 || (memo_on() && consts_ok && !memcmp(consts_shadow, v->c, sizeof v->c))) {
             /* the buffer already holds these bytes */
@@ -3110,23 +3332,12 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             memcpy(consts_shadow, v->c, sizeof v->c);
             consts_ok = 1;
         }
-        if (memo_on() && vp_ok && !memcmp(vp_shadow, vp, sizeof vp)) {
-            /* unchanged */
-        } else if (SUCCEEDED(ID3D11DeviceContext_Map(
-                s_ctx, (ID3D11Resource *)s_cb_vp, 0,
-                D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            memcpy(m.pData, vp, sizeof vp);
-            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_vp, 0);
-            memcpy(vp_shadow, vp, sizeof vp);
-            vp_ok = 1;
-        }
     }
 
     {
         D3D11_VIEWPORT vp;
-        D3D11_RECT sr;
         ID3D11Buffer *cbs[3];
-        uint32_t cb[4], hb[4];
+        uint32_t cb[4];
         vp.TopLeftX = 0;
         vp.TopLeftY = 0;
         vp.Width = (float)rt->hw;
@@ -3138,11 +3349,6 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             s_draws_skipped++;
             return;
         }
-        nv2a_host_box(cb, rt->w, rt->h, rt->hw, rt->hh, hb);
-        sr.left = (LONG)hb[0];
-        sr.top = (LONG)hb[1];
-        sr.right = (LONG)hb[2];
-        sr.bottom = (LONG)hb[3];
         cbs[0] = NULL;
         cbs[1] = s_cb_consts;
         cbs[2] = s_cb_vp;
@@ -3176,10 +3382,6 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
                 s_sc.vp = vp;
             }
-            if (!sc || memcmp(&s_sc.sr, &sr, sizeof sr)) {
-                ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sr);
-                s_sc.sr = sr;
-            }
             if (!sc || s_sc.rs != rs) {
                 ID3D11DeviceContext_RSSetState(s_ctx, rs);
                 s_sc.rs = rs;
@@ -3212,14 +3414,53 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             if (skip_post < 0)
                 skip_post = recomp_env(RENV_D3D11_DEBUG_PS_SKIP_POST) != NULL;
             s_dbg_post = skip_post && !v->depth_enable && d->idx_count <= 8;
-            ps = setup_pixel();
+            ps = setup_pixel(&hp);
             /* setup_pixel may have compiled (and evicted) a shader */
             if (!sc_on() || s_sc.ps != ps) {
                 ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
                 s_sc.ps = ps;
             }
         }
-        if (px_on()) {
+        /* display.hud=edges: a centred 2D batch's pieces each to their
+         * side; one placement for the whole batch is the common case (a
+         * piece a batch), else the batch is drawn in runs. */
+        if (edges && hp.two_d && hp.full_w && hp.guest_tex)
+            nv2a_aspect_layout_note(s_presents);
+        if (hp.place == NV2A_PLACE_CENTRE && hp.two_d && edges && !hp.full_w) {
+            uint32_t ntri = nidx / 3u;
+            if (ntri > tplace_cap) {
+                uint8_t *grown = (uint8_t *)realloc(tplace, ntri);
+                if (grown) {
+                    tplace = grown;
+                    tplace_cap = ntri;
+                }
+            }
+            if (ntri <= tplace_cap) {
+                runs = nv2a_aspect_anchor_tris((const float (*)[2])hxy, idx, ntri, rt->w,
+                                               rt->h, s_presents, tplace);
+                hp.place = tplace[0];
+                if (runs > 1)
+                    s_draws_runs++;
+            }
+        }
+        if (hp.place != NV2A_PLACE_CENTRE)
+            s_draws_stretch++;
+        if (hp.two_d && rt->pad && aspect_trace())
+            aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place, runs);
+        if (runs <= 1)
+            set_vp(v, g, rt, hp.place, hp.two_d, cb);
+        if (runs > 1) {
+            /* hor+ edges: each run of triangles with one placement, in
+             * order, with its own mapping and scissor. */
+            uint32_t t0 = 0, t1, ntri = nidx / 3u;
+            while (t0 < ntri) {
+                for (t1 = t0 + 1; t1 < ntri && tplace[t1] == tplace[t0]; t1++)
+                    ;
+                set_vp(v, g, rt, tplace[t0], 1, cb);
+                ID3D11DeviceContext_DrawIndexed(s_ctx, (t1 - t0) * 3u, t0 * 3u, 0);
+                t0 = t1;
+            }
+        } else if (px_on()) {
             uint32_t before[4];
             int n;
             for (n = 0; n < s_px_n; n++)
@@ -3427,6 +3668,16 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_occ.first - p_occ_first),
             (unsigned long long)(s_occ.sync_us - p_occ_us),
             s_drawn ? s_drawn->offset : 0, surface_offset);
+    if (s_drawn && s_drawn->pad && aspect_trace()) {
+        static uint64_t p_stretch, p_runs;
+        fprintf(stderr, LOGP "flip %llu hor+: target %ux%u pad %u (%ux%u host),"
+                " %llu batches off-centre, %llu split\n", (unsigned long long)s_presents,
+                s_drawn->w, s_drawn->h, s_drawn->pad, s_drawn->hw, s_drawn->hh,
+                (unsigned long long)(s_draws_stretch - p_stretch),
+                (unsigned long long)(s_draws_runs - p_runs));
+        p_stretch = s_draws_stretch;
+        p_runs = s_draws_runs;
+    }
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
     p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_cull = s_draws_culled; p_clears = s_clears;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
@@ -3612,12 +3863,13 @@ static void present_blit(RenderTarget *rt, int filter)
                 s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
         return;
     present_extent(rt, &cw, &ch);
-    hcw = (UINT)((uint64_t)cw * rt->hw / rt->w);
-    hch = (UINT)((uint64_t)ch * rt->hh / rt->h);
+    /* hor+: the pads go to the screen with the frame (Metal's present) */
+    hcw = (cw + 2u * rt->pad) * rt->n;
+    hch = ch * rt->n;
     whole = nv2a_present_rect(hcw, hch, s_back_w, s_back_h, filter, &r);
     {
         D3D11_MAPPED_SUBRESOURCE m;
-        float uv[4] = {(float)cw / (float)rt->w, (float)ch / (float)rt->h, 0, 0};
+        float uv[4] = {(float)hcw / (float)rt->hw, (float)hch / (float)rt->hh, 0, 0};
         if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
                                            D3D11_MAP_WRITE_DISCARD, 0, &m)))
             return;
@@ -3680,10 +3932,12 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         static int said;
         const struct nv2a_host_opts *eo = nv2a_host_opts();
         /* Stock: the frame as the guest drew it, a copy into the unresized
-         * windowed back buffer (whole or, for another size, its overlap). */
+         * windowed back buffer (whole or, for another size, its overlap).
+         * Not for a hor+ target: its overlap is the left pad and 4:3 of the
+         * rest, the right pad cut off; it goes whole or through the blit. */
         int stock = nv2a_host_render_scale() == 1
                  && eo->present_filter == NV2A_PRESENT_NEAREST
-                 && !eo->fullscreen
+                 && !eo->fullscreen && !s_drawn->pad
                  && s_back_w == s_made_w && s_back_h == s_made_h;
         UINT cw, ch;
         int same;

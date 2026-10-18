@@ -552,6 +552,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     {
         Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                       | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        /* display.aspect: the padded frame's shape (854x480 at 16:9). */
+        int win_w = (int)nv2a_host_window_w(640, 480, (unsigned)scale);
 #if defined(__APPLE__)
         /* The Metal backend's frames stay on the GPU: a CAMetalLayer window
          * the backend blits into (fb_present_metal.m), unless
@@ -561,7 +563,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
             char why[256] = "";
             win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
+                                   SDL_WINDOWPOS_CENTERED, win_w, 480 * scale,
                                    wflags | SDL_WINDOW_METAL);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
@@ -578,7 +580,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 #endif
         if (!s_layer) {
             win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale, wflags);
+                                   SDL_WINDOWPOS_CENTERED, win_w, 480 * scale, wflags);
             ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
                                            | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
                       : NULL;

@@ -6502,6 +6502,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[ENHANCE] render.scale=%u ignored: the CPU rasteriser"
                     " draws into guest memory at the guest size\n",
                     nv2a_host_render_scale());
+        /* display.aspect pads host targets, which the CPU rasteriser does
+         * not have: it draws the stock 4:3 frame. */
+        if (nv2a_host_opts()->aspect_w
+                && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
+            fprintf(stderr, "[ENHANCE] display.aspect=%u:%u ignored: the CPU rasteriser"
+                    " draws the 4:3 frame into guest memory\n",
+                    nv2a_host_opts()->aspect_w, nv2a_host_opts()->aspect_h);
         /* A texture pack is a host-side replacement at upload; the CPU
          * rasteriser samples guest memory and has no upload to replace. */
         if (nv2a_tex_pack_count()

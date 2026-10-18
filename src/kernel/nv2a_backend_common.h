@@ -922,7 +922,9 @@ struct nv2a_ps_consts {
     uint32_t alpha_test_enable, fog_enable;
     uint32_t alpha_only[4];     /* 1: rgb reads 1 (A8); 2: alpha reads 1 (no alpha) */
     float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear);
-                                 * z: nv2a_rect_snap_scale, 0 for none */
+                                 * z: nv2a_rect_snap_scale, 0 for none;
+                                 * w: hor+ x offset into a padded target
+                                 * (rt_offset), 0 otherwise */
     uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
     /* BUMPENVMAP stages: the bump matrix as the method slots hold it --
      * 00, 01, 11, 10, not the 00 01 10 11 their order suggests. The XDK's
@@ -1021,14 +1023,20 @@ static inline float nv2a_screen_snap(float p)
 
 /* The vertex stage's viewport and fog constants: c = 2/w, -2/h, 1/zmax, 0,
  * -1, 1, 0, 0, fog params 0..2, 0; u = fog on, fog func, fog abs, fog
- * edge-one, specular on, light_ctl bit 17 (separate specular), 0, 0. */
+ * edge-one, specular on, light_ctl bit 17 (separate specular), 0, 0.
+ *
+ * `pad` is the hor+ padding of the target (nv2a_host_pad), guest pixels on
+ * each side: with it the x mapping is 2/(w + 2 pad), -w/(w + 2 pad), so the
+ * title's columns 0..w land centred in the wider target and a perspective
+ * batch's geometry beyond them is drawn instead of clipped. 0 is stock. */
 struct nv2a_vp_consts {
     float    c[12];
     uint32_t u[8];
 };
 
 void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
-                         uint32_t w, uint32_t h, struct nv2a_vp_consts *o);
+                         uint32_t w, uint32_t h, uint32_t pad,
+                         struct nv2a_vp_consts *o);
 
 /* ------------------------------------------------------------------------ */
 /* Visibility-test reports (GET_REPORT)                                      */
@@ -1212,6 +1220,11 @@ struct nv2a_host_opts {
     int      fullscreen;        /* borderless desktop fullscreen at start */
     unsigned pack_off;          /* NV2A_PACK_OFF_* bits: 0 = every kind on */
     int      present_surface;   /* enum nv2a_present_surface */
+    /* display.aspect as a ratio, 0:0 = stock (4:3, no padding): 4:3-shaped
+     * targets get hor+ padding (nv2a_host_pad). */
+    unsigned aspect_w, aspect_h;
+    int      hud_mode;          /* enum nv2a_hud_mode: display.hud */
+    int      movie_mode;        /* enum nv2a_movie_mode: display.movie */
 };
 
 /* pack_off bits: the whole pack, or one kind of entry (nv2a_tex_pack.h). */
@@ -1262,6 +1275,192 @@ unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
  * on the result. */
 unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
                           int bump_source);
+/* Hor+ padding of a guest w x h colour target, guest pixels on each side:
+ * 0 unless display.aspect is set and the target is 4:3 within 1% (the frame
+ * and its half-size post buffers; not the square shadow, environment or
+ * post targets, which keep their shape), then round((h * aw/ah - w) / 2):
+ * 107 for 640x480 at 16:9 (an 854-wide target), 53 for 320x240. */
+uint32_t nv2a_host_pad(uint32_t w, uint32_t h);
+
+/* Width of the window for a guest w x h frame shown `scale` times larger:
+ * the padded target's, (w + 2 nv2a_host_pad) * scale, so a 16:9 window
+ * shows the pads 1:1 (854 for 640x480) instead of letterboxing them into a
+ * 4:3 window. Even, since the pad is doubled; w * scale at stock. */
+uint32_t nv2a_host_window_w(uint32_t w, uint32_t h, unsigned scale);
+
+/* Hor+ placement of one batch on a padded target (display.aspect). The
+ * title's 4:3 frame sits centred in the wider target; each batch is mapped
+ * one of these ways (nv2a_aspect_map) and scissored to match
+ * (nv2a_aspect_box). */
+enum nv2a_aspect_place {
+    NV2A_PLACE_CENTRE = 0,  /* 3D and 2D: columns 0..w centred, x + pad */
+    NV2A_PLACE_STRETCH,     /* a full-width screen pass, or a movie under
+                             * display.movie=fit: 0..w over the whole target */
+    NV2A_PLACE_LEFT,        /* display.hud=edges: a left HUD piece, x + 0 */
+    NV2A_PLACE_RIGHT,       /* display.hud=edges: a right HUD piece, x + 2 pad */
+    NV2A_PLACE_COVER        /* display.movie=fill: 0..w over the whole width,
+                             * y scaled the same about the centre (cropped) */
+};
+
+/* display.hud and display.movie (nv2a_host_opts). */
+enum nv2a_hud_mode { NV2A_HUD_CENTRED = 0, NV2A_HUD_EDGES };
+enum nv2a_movie_mode { NV2A_MOVIE_BLACK = 0, NV2A_MOVIE_FIT, NV2A_MOVIE_FILL };
+
+/* A 2D batch whose vertices span lo_x..hi_x (surface pixels) on a w-wide
+ * target covers the whole guest width: a fade, a post quad, a letterbox
+ * bar, a movie frame. 2 pixels of slack each side. */
+static inline int nv2a_aspect_full_width(float lo_x, float hi_x, uint32_t w)
+{
+    return lo_x <= 2.0f && hi_x >= (float)w - 2.0f;
+}
+
+/* Whether a guest texture under a full-width 2D batch is a picture (a
+ * movie frame, a still, a menu backdrop) for nv2a_aspect_place's guest_tex.
+ * One at most a quarter of the frame's width is magnified 4x or more over
+ * it: a flat colour or a gradient, which is a fade (BLiNX 2 fades through
+ * a 16x16 white texture, every frame of a stage), and a fade is stretched
+ * like an untextured one so the pads fade too. */
+static inline int nv2a_aspect_picture(uint32_t tex_w, uint32_t w)
+{
+    return tex_w * 4u > w;
+}
+
+/* Whether a program vertex's oPos.w puts it on a screen layer. oPos.xy
+ * are surface pixels whatever w is (w only steers perspective-correct
+ * interpolation and the depth), so a batch is 2D when its vertices share
+ * one w. Orthographic output has w 1; BLiNX 2 also draws parts of its
+ * stage HUD (the status panel's frame, its red lamps) through the world's
+ * projection at a fixed view depth, every vertex at w 2 or 3, and its
+ * title movie at w 100. Those are exact whole floats. A world sprite also
+ * shares one w, but a computed depth lands exactly on a whole number about
+ * once in 10^4 or less below 1024 (float spacing there is 6e-5 or finer),
+ * so a layer is an exact whole w from 1 to 1024. */
+static inline int nv2a_aspect_layer_w(float w)
+{
+    return w >= 1.0f && w <= 1024.0f && w == floorf(w);
+}
+
+/* How a batch is placed. two_d: the batch is 2D (pass-through, or every
+ * vertex at one nv2a_aspect_layer_w); full_w: nv2a_aspect_full_width;
+ * guest_tex: a stage samples a guest texture (not a render target), and
+ * nv2a_aspect_picture says it is one; flat_rt: a stage samples a render
+ * target without pads (a 256x256 blur, a 512x512 reflection). A full-width
+ * pass that samples only padded render targets, or nothing, is stretched
+ * (its source is padded too, or it is a flat fade); one over an unpadded
+ * target is centred, since stretching it would widen a 4:3 picture over
+ * the padded frame. One over a guest texture is a movie or a still and
+ * keeps its shape unless display.movie says otherwise. Everything else is
+ * centred; HUD anchoring (LEFT/RIGHT) is per primitive group
+ * (nv2a_aspect_anchor) and starts from CENTRE. */
+static inline int nv2a_aspect_place(int two_d, int full_w, int guest_tex, int flat_rt,
+                                    int movie_mode)
+{
+    if (!two_d || !full_w)
+        return NV2A_PLACE_CENTRE;
+    if (!guest_tex)
+        return flat_rt ? NV2A_PLACE_CENTRE : NV2A_PLACE_STRETCH;
+    return movie_mode == NV2A_MOVIE_FIT ? NV2A_PLACE_STRETCH
+         : movie_mode == NV2A_MOVIE_FILL ? NV2A_PLACE_COVER : NV2A_PLACE_CENTRE;
+}
+
+/* display.hud=edges: where a HUD piece spanning lo_x..hi_x of a w-wide
+ * frame goes, by its centre: in the left third it moves out to the left
+ * edge, in the right third to the right edge, else (centred text, the
+ * middle of the screen) it stays. A piece wider than half the frame (a
+ * banner, a panel across the screen) stays centred too: moving it would
+ * pull it apart from what sits beside it. A piece the title parks
+ * off-screen (x < 0 or x > w) moves with its side, so it stays off-screen. */
+static inline int nv2a_aspect_anchor(float lo_x, float hi_x, uint32_t w)
+{
+    float mid = (lo_x + hi_x) * 0.5f, third = (float)w / 3.0f;
+    if (hi_x - lo_x > (float)w * 0.5f)
+        return NV2A_PLACE_CENTRE;
+    if (mid < third)
+        return NV2A_PLACE_LEFT;
+    if (mid > 2.0f * third)
+        return NV2A_PLACE_RIGHT;
+    return NV2A_PLACE_CENTRE;
+}
+
+/* Per vertex program: whether its batches are 2D. Every BLiNX 2 batch is a
+ * program (the XDK's fixed function is one too), so the program's own
+ * output decides: every vertex on one screen layer (nv2a_aspect_layer_w)
+ * after an orthographic transform, a depth per vertex after a perspective
+ * one. The interpreter costs about a draw, so it is
+ * gated: two_d is -1 until a batch is checked; a program whose first 16
+ * batches were all 3D is checked every 256th batch after (the same program
+ * with an orthographic matrix is caught then, late); one seen 2D once is
+ * checked every batch. */
+struct nv2a_aspect_gate {
+    int      two_d;
+    uint32_t n;
+};
+
+/* Run a program batch's vertices through the interpreter (nv2a_vsh_run) if
+ * the gate says so. vf holds count vertices of nf4 float4 inputs each,
+ * input k of a vertex going to register slot[k]; c is the constant file.
+ * With xy (count entries) every vertex runs and its x, y land there
+ * (display.hud=edges, nv2a_aspect_anchor_tris); without, up to 33 evenly
+ * spaced. Returns 1 for a 2D batch with its x range in *lo, *hi (surface
+ * pixels, as the epilogue leaves them), 0 for 3D or not checked. */
+/* Whether the next nv2a_aspect_scan through this gate runs the program, so
+ * a backend that has to gather the inputs first skips that when it won't. */
+int nv2a_aspect_due(const struct nv2a_aspect_gate *gate);
+
+int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
+                     const uint32_t prog[][4], uint32_t start, float c[][4],
+                     const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                     float (*xy)[2], float *lo, float *hi);
+
+/* Whether one triangle of a 2D triangle list (ntri triangles, idx into xy)
+ * spans the w-wide frame (nv2a_aspect_full_width). A batch's bounds are not
+ * enough: BLiNX 2 draws its blue corner triangles, one in each corner, as
+ * one batch whose bounds are the whole screen, and stretching it would
+ * widen them a third. A full-screen quad, a fade, a post pass or a movie
+ * frame has triangles that span the width. */
+int nv2a_aspect_full_tris(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
+                          uint32_t w);
+
+/* display.hud=edges on a 2D triangle list (ntri triangles, idx into xy):
+ * each triangle's placement into place[t]. Triangles whose boxes touch or
+ * sit within a small gap on the same rows are one HUD piece (the two
+ * halves of a quad, the glyphs of a string, a tiled panel), so a piece is
+ * never torn; each piece goes where nv2a_aspect_anchor puts its x range.
+ * A HUD cluster is often several batches (BLiNX 2's status panel: icon,
+ * frame, gauge, label, lights), whose middle pieces can fall in the centre
+ * third while their neighbours do not. So a piece that would stay centred
+ * takes the side of a piece it touches (same rows, within the gap) that
+ * was moved in the previous frame, if it lies on that side of the middle;
+ * frame is the flip count, and a cluster joins up over a few frames.
+ * Above NV2A_ASPECT_TRIS_MAX triangles the batch is one piece. Returns the
+ * number of runs of consecutive triangles with one placement. */
+#define NV2A_ASPECT_TRIS_MAX 1024u
+
+/* display.hud=edges stays off on a 2D screen: a menu, a loading or story
+ * screen laid out over a full-frame picture would come apart if its pieces
+ * moved. A frame is one when it draws a full-width 2D batch over a guest
+ * texture (the backends call this) or a piece covering a third of the
+ * frame (nv2a_aspect_anchor_tris sees it); every piece of that frame from
+ * then on and of the next is centred. */
+void nv2a_aspect_layout_note(uint64_t frame);
+unsigned nv2a_aspect_anchor_tris(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
+                                 uint32_t w, uint32_t h, uint64_t frame, uint8_t *place);
+
+/* Adjust vertex constants filled with `pad` (nv2a_vp_consts_fill) to a
+ * placement. CENTRE leaves them; with pad 0 every placement is stock. */
+void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t pad,
+                     int place);
+
+/* The host scissor of a batch placed `place` on a guest w x h target padded
+ * by pad and made n times larger (host (w + 2 pad) n x h n), from its guest
+ * surface-clip box (nv2a_draw_box). The clip box is in the batch's own
+ * coordinates, so it moves with the placement. A centred 2D batch keeps to
+ * the guest columns: a HUD piece slid off-screen (x < 0) must not show in
+ * the pads. A centred 3D batch's clip edges at 0 and w reach out to the
+ * target's edges, so the world fills the pads. A stretched or covering one
+ * scales with the mapping. pad 0 gives nv2a_host_box's result. */
+void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad,
+                     unsigned n, int place, int two_d, uint32_t out[4]);
 
 /* Host size of a guest w x h target at `scale`: w*N x h*N, N lowered for
  * this target until both fit max_dim. Returns the N used (>= 1). */

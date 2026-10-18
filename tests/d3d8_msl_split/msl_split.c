@@ -234,6 +234,46 @@ static int bump_check(void)
     return bad;
 }
 
+/* rt_offset (hor+, display.aspect): a 2D stage and a BUMPENVMAP stage add
+ * tex_scale.w to u, the shift into a padded render target's guest columns;
+ * the same state without the flag reads no .w, so the hashed cases above
+ * stay the stock text. */
+static int rt_offset_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0, n;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u | 6u << 5, &st);
+    st.fog_input = 1;
+    st.tex_input[1] = 0;
+    st.bump_on = 1;
+    st.rt_offset = 1;
+    if ((n = d3d8_combiners_generate_msl(&st, text, (int)sizeof text)) <= 0)
+        return 1;
+    if (!strstr(text, "x8 = tex0.sample(samp0, uv * pc.tex_scale[0].xy + float2(pc.tex_scale[0].w, 0.0), bias(pc.tex_bias[0]));")
+            || !strstr(text, "x9 = tex1.sample(samp1, (i.t1.xy + ds) * pc.tex_scale[1].xy + float2(pc.tex_scale[1].w, 0.0), bias(pc.tex_bias[1]));")) {
+        printf("FAIL: rt_offset does not add tex_scale.w on the 2D and bump stages\n");
+        bad = 1;
+    }
+    {
+        int before = s_compile_bad;
+        compile_case("rc-rt-offset", 0, text, n, "fs_main");
+        if (s_compile_bad != before)
+            bad = 1;
+    }
+    st.rt_offset = 0;
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "tex_scale[0].w") || strstr(text, "tex_scale[1].w")) {
+        printf("FAIL: tex_scale.w without rt_offset\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -308,6 +348,8 @@ int main(void)
     if (snap_check())
         return 1;
     if (bump_check())
+        return 1;
+    if (rt_offset_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (MSL_DUMP=<file> writes the text)\n",

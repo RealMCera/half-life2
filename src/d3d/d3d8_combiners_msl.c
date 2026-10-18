@@ -142,8 +142,13 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             EMIT("        ds = select(ds, ds - 256.0, ds >= 128.0) / 127.0;\n");
             EMIT("        ds = float2(dot(ds, pc.bump[%d].xw), dot(ds, pc.bump[%d].yz));\n",
                  i, i);
-            EMIT("        x%d = tex%d.sample(samp%d, (i.t%d.xy + ds) * pc.tex_scale[%d].xy,"
-                 " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i, i);
+            if (state->rt_offset)
+                EMIT("        x%d = tex%d.sample(samp%d, (i.t%d.xy + ds) * pc.tex_scale[%d].xy"
+                     " + float2(pc.tex_scale[%d].w, 0.0), bias(pc.tex_bias[%d]));\n",
+                     8 + i, i, i, i, i, i, i);
+            else
+                EMIT("        x%d = tex%d.sample(samp%d, (i.t%d.xy + ds) * pc.tex_scale[%d].xy,"
+                     " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i, i);
             if (m == NV2A_TEXMODE_BUMPENVMAP_LUM)
                 EMIT("        x%d *= x%d.r * pc.bumpls[%d].x + pc.bumpls[%d].y;\n",
                      8 + i, 8 + in, i, i);
@@ -157,8 +162,15 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                      " uv /= i.t%d.w;\n", i, i, i, i);
             if (state->rect_snap)
                 EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
-            EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy,"
-                 " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i);
+            if (state->rt_offset)
+                /* hor+: tex_scale.w moves a centred batch's read into the
+                 * guest columns of a padded render target (0 elsewhere). */
+                EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy"
+                     " + float2(pc.tex_scale[%d].w, 0.0), bias(pc.tex_bias[%d]));\n",
+                     8 + i, i, i, i, i, i);
+            else
+                EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy,"
+                     " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i);
             EMIT("    }\n");
         }
         EMIT("    if (pc.alpha_only[%d] == 2u) x%d.a = 1.0;\n"

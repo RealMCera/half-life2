@@ -99,7 +99,7 @@ Every file that this reader accepts is valid [TOML](https://toml.io) 1.0. The fi
 ```toml
 # Comments start with '#' and run to the end of the line.
 
-[render]                # a table; dotted names work too: [aspect.program]
+[render]                # a table; dotted names work too: [input.bindings]
 scale = 2               # integer: 42, -7, 1_000, 0xFF, 0o17, 0b101
 sharpness = 0.5         # float: 0.5, 1e3, -2.5E-2, inf, nan
 filter = "linear"       # string: "..." with escapes \t \n \" \\ \uXXXX
@@ -111,8 +111,8 @@ modes = [               # hold comments, mix types and end with a comma
   "b",
 ]
 
-[aspect]
-program.a1b2c3 = "hud"  # dotted key: the same as [aspect.program] a1b2c3 = "hud"
+[input]
+bindings.a = "Space"    # dotted key: the same as [input.bindings] a = "Space"
 ```
 
 The reader rejects the following. Each is reported as an error with a line
@@ -155,7 +155,9 @@ the stock settings, `present.pacing = "spin"` included.
 |---|---|---|---|---|
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
 | `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
-| `display.aspect` | string | `"4:3"` only for now (`"16:9"`, `"16:10"`, `"21:9"` are reported as not implemented, and 4:3 is used) | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
+| `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
+| `display.hud` | string | `"centred"`, `"edges"`: with a wide aspect, the 2D HUD stays in the 4:3 frame or its corner and side pieces move out to the screen edges | `"centred"` | `RECOMP_DISPLAY_HUD` |
+| `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
@@ -163,7 +165,6 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
-| `aspect.program.<hash>` | string | `"hud"`, `"stretch"`, `"3d"`: a per-shader override of the aspect classifier | none | none |
 
 A title adds its own tables (`[fps]`, `[fx]`, ...) in the same files, and
 lists them with their stock values in its `config.default.toml`. The
@@ -177,6 +178,45 @@ guest values. The title documents its keys with its environment variables.
 
 The keyboard and mouse keys (`[input]`, `[input.bindings]`) have their own
 section, [Input](#input), below.
+
+### Hor+ widescreen (display.aspect)
+
+A ratio wider than 4:3 widens the picture instead of stretching it. Every
+4:3-shaped colour and depth target is allocated wider by a pad a side
+(`nv2a_host_pad`: 107 guest pixels for 640x480 at 16:9) and the title's
+columns are mapped centred in it, so the game's own perspective projection
+fills the pads with more of the world. The projection is not patched: what
+the title culls at the old frustum's edge pops in at the screen's edge.
+Guest memory and the write-back keep the 640x480 centre columns, so the
+guest and the goldens see the stock frame. A window (not fullscreen) opens
+at the padded frame's shape, `nv2a_host_window_w`: 854x480 at 16:9 and
+scale 1, so the pads show 1:1; fullscreen keeps the display's size and
+letterboxes.
+
+Each batch is placed by one rule table (`nv2a_aspect_place`,
+`src/kernel/nv2a_backend_common.h`), after a 2D test that runs the batch's
+vertex program on the CPU and checks that every vertex shares one `oPos.w`,
+an exact whole number from 1 to 1024 (`nv2a_aspect_layer_w`,
+`nv2a_aspect_scan`, gated per program). `oPos.xy` are pixels whatever `w`
+is, and BLiNX 2 draws parts of its stage HUD at a fixed view depth of 2 or 3
+and its title movie at 100:
+
+- 3D: centred; a clip box at the frame's edges reaches the target's edges.
+- 2D, not full width (HUD, menus, text): centred and scissored to the 4:3
+  frame, so pieces the title parks off-screen never show in the pads. With
+  `display.hud = "edges"` the batch's triangles are grouped into pieces
+  and a piece in the outer third moves to its side's new edge, unscaled;
+  a middle piece touching one that moved goes with it, and a menu or
+  story screen (a full-width picture, or a piece a third of the frame)
+  keeps every piece centred.
+- 2D, full width, sampling only render targets, nothing, or a guest
+  texture no wider than a quarter of the frame (fades, post passes):
+  stretched over the whole target.
+- 2D, full width over a wider guest texture (a movie, a still):
+  `display.movie`.
+
+`RECOMP_TRACE=aspect` prints one `[aspect.program]` line per program,
+texture and placement, and the target size per flip.
 
 ### What the render and present keys do
 
@@ -475,7 +515,7 @@ run under `RECOMP_CONFIG=none`, keep both off.
 
 ### Naming rule
 
-- Tables group keys by feature: `[render]`, `[present]`, `[display]`, `[aspect]`, and a title's own.
+- Tables group keys by feature: `[render]`, `[present]`, `[display]`, and a title's own.
   Key names are lower case, with `_` between words.
 - A key that has an environment override uses the variable `RECOMP_` + the
   dotted key in upper case with `.` replaced by `_`. For example,
@@ -492,6 +532,8 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_CONFIG` | path of the player's file, which replaces both `config.toml` files, or `none` for no file at all (the defaults included). `RECOMP_ENHANCE_CONFIG` is its earlier name, read with a deprecation line |
 | `RECOMP_RENDER_SCALE` | overrides `render.scale` |
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
+| `RECOMP_DISPLAY_HUD` | overrides `display.hud` |
+| `RECOMP_DISPLAY_MOVIE` | overrides `display.movie` |
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |

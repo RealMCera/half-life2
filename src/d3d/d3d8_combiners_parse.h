@@ -250,6 +250,12 @@ typedef struct NV2ACombinerState {
      * acts where tex_scale[n].z > 1. A backend flag, set at render scale
      * > 1 so the stock shader text is unchanged; part of the cache key. */
     int rect_snap;
+
+    /* 1: 2D and bump stages add tex_scale[n].w to the sampled x, the hor+
+     * offset of a centred batch into a padded render target's guest columns
+     * (nv2a_aspect_place). A backend flag, set only while display.aspect
+     * pads targets, so the stock shader text is unchanged; in the cache key. */
+    int rt_offset;
 } NV2ACombinerState;
 
 /**
