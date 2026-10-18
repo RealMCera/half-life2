@@ -17,14 +17,12 @@
  *                       timing): how lowered guest spin waits wait
  *                       (kernel_pacing.h)
  *   display.aspect      4:3 (stock) or a wider W:H: Hor+ (Metal, D3D11)
- *   display.hud         centered | edges: the HUD with a wide aspect
  *   display.movie       black | fit | fill: full-screen movies with a wide aspect
  *
  * Logs one line with the values in force, e.g.
  *   [ENHANCE] render.scale=2 present.filter=linear present.fullscreen=0 present.pacing=sleep (display.aspect=4:3)
  * which scripts/golden.py reads to refuse a non-stock golden run; with a
- * wide aspect a second line gives display.aspect, display.hud and
- * display.movie.
+ * wide aspect a second line gives display.aspect and display.movie.
  *
  * It does not report unused keys: the title reads its own keys after this
  * and then calls enhance_cfg_report_unused() (enhance_cfg.h), so a title

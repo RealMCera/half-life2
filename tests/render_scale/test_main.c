@@ -67,17 +67,6 @@ static int snap_at(float px, float py, float ou, float ov, float dxu, float dxv,
     return fabsf(uv[0] - eu) < 1e-3f && fabsf(uv[1] - ev) < 1e-3f;
 }
 
-/* A quad of two triangles over x0..x1, y0..y1, into xy and idx at q. */
-static void quad(float (*xy)[2], uint32_t *idx, unsigned q, float x0, float x1,
-                 float y0, float y1)
-{
-    float (*v)[2] = xy + 4u * q;
-    uint32_t *i = idx + 6u * q, b = 4u * q;
-    v[0][0] = x0; v[0][1] = y0; v[1][0] = x1; v[1][1] = y0;
-    v[2][0] = x1; v[2][1] = y1; v[3][0] = x0; v[3][1] = y1;
-    i[0] = b; i[1] = b + 1; i[2] = b + 2; i[3] = b; i[4] = b + 2; i[5] = b + 3;
-}
-
 static struct nv2a_stage stage(int mode, uint32_t color, uint32_t filter)
 {
     struct nv2a_stage t;
@@ -232,12 +221,6 @@ int main(void)
         nv2a_aspect_map(&c, 640, 480, 107, NV2A_PLACE_STRETCH);
         CHECK(c.c[0] == 2.0f / 640.0f && c.c[4] == -1.0f && c.c[1] == c0.c[1] && c.c[5] == c0.c[5]);
         c = c0;
-        nv2a_aspect_map(&c, 640, 480, 107, NV2A_PLACE_LEFT);
-        CHECK(c.c[0] == c0.c[0] && c.c[4] == -1.0f);                     /* x 0 at the left edge */
-        c = c0;
-        nv2a_aspect_map(&c, 640, 480, 107, NV2A_PLACE_RIGHT);
-        CHECK(fabsf(640.0f * c.c[0] + c.c[4] - 1.0f) < 1e-6f);           /* x 640 at the right edge */
-        c = c0;
         nv2a_aspect_map(&c, 640, 480, 107, NV2A_PLACE_COVER);
         CHECK(c.c[0] == 2.0f / 640.0f && c.c[4] == -1.0f);
         /* y about the centre by 854/640: row 240 stays at 0, row 0 above +1 */
@@ -255,10 +238,6 @@ int main(void)
         CHECK(out[0] == 0 && out[2] == 1708);
         nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_COVER, 1, out);
         CHECK(out[0] == 0 && out[2] == 1708 && out[3] == 960);
-        nv2a_aspect_box(part, 640, 480, 107, 2, NV2A_PLACE_LEFT, 1, out);
-        CHECK(out[0] == 32 && out[2] == 640);
-        nv2a_aspect_box(part, 640, 480, 107, 2, NV2A_PLACE_RIGHT, 1, out);
-        CHECK(out[0] == 460 && out[2] == 1068);
 
         /* A stretch on a padded square spans the ratio's pad only (85 of
          * 149 at 16:9, 810 wide): a full-width copy of the frame into it,
@@ -325,203 +304,14 @@ int main(void)
         CHECK(!nv2a_aspect_layer_w(5.64599f) && !nv2a_aspect_layer_w(259.141f)
               && !nv2a_aspect_layer_w(3.0005f));
         CHECK(!nv2a_aspect_layer_w(0.5f) && !nv2a_aspect_layer_w(-1.0f) && !nv2a_aspect_layer_w(2048.0f));
-        CHECK(nv2a_aspect_anchor(16, 120, 640) == NV2A_PLACE_LEFT);
-        CHECK(nv2a_aspect_anchor(520, 624, 640) == NV2A_PLACE_RIGHT);
-        CHECK(nv2a_aspect_anchor(260, 380, 640) == NV2A_PLACE_CENTRE);
-        CHECK(nv2a_aspect_anchor(-200, -100, 640) == NV2A_PLACE_LEFT);    /* parked stays off */
-        CHECK(nv2a_aspect_anchor(700, 900, 640) == NV2A_PLACE_RIGHT);
-        CHECK(nv2a_aspect_anchor(0, 400, 640) == NV2A_PLACE_CENTRE);      /* wider than w/2 */
     }
 
-    /* ---- hor+ HUD pieces (display.hud=edges) ---- */
+    /* ---- hor+ corner HUD: one batch spanning the frame, not full width ---- */
     {
-        static float xy[64][2];
-        static uint32_t idx[96];
-        uint8_t pl[32];
-        unsigned runs, t, u;
+        static float xy[12][2];
+        static uint32_t idx[12];
+        unsigned t;
 
-        /* One quad in the left corner: one piece, one run. */
-        quad(xy, idx, 0, 16, 80, 16, 48);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 100, pl) == 1);
-        CHECK(pl[0] == NV2A_PLACE_LEFT && pl[1] == NV2A_PLACE_LEFT);
-        /* A string that crosses the left third's edge: glyphs 12 px apart
-         * (under the 16 px gap) are one piece and move together, placed by
-         * the whole string's middle (100..280, 190: the left third). */
-        for (t = 0; t < 8; t++)
-            quad(xy, idx, t, 100.0f + 24.0f * (float)t, 112.0f + 24.0f * (float)t, 200, 216);
-        runs = nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 16, 640, 480, 200, pl);
-        CHECK(runs == 1);
-        for (t = 0; t < 16; t++)
-            CHECK(pl[t] == NV2A_PLACE_LEFT);
-        /* Left score, centred title, right timer in one batch: three runs.
-         * The right piece's two glyphs 40 px apart are two pieces, both on
-         * the right. */
-        quad(xy, idx, 0, 16, 96, 16, 40);
-        quad(xy, idx, 1, 280, 360, 16, 40);
-        quad(xy, idx, 2, 540, 560, 16, 40);
-        quad(xy, idx, 3, 600, 624, 16, 40);
-        runs = nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 8, 640, 480, 300, pl);
-        CHECK(runs == 3);
-        CHECK(pl[0] == NV2A_PLACE_LEFT && pl[1] == NV2A_PLACE_LEFT);
-        CHECK(pl[2] == NV2A_PLACE_CENTRE && pl[3] == NV2A_PLACE_CENTRE);
-        CHECK(pl[4] == NV2A_PLACE_RIGHT && pl[7] == NV2A_PLACE_RIGHT);
-        /* Pieces on other rows do not join even when their columns touch:
-         * a left icon above a full-width bar. */
-        quad(xy, idx, 0, 16, 64, 16, 64);
-        quad(xy, idx, 1, 0, 640, 400, 440);
-        runs = nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 400, pl);
-        CHECK(runs == 2 && pl[0] == NV2A_PLACE_LEFT && pl[2] == NV2A_PLACE_CENTRE);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 0, 640, 480, 500, pl) == 0);
-
-        /* A cluster drawn in several batches: the icon (16..96) moves
-         * left; the frame beside it (90..290, middle 190) is in the left
-         * third too; the lights next to the frame (290..330, middle 310,
-         * centre third) stay in frame 1 and join the frame's side from
-         * frame 2, as the frame moved in frame 1. A piece in the right
-         * half never takes a left neighbour's side, and a frame that is
-         * not the next one forgets the cluster. */
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 1, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        quad(xy, idx, 0, 90, 290, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 1, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        quad(xy, idx, 0, 290, 316, 30, 60);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 1, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        quad(xy, idx, 0, 290, 316, 30, 60);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 2, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        quad(xy, idx, 0, 300, 360, 30, 60);   /* middle 330: right half */
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 3, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        quad(xy, idx, 0, 290, 316, 30, 60);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 9, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-
-        /* A 2D screen: after a full-frame picture (noted, or a piece over
-         * a third of the frame) nothing moves this frame or the next. */
-        nv2a_aspect_layout_note(20);
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 20, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 21, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 22, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        quad(xy, idx, 0, 40, 600, 40, 440);
-        quad(xy, idx, 1, 16, 96, 16, 30);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 23, pl) == 1
-              && pl[2] == NV2A_PLACE_CENTRE);
-
-        /* Off the frame's layer: BLiNX 2's 1-1 draws 2-triangle quads that
-         * project thousands of pixels out (x 119131..125785). Not counted,
-         * not a layout screen: the HUD beside it keeps its side this frame
-         * and the next. */
-        {
-            static const float art[2][4] = { { 119131, -45001, 125785, -38347 },
-                                             { -5.99e7f, -10, 8.3e7f, 20 } };
-            float in, ext, b[4] = { 16, 16, 96, 80 };
-            CHECK(!nv2a_aspect_piece_cover(art[0], 640, 480, &in, &ext));
-            CHECK(!nv2a_aspect_piece_cover(art[1], 640, 480, &in, &ext));
-            CHECK(nv2a_aspect_piece_cover(b, 640, 480, &in, &ext) && in == 80 * 64 && ext == in);
-            b[0] = -600; b[2] = -500;            /* parked off-screen: ext only */
-            CHECK(nv2a_aspect_piece_cover(b, 640, 480, &in, &ext) && in == 0 && ext == 100 * 64);
-        }
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        quad(xy, idx, 1, 119131, 125785, -45001, -38347);
-        runs = nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 40, pl);
-        CHECK(pl[0] == NV2A_PLACE_LEFT && pl[2] == NV2A_PLACE_CENTRE);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 41, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-
-        /* A screen tiled from many batches of one tile each (the loading
-         * screen's 128-pixel panels): no piece covers a third, together
-         * they cover the frame. The tile that completes it flags the frame;
-         * the next frame is centred from its first tile. */
-        for (t = 0; t < 20; t++) {
-            float x = 128.0f * (float)(t % 5u), y = 120.0f * (float)(t / 5u);
-            quad(xy, idx, 0, x, x + 128, y, y + 120);
-            nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 50, pl);
-            if (t == 0)
-                CHECK(pl[0] == NV2A_PLACE_LEFT);
-        }
-        CHECK(pl[0] == NV2A_PLACE_CENTRE);
-        quad(xy, idx, 0, 0, 128, 0, 96);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 51, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        /* Panels parked off-screen to slide in count too: almost nothing
-         * on the frame, five frame-tall panels outside it. */
-        for (t = 0; t < 5; t++) {
-            float x = t & 1u ? 640.0f + 128.0f * (float)t : -128.0f * (float)(t + 1u);
-            quad(xy, idx, 0, x, x + 128, 0, 480);
-            nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 60, pl);
-        }
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 61, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        /* Sliding out: half the frame keeps a screen that was one last
-         * frame (91: three panels), so the HUD is centred through 92; less
-         * than half (92: one quad) ends it, and 93 moves again. */
-        for (u = 90; u < 92; u++)
-            for (t = 0; t < (u == 90 ? 5u : 3u); t++) {
-                float x = t & 1u ? 640.0f + 128.0f * (float)t : -128.0f * (float)(t + 1u);
-                quad(xy, idx, 0, x, x + 128, 0, 480);
-                nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, u, pl);
-            }
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 92, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 93, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        /* A busy HUD (a dialogue box, the mission list: up to half the
-         * frame in BLiNX 2) is not a screen. */
-        quad(xy, idx, 0, 16, 336, 16, 256);
-        quad(xy, idx, 1, 320, 624, 280, 464);
-        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 70, pl);
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 71, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        /* The cover is a share of each piece's own target: a quarter of
-         * the 640x480 frame and a quarter of each of two 320x240 post
-         * buffers is three quarters, not 160% of a 320x240 one. */
-        quad(xy, idx, 0, 16, 336, 16, 256);
-        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 100, pl);
-        quad(xy, idx, 0, 8, 168, 8, 128);
-        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 320, 240, 100, pl);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 320, 240, 100, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 101, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        /* A quad crossing the eye plane (+-1e8) in the HUD's own batch and
-         * on its rows joins no piece: the HUD keeps its side, the quad is
-         * centred. */
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        quad(xy, idx, 1, -1e8f, 1e8f, 20, 60);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 110, pl) == 2
-              && pl[0] == NV2A_PLACE_LEFT && pl[1] == NV2A_PLACE_LEFT
-              && pl[2] == NV2A_PLACE_CENTRE && pl[3] == NV2A_PLACE_CENTRE);
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 111, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-        /* Placements are recorded on layout frames too, so the cluster's
-         * centre-third piece is on its side on the first frame that moves
-         * again (82), not one frame later. */
-        nv2a_aspect_layout_note(80);
-        quad(xy, idx, 0, 16, 96, 16, 80);
-        quad(xy, idx, 1, 90, 290, 16, 80);
-        nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 80, pl);
-        quad(xy, idx, 0, 290, 316, 30, 60);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 81, pl) == 1
-              && pl[0] == NV2A_PLACE_CENTRE);
-        CHECK(nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 2, 640, 480, 82, pl) == 1
-              && pl[0] == NV2A_PLACE_LEFT);
-
-        /* Full width by triangle: a full-screen quad is; the four corner
-         * triangles of one batch, whose bounds are the screen, are not. */
-        quad(xy, idx, 0, 0, 640, 0, 480);
-        CHECK(nv2a_aspect_full_tris((const float (*)[2])xy, idx, 2, 640));
         xy[0][0] = 0;   xy[0][1] = 0;   xy[1][0] = 120; xy[1][1] = 0;   xy[2][0] = 0;   xy[2][1] = 90;
         xy[3][0] = 640; xy[3][1] = 0;   xy[4][0] = 520; xy[4][1] = 0;   xy[5][0] = 640; xy[5][1] = 90;
         xy[6][0] = 0;   xy[6][1] = 480; xy[7][0] = 120; xy[7][1] = 480; xy[8][0] = 0;   xy[8][1] = 390;
@@ -529,9 +319,8 @@ int main(void)
         for (t = 0; t < 12; t++)
             idx[t] = t;
         CHECK(!nv2a_aspect_full_tris((const float (*)[2])xy, idx, 4, 640));
-        runs = nv2a_aspect_anchor_tris((const float (*)[2])xy, idx, 4, 640, 480, 600, pl);
-        CHECK(runs == 4 && pl[0] == NV2A_PLACE_LEFT && pl[1] == NV2A_PLACE_RIGHT
-              && pl[2] == NV2A_PLACE_LEFT && pl[3] == NV2A_PLACE_RIGHT);
+        /* so it is a centred 2D batch: the HUD keeps its 4:3 layout */
+        CHECK(nv2a_aspect_place(1, 0, 0, 0, NV2A_MOVIE_BLACK) == NV2A_PLACE_CENTRE);
     }
 
     /* ---- hor+ 2D test: a program's oPos.w, one screen layer ---- */

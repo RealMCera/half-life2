@@ -1027,12 +1027,6 @@ void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t 
         o->c[4] = 2.0f * (float)(pad - r) / pw - 1.0f;
         break;
     }
-    case NV2A_PLACE_LEFT:
-    case NV2A_PLACE_RIGHT:
-        /* x + pad + s over a pw-wide target is (2 s - w) / pw at x 0, s =
-         * -pad (exactly -1) or +pad. */
-        o->c[4] = place == NV2A_PLACE_LEFT ? -1.0f : ((float)(2u * pad) - (float)w) / pw;
-        break;
     case NV2A_PLACE_COVER:
         k = pw / (float)w;
         o->c[0] = 2.0f / (float)w;
@@ -1067,14 +1061,6 @@ void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad
          * the viewport, so its box is the stretched one. */
         out[0] = (uint32_t)((uint64_t)box[0] * pw * n / w);
         out[2] = (uint32_t)((uint64_t)box[2] * pw * n / w);
-        break;
-    case NV2A_PLACE_LEFT:
-        out[0] = box[0] * n;
-        out[2] = box[2] * n;
-        break;
-    case NV2A_PLACE_RIGHT:
-        out[0] = (box[0] + 2u * pad) * n;
-        out[2] = (box[2] + 2u * pad) * n;
         break;
     default:
         out[0] = (box[0] + pad) * n;

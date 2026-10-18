@@ -156,7 +156,6 @@ the stock settings, `present.pacing = "spin"` included.
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
 | `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
 | `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
-| `display.hud` | string | `"centered"`, `"edges"`: with a wide aspect, the 2D HUD stays in the 4:3 frame or its corner and side pieces move out to the screen edges | `"centered"` | `RECOMP_DISPLAY_HUD` |
 | `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
@@ -206,18 +205,12 @@ and its title movie at 100:
 
 - 3D: centered; a clip box at the frame's edges reaches the target's edges.
 - 2D, not full width (HUD, menus, text): centered and scissored to the 4:3
-  frame, so pieces the title parks off-screen never show in the pads. With
-  `display.hud = "edges"` the batch's triangles are grouped into pieces
-  and a piece in the outer third moves to its side's new edge, unscaled;
-  a middle piece touching one that moved goes with it, and a menu,
-  story or loading screen keeps every piece centered: a frame with a
-  full-width picture, a piece over a third of the frame, or pieces that
-  together cover the frame, counted a frame's width to each side (half
-  keeps a screen that was one last frame, while its panels slide out).
-  Each piece counts as a share of its own target, since one frame draws
-  into the 640x480 frame and its smaller post buffers alike. A triangle
-  far off the frame (a sprite behind the eye, projected to thousands of
-  pixels) joins no piece, is left centered and does not count.
+  frame, so pieces the title parks off-screen never show in the pads. The
+  HUD keeps the title's 4:3 layout; there is no option to move or scale
+  it. A 2D batch's triangles say nothing of which HUD element they belong
+  to, so moving pieces by their position split groups the title draws as
+  one (BLiNX 2's item counter from its items, a dialogue face from its
+  box).
 - 2D, full width, sampling only render targets, nothing, or a guest
   texture no wider than a quarter of the frame (fades, post passes):
   stretched over the whole target. On a square target that is the ratio's
@@ -228,8 +221,7 @@ and its title movie at 100:
   `display.movie`.
 
 `RECOMP_TRACE=aspect` prints one `[aspect.program]` line per program,
-texture and placement, the target size per flip, and an
-`[aspect.layout]` line for each frame that becomes a layout screen.
+texture and placement, and the target size per flip.
 
 ### What the render and present keys do
 
@@ -545,7 +537,6 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_CONFIG` | path of the player's file, which replaces both `config.toml` files, or `none` for no file at all (the defaults included). `RECOMP_ENHANCE_CONFIG` is its earlier name, read with a deprecation line |
 | `RECOMP_RENDER_SCALE` | overrides `render.scale` |
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
-| `RECOMP_DISPLAY_HUD` | overrides `display.hud` |
 | `RECOMP_DISPLAY_MOVIE` | overrides `display.movie` |
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |

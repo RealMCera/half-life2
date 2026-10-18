@@ -1223,7 +1223,6 @@ struct nv2a_host_opts {
     /* display.aspect as a ratio, 0:0 = stock (4:3, no padding): 4:3-shaped
      * and square targets get hor+ padding (nv2a_host_pad). */
     unsigned aspect_w, aspect_h;
-    int      hud_mode;          /* enum nv2a_hud_mode: display.hud */
     int      movie_mode;        /* enum nv2a_movie_mode: display.movie */
 };
 
@@ -1303,14 +1302,11 @@ enum nv2a_aspect_place {
     NV2A_PLACE_CENTRE = 0,  /* 3D and 2D: columns 0..w centred, x + pad */
     NV2A_PLACE_STRETCH,     /* a full-width screen pass, or a movie under
                              * display.movie=fit: 0..w over the whole target */
-    NV2A_PLACE_LEFT,        /* display.hud=edges: a left HUD piece, x + 0 */
-    NV2A_PLACE_RIGHT,       /* display.hud=edges: a right HUD piece, x + 2 pad */
     NV2A_PLACE_COVER        /* display.movie=fill: 0..w over the whole width,
                              * y scaled the same about the centre (cropped) */
 };
 
-/* display.hud and display.movie (nv2a_host_opts). */
-enum nv2a_hud_mode { NV2A_HUD_CENTRED = 0, NV2A_HUD_EDGES };
+/* display.movie (nv2a_host_opts). */
 enum nv2a_movie_mode { NV2A_MOVIE_BLACK = 0, NV2A_MOVIE_FIT, NV2A_MOVIE_FILL };
 
 /* A 2D batch whose vertices span lo_x..hi_x (surface pixels) on a w-wide
@@ -1358,8 +1354,7 @@ static inline int nv2a_aspect_layer_w(float w)
  * target is centred, since stretching it would widen a 4:3 picture over
  * the padded frame. One over a guest texture is a movie or a still and
  * keeps its shape unless display.movie says otherwise. Everything else is
- * centred; HUD anchoring (LEFT/RIGHT) is per primitive group
- * (nv2a_aspect_anchor) and starts from CENTRE. */
+ * centred, the HUD included: it keeps its 4:3 layout. */
 static inline int nv2a_aspect_place(int two_d, int full_w, int guest_tex, int flat_rt,
                                     int movie_mode)
 {
@@ -1401,25 +1396,6 @@ static inline int nv2a_rt_stretch_read(uint32_t w, uint32_t h, uint32_t pad, flo
     return 1;
 }
 
-/* display.hud=edges: where a HUD piece spanning lo_x..hi_x of a w-wide
- * frame goes, by its centre: in the left third it moves out to the left
- * edge, in the right third to the right edge, else (centred text, the
- * middle of the screen) it stays. A piece wider than half the frame (a
- * banner, a panel across the screen) stays centred too: moving it would
- * pull it apart from what sits beside it. A piece the title parks
- * off-screen (x < 0 or x > w) moves with its side, so it stays off-screen. */
-static inline int nv2a_aspect_anchor(float lo_x, float hi_x, uint32_t w)
-{
-    float mid = (lo_x + hi_x) * 0.5f, third = (float)w / 3.0f;
-    if (hi_x - lo_x > (float)w * 0.5f)
-        return NV2A_PLACE_CENTRE;
-    if (mid < third)
-        return NV2A_PLACE_LEFT;
-    if (mid > 2.0f * third)
-        return NV2A_PLACE_RIGHT;
-    return NV2A_PLACE_CENTRE;
-}
-
 /* Per vertex program: whether its batches are 2D. Every BLiNX 2 batch is a
  * program (the XDK's fixed function is one too), so the program's own
  * output decides: every vertex on one screen layer (nv2a_aspect_layer_w)
@@ -1438,7 +1414,7 @@ struct nv2a_aspect_gate {
  * the gate says so. vf holds count vertices of nf4 float4 inputs each,
  * input k of a vertex going to register slot[k]; c is the constant file.
  * With xy (count entries) every vertex runs and its x, y land there
- * (display.hud=edges, nv2a_aspect_anchor_tris); without, up to 33 evenly
+ * (for nv2a_aspect_full_tris); without, up to 33 evenly
  * spaced. Returns 1 for a 2D batch with its x range in *lo, *hi (surface
  * pixels, as the epilogue leaves them), 0 for 3D or not checked. */
 /* Whether the next nv2a_aspect_scan through this gate runs the program, so
@@ -1458,45 +1434,6 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
  * frame has triangles that span the width. */
 int nv2a_aspect_full_tris(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
                           uint32_t w);
-
-/* display.hud=edges on a 2D triangle list (ntri triangles, idx into xy):
- * each triangle's placement into place[t]. Triangles whose boxes touch or
- * sit within a small gap on the same rows are one HUD piece (the two
- * halves of a quad, the glyphs of a string, a tiled panel), so a piece is
- * never torn; each piece goes where nv2a_aspect_anchor puts its x range.
- * A HUD cluster is often several batches (BLiNX 2's status panel: icon,
- * frame, gauge, label, lights), whose middle pieces can fall in the centre
- * third while their neighbours do not. So a piece that would stay centred
- * takes the side of a piece it touches (same rows, within the gap) that
- * was moved in the previous frame, if it lies on that side of the middle;
- * frame is the flip count, and a cluster joins up over a few frames.
- * Above NV2A_ASPECT_TRIS_MAX triangles the batch is one piece. Returns the
- * number of runs of consecutive triangles with one placement. */
-#define NV2A_ASPECT_TRIS_MAX 1024u
-
-/* display.hud=edges stays off on a 2D screen: a menu, a loading or story
- * screen laid out over a full-frame picture would come apart if its pieces
- * moved. A frame is one when it draws a full-width 2D batch over a guest
- * texture (the backends call this), a piece covering a third of the frame,
- * or pieces that add up to the whole frame, each counted as a share of its
- * own target (nv2a_aspect_anchor_tris sees those: BLiNX 2's loading screen
- * is dozens of batches of one 128-pixel tile each, some parked off-screen
- * to slide in); every piece of that frame from then on and of the next is
- * centred. A triangle off the layer on its own joins no piece and is
- * centred. */
-void nv2a_aspect_layout_note(uint64_t frame);
-/* RECOMP_TRACE=aspect: an [aspect.layout] line for each frame that
- * becomes a layout screen, with the rule (a full-width picture, or the
- * piece and the frame's cover so far). The backends set it. */
-void nv2a_aspect_trace_set(int on);
-/* A HUD piece's box b (x0, y0, x1, y1) on a w x h frame: its area within
- * the frame (*in) and within the frame widened by a frame to each side
- * (*ext), both over the frame's rows. Returns 0 for a box not on the
- * frame's layer -- wider than 4w, taller than 4h, or clear of the widened
- * frame -- which nv2a_aspect_anchor_tris leaves centred and uncounted. */
-int nv2a_aspect_piece_cover(const float b[4], uint32_t w, uint32_t h, float *in, float *ext);
-unsigned nv2a_aspect_anchor_tris(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
-                                 uint32_t w, uint32_t h, uint64_t frame, uint8_t *place);
 
 /* Adjust vertex constants filled with `pad` (nv2a_vp_consts_fill) to a
  * placement. CENTRE leaves them; with pad 0 every placement is stock. */

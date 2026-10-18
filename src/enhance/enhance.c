@@ -65,8 +65,7 @@ static const char *const s_pacing[] = { "spin", "sleep", NULL };
 static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 /* textures.font / textures.text: words, as the menu shows them. */
 static const char *const s_onoff[] = { "off", "on", NULL };
-/* Indexes match enum nv2a_hud_mode / nv2a_movie_mode. */
-static const char *const s_hud[] = { "centered", "edges", NULL };
+/* Indexes match enum nv2a_movie_mode. */
 static const char *const s_movie[] = { "black", "fit", "fill", NULL };
 
 int xbox_enhance_init(const char *root, const char *title)
@@ -128,8 +127,9 @@ int xbox_enhance_init(const char *root, const char *title)
     /* Hor+: "W:H" wider than 4:3 pads the 4:3-shaped and square targets (nv2a_host_pad)
      * and the title's frame sits centred in them; 4:3 is stock. The GPU
      * backends honour it; the CPU rasteriser draws 4:3 (it says so). The
-     * HUD and movie keys only matter with a wide aspect, but are read
-     * either way so they are never reported unused. */
+     * HUD keeps its 4:3 layout: there is no option for it. The movie key
+     * only matters with a wide aspect, but is read either way so it is
+     * never reported unused. */
     aspect = enhance_cfg_string("display.aspect", "4:3");
     if (strcmp(aspect, "4:3") != 0) {
         unsigned aw = 0, ah = 0;
@@ -145,7 +145,6 @@ int xbox_enhance_init(const char *root, const char *title)
             aspect = "4:3";
         }
     }
-    o.hud_mode = enhance_cfg_choice("display.hud", s_hud, NV2A_HUD_CENTRED);
     o.movie_mode = enhance_cfg_choice("display.movie", s_movie, NV2A_MOVIE_BLACK);
 
     /* The pack's kinds a player can turn off; read whether or not a pack
@@ -161,8 +160,8 @@ int xbox_enhance_init(const char *root, const char *title)
             " (display.aspect=%s)\n", o.render_scale, o.aniso,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], surface_txt, aspect);
     if (o.aspect_w)
-        fprintf(stderr, LOGP "display.aspect=%s display.hud=%s display.movie=%s\n", aspect,
-                s_hud[o.hud_mode], s_movie[o.movie_mode]);
+        fprintf(stderr, LOGP "display.aspect=%s display.movie=%s\n", aspect,
+                s_movie[o.movie_mode]);
     load_tex_pack(&o);
     enhance_input_init();
     /* No enhance_cfg_report_unused() here: the title reads its own keys

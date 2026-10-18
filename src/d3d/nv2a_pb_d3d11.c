@@ -198,7 +198,6 @@ static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
 static uint64_t s_draws_culled;
 static uint64_t s_draws_bconst;   /* drawn with a CONSTANT_* blend factor */
 static uint64_t s_draws_stretch;  /* hor+: batches placed off-centre (nv2a_aspect_place) */
-static uint64_t s_draws_runs;     /* hor+ edges: batches drawn in runs (nv2a_aspect_anchor_tris) */
 static uint64_t s_tex_uploads, s_tex_rehash, s_tex_changed;
 static uint64_t s_tex_mip_uploads;   /* uploads with more than one level */
 static uint64_t s_vb_native, s_vb_expanded;  /* vertex bytes copied / made */
@@ -2293,7 +2292,7 @@ static int      s_cb_ps_ok;
  * Metal's metal_on_draw does in one place). */
 struct aspect_batch {
     int two_d, full_w;
-    int place;          /* nv2a_aspect_place, before HUD anchoring */
+    int place;          /* nv2a_aspect_place */
     int guest_tex;      /* a stage samples a guest picture (nv2a_aspect_picture) */
 };
 
@@ -3022,22 +3021,22 @@ static int aspect_trace(void)
 {
     static int on = -1;
     if (on < 0)
-        nv2a_aspect_trace_set(on = recomp_env(RENV_ASPECT_TRACE) != NULL);
+        on = recomp_env(RENV_ASPECT_TRACE) != NULL;
     return on;
 }
 
 /* RECOMP_ASPECT_TRACE: each 2D batch's placement, once per program,
  * stage-0 texture and placement (Metal's aspect_log, same line). */
 static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
-                       float hi_x, const RenderTarget *rt, int place, unsigned runs)
+                       float hi_x, const RenderTarget *rt, int place)
 {
-    static const char *const names[] = { "centre", "stretch", "left", "right", "cover" };
+    static const char *const names[] = { "centre", "stretch", "cover" };
     enum { SET = 4096 };
     static uint64_t set[SET];
     static unsigned used;
     const Stage *t0 = &s_stage[0];
     uint64_t key = ((uint64_t)hash << 32 | (t0->mode ? t0->offset : 0)) * 0x9E3779B97F4A7C15ull
-                   + (uint64_t)place * 2u + (runs > 1) + 1u;
+                   + (uint64_t)place + 1u;
     unsigned h = (unsigned)(key >> 52) & (SET - 1u);
     while (set[h] && set[h] != key)
         h = (h + 1u) & (SET - 1u);
@@ -3046,11 +3045,10 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
     set[h] = key;
     used++;
     fprintf(stderr, "[aspect.program] %08X flip %llu: %u vertices %u tris x %g..%g on %ux%u"
-            " pad %u, stage 0 %s 0x%08X fmt %X %ux%u -> %s%s (%u runs)\n", hash,
+            " pad %u, stage 0 %s 0x%08X fmt %X %ux%u -> %s\n", hash,
             (unsigned long long)s_presents, count, ntri, lo_x, hi_x, rt->w, rt->h, rt->pad,
             !t0->mode || t0->mode == 4 ? "none" : s_stage_rt[0] ? "rt" : "tex", t0->offset,
-            t0->color, t0->width, t0->height, names[place],
-            runs > 1 ? " split" : "", runs);
+            t0->color, t0->width, t0->height, names[place]);
 }
 
 /* The pixels->NDC mapping at b2 and the scissor for one placement
@@ -3097,17 +3095,14 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
      * largest batch so far rather than sized to NV_MAX_INDICES. */
     static uint32_t *idx;
     static uint32_t idx_cap;
-    static float (*hxy)[2];        /* hor+: a 2D batch's vertex x, y (edges, full width) */
+    static float (*hxy)[2];        /* hor+: a 2D batch's vertex x, y (full width) */
     static uint32_t hxy_cap;
     static float *hvf;             /* hor+: a program batch's inputs, for the scan */
     static size_t hvf_cap;
-    static uint8_t *tplace;        /* hor+ edges: each triangle's placement */
-    static uint32_t tplace_cap;
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     struct aspect_batch hp = {0, 0, NV2A_PLACE_CENTRE, 0};
-    int have_x = 0, tris = 0, edges = 0;
-    unsigned runs = 1;             /* hor+ edges: draws of one placement each */
+    int have_x = 0, tris = 0;
     float lo_x = 0, hi_x = 0;      /* hor+: a 2D batch's x range, surface pixels */
     D3D11_PRIMITIVE_TOPOLOGY topo;
     ID3D11Buffer *vbs[NV2A_VS_MAX_INPUTS];
@@ -3274,9 +3269,6 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             tris = 0;
         }
     }
-    /* Edges anchoring is for the frame's HUD; a square target (a
-     * reflection or glow map) keeps every batch where it is. */
-    edges = tris && rt->w != rt->h && nv2a_host_opts()->hud_mode == NV2A_HUD_EDGES;
     if (rt->pad && !d->program && (vs->inputs & 1u)) {
         for (k = 0; k < count; k++) {
             float o[4];
@@ -3308,11 +3300,11 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                     vtx_input(d, v, (unsigned)slot[i], lo + k, hvf + ((size_t)k * nf4 + i) * 4u);
             hp.two_d = have_x = nv2a_aspect_scan(&vs->hp, (const uint32_t (*)[4])v->prog,
                                                  v->start, (float (*)[4])(uintptr_t)v->c,
-                                                 hvf, nf4, slot, count, edges ? hxy : NULL,
+                                                 hvf, nf4, slot, count, NULL,
                                                  &lo_x, &hi_x);
             /* Full-width bounds: every vertex, for the per-triangle test
              * (a 2D program is scanned every batch, so the gate passes). */
-            if (have_x && tris && !edges && nv2a_aspect_full_width(lo_x, hi_x, rt->w))
+            if (have_x && tris && nv2a_aspect_full_width(lo_x, hi_x, rt->w))
                 nv2a_aspect_scan(&vs->hp, (const uint32_t (*)[4])v->prog, v->start,
                                  (float (*)[4])(uintptr_t)v->c, hvf, nf4, slot, count, hxy,
                                  &lo_x, &hi_x);
@@ -3432,46 +3424,12 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 s_sc.ps = ps;
             }
         }
-        /* display.hud=edges: a centred 2D batch's pieces each to their
-         * side; one placement for the whole batch is the common case (a
-         * piece a batch), else the batch is drawn in runs. */
-        if (edges && hp.two_d && hp.full_w && hp.guest_tex)
-            nv2a_aspect_layout_note(s_presents);
-        if (hp.place == NV2A_PLACE_CENTRE && hp.two_d && edges && !hp.full_w) {
-            uint32_t ntri = nidx / 3u;
-            if (ntri > tplace_cap) {
-                uint8_t *grown = (uint8_t *)realloc(tplace, ntri);
-                if (grown) {
-                    tplace = grown;
-                    tplace_cap = ntri;
-                }
-            }
-            if (ntri <= tplace_cap) {
-                runs = nv2a_aspect_anchor_tris((const float (*)[2])hxy, idx, ntri, rt->w,
-                                               rt->h, s_presents, tplace);
-                hp.place = tplace[0];
-                if (runs > 1)
-                    s_draws_runs++;
-            }
-        }
         if (hp.place != NV2A_PLACE_CENTRE)
             s_draws_stretch++;
         if (hp.two_d && rt->pad && aspect_trace())
-            aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place, runs);
-        if (runs <= 1)
-            set_vp(v, g, rt, hp.place, hp.two_d, cb);
-        if (runs > 1) {
-            /* hor+ edges: each run of triangles with one placement, in
-             * order, with its own mapping and scissor. */
-            uint32_t t0 = 0, t1, ntri = nidx / 3u;
-            while (t0 < ntri) {
-                for (t1 = t0 + 1; t1 < ntri && tplace[t1] == tplace[t0]; t1++)
-                    ;
-                set_vp(v, g, rt, tplace[t0], 1, cb);
-                ID3D11DeviceContext_DrawIndexed(s_ctx, (t1 - t0) * 3u, t0 * 3u, 0);
-                t0 = t1;
-            }
-        } else if (px_on()) {
+            aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place);
+        set_vp(v, g, rt, hp.place, hp.two_d, cb);
+        if (px_on()) {
             uint32_t before[4];
             int n;
             for (n = 0; n < s_px_n; n++)
@@ -3680,14 +3638,12 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_occ.sync_us - p_occ_us),
             s_drawn ? s_drawn->offset : 0, surface_offset);
     if (s_drawn && s_drawn->pad && aspect_trace()) {
-        static uint64_t p_stretch, p_runs;
+        static uint64_t p_stretch;
         fprintf(stderr, LOGP "flip %llu hor+: target %ux%u pad %u (%ux%u host),"
-                " %llu batches off-centre, %llu split\n", (unsigned long long)s_presents,
+                " %llu batches off-centre\n", (unsigned long long)s_presents,
                 s_drawn->w, s_drawn->h, s_drawn->pad, s_drawn->hw, s_drawn->hh,
-                (unsigned long long)(s_draws_stretch - p_stretch),
-                (unsigned long long)(s_draws_runs - p_runs));
+                (unsigned long long)(s_draws_stretch - p_stretch));
         p_stretch = s_draws_stretch;
-        p_runs = s_draws_runs;
     }
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
     p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_cull = s_draws_culled; p_clears = s_clears;
