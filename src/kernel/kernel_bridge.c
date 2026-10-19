@@ -35,6 +35,7 @@
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "kernel_user_apc.h"
 #include <stdio.h>
 #ifndef _WIN32
 #include <pthread.h>
@@ -2103,6 +2104,55 @@ static void bridge_KeSetEvent(void)
         g_eax = 0;
 }
 
+/* A user-mode alertable wait on a thread with deferred file I/O APCs (see
+ * bridge_complete_file_io) runs them and returns STATUS_USER_APC without
+ * blocking, as the kernel does; XAPI's SleepEx and WaitFor...Ex turn that into
+ * WAIT_IO_COMPLETION. Only the waiting thread's own requests fill the queue
+ * (empty under RECOMP_FILE_APC_DEFER=0), so no APC can arrive during a wait
+ * that started empty.
+ *
+ * The object waits test their objects first, as KeWaitFor... does: with APCs
+ * pending they wait with a zero timeout (bridge_user_apc_timeout) and deliver
+ * only when that times out (bridge_user_apc_finish). A signalled object must
+ * win: a title that waits alertably for its read event would otherwise take
+ * STATUS_USER_APC and loop on every wait while the event sat signalled. */
+static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
+                            uint32_t iostatus);
+
+static int bridge_user_apc_pending(uint32_t wait_mode, uint32_t alertable)
+{
+    return alertable && wait_mode == 1 /* UserMode */ && kuapc_pending();
+}
+
+/* The timeout an object wait uses: zero while APCs are pending. */
+static PLARGE_INTEGER bridge_user_apc_timeout(int pending, uint32_t timeout_va,
+                                              LARGE_INTEGER *zero)
+{
+    if (!pending)
+        return (PLARGE_INTEGER)XBOX_TO_NATIVE(timeout_va);
+    zero->QuadPart = 0;
+    return zero;
+}
+
+static void bridge_user_apc_finish(int pending)
+{
+    if (!pending || g_eax != 0x00000102u)    /* STATUS_TIMEOUT */
+        return;
+    kuapc_drain(deliver_one_apc);
+    g_eax = 0x000000C0u;                     /* STATUS_USER_APC */
+}
+
+/* KeDelayExecutionThread has no object to test, so it delivers at once.
+ * Returns 1 when it did, with g_eax set. */
+static int bridge_user_apc_wait(uint32_t wait_mode, uint32_t alertable)
+{
+    if (!bridge_user_apc_pending(wait_mode, alertable))
+        return 0;
+    kuapc_drain(deliver_one_apc);
+    g_eax = 0x000000C0u;                     /* STATUS_USER_APC */
+    return 1;
+}
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
@@ -2112,6 +2162,9 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+    int apc = bridge_user_apc_pending(wait_mode, alertable);
+    LARGE_INTEGER zero;
+    PLARGE_INTEGER timeout = bridge_user_apc_timeout(apc, timeout_ptr, &zero);
 
     {   /* An event the title built itself (see ke_guest_event). Its
          * SignalState in guest memory is the truth -- XDK code resets it by
@@ -2120,10 +2173,10 @@ static void bridge_KeWaitForSingleObject(void)
         HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-                ge, wait_reason, wait_mode,
-                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+                ge, wait_reason, wait_mode, (BOOLEAN)alertable, timeout);
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
+            bridge_user_apc_finish(apc);
             return;
         }
     }
@@ -2135,8 +2188,8 @@ static void bridge_KeWaitForSingleObject(void)
         h = XBOX_TO_NATIVE(object);
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        h, wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        h, wait_reason, wait_mode, (BOOLEAN)alertable, timeout);
+    bridge_user_apc_finish(apc);
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2205,6 +2258,9 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
+    int apc = bridge_user_apc_pending(wait_mode, alertable);
+    LARGE_INTEGER zero;
+    PLARGE_INTEGER timeout = bridge_user_apc_timeout(apc, timeout_ptr, &zero);
 
     static int logged = 0;
     if (logged++ < 20) {
@@ -2215,8 +2271,8 @@ static void bridge_NtWaitForSingleObjectEx(void)
     }
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
-        handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
-        XBOX_TO_NATIVE(timeout_ptr));
+        handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable, timeout);
+    bridge_user_apc_finish(apc);
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -2263,14 +2319,20 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     uint32_t alertable   = STACK_ARG(4);
     uint32_t timeout_ptr = STACK_ARG(5);
 
-    (void)wait_mode;
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
+    int apc;
+    LARGE_INTEGER zero;
+    PLARGE_INTEGER timeout;
 
+    /* A bad call fails as such even with APCs pending, as the kernel's
+     * argument checks come before the wait. */
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
         return;
     }
+    apc = bridge_user_apc_pending(wait_mode, alertable);
+    timeout = bridge_user_apc_timeout(apc, timeout_ptr, &zero);
     for (i = 0; i < count; i++)
         handles[i] = bridge_resolve_handle(BRIDGE_MEM32(handles_va + i * 4));
 
@@ -2287,8 +2349,8 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     }
 
     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
-        count, handles, wait_type, (BOOLEAN)alertable,
-        XBOX_TO_NATIVE(timeout_ptr));
+        count, handles, wait_type, (BOOLEAN)alertable, timeout);
+    bridge_user_apc_finish(apc);
 }
 
 /*
@@ -2366,6 +2428,8 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
 
+    if (bridge_user_apc_wait(wait_mode, alertable))
+        return;
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -4485,12 +4549,19 @@ static void bridge_NtOpenFile(void)
  * cache-partition setup does exactly that, gives up after its 5-second SleepEx,
  * and asserts "setup for new cache file failed (#0)".
  *
- * ponytail: the APC runs inline here rather than at the next alertable wait.
- * The data really is ready by then, so the observable result matches; a title
- * that depends on the APC *not* having run yet would notice. A per-thread
- * deferred queue drained at alertable waits was tried for Halo's map streamer
- * and made no difference (it still issues one 14 KB batch and stops), so it was
- * dropped rather than risk changing this shared path for the other titles.
+ * The APC is queued on the issuing thread (kernel_user_apc.c) and runs at
+ * that thread's next alertable user-mode wait (bridge_user_apc_pending), as the
+ * kernel does. A title can tell the difference. Jet Set Radio Future's CRI
+ * file server (sub_00140BA0) marks a read busy, issues ReadFileEx, and
+ * accounts the bytes only when its own SleepEx(0, TRUE) sees the completion
+ * clear the flag. Run inline, the flag was clear before the server looked,
+ * the accounting never ran, and the stream stopped after its first block.
+ *
+ * RECOMP_FILE_APC_DEFER=0 restores the old inline delivery, as an escape
+ * hatch. Inline was the shared default until JSRF. A deferred queue had been
+ * tried for Halo's map streamer and made no difference (it still issued one
+ * 14 KB batch and stopped). That try predates the deliver_one_apc stack fix
+ * below, which only a deferred APC exposes.
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 
@@ -4505,13 +4576,28 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
     if (!fn) fn = recomp_lookup_manual(apc_routine);
     if (!fn) fn = recomp_lookup_kernel(apc_routine);
     if (fn) {
-        /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG) */
+        /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG), NTAPI:
+         * the routine pops its own arguments, and so does the kernel dispatch
+         * for NtUserIoApcDispatcher (12 bytes). Popping 12 more here left
+         * g_esp 12 bytes high; a caller that restores esp with `leave` hid it,
+         * but XAPI's SleepEx pops esi before its `leave`, so a deferred APC
+         * drained there handed JSRF's CRI file server a wrong esi. Restoring
+         * the saved esp is right for a stdcall and a cdecl routine alike. */
+        uint32_t esp0 = g_esp;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-        fn();
-        g_esp += 12;
+        {
+            /* Guest code on its own thread, as in bridge_NtUserIoApcDispatcher.
+             * A deferred APC drains inside a wait bridge, which has let the
+             * guest CPU go; the inline path still holds it, and the lock
+             * nests. */
+            int took = xbox_GuestCpuEnterCallback();
+            fn();
+            xbox_GuestCpuLeaveCallback(took);
+        }
+        g_esp = esp0;
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
@@ -4523,8 +4609,8 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
     }
 }
 
-/* Per-thread pending-APC ring. An APC is delivered on the thread that issued
- * the request, which is also the thread that waits, so thread-local is right. */
+/* The event is set at once either way: it is the request's completion, not
+ * an APC. */
 static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
                                     uint32_t apc_context, uint32_t iostatus)
 {
@@ -4533,7 +4619,17 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         if (ev) SetEvent(ev);
     }
     if (apc_routine) {
-        deliver_one_apc(apc_routine, apc_context, iostatus);
+        static int defer = -1;
+        if (defer < 0)
+            defer = recomp_env_int(RENV_FILE_APC_DEFER, 1) ? 1 : 0;
+        /* A full queue falls back to inline rather than losing the APC.
+         * The queue is the host thread's, which is the issuing guest thread
+         * except where a worker runs on its creator (RECOMP_WORKERS=inline, or
+         * no worker stack left; see bridge_run_thread_inline): there the
+         * worker's APCs land on the creator's queue and run at the creator's
+         * next alertable wait, or the worker's own if it makes one first. */
+        if (!defer || !kuapc_queue(apc_routine, apc_context, iostatus))
+            deliver_one_apc(apc_routine, apc_context, iostatus);
     }
 }
 
@@ -5897,11 +5993,16 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t guest_events[BRIDGE_MAXIMUM_WAIT_OBJECTS] = {0};
     int event_types[BRIDGE_MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
+    int apc;
+    LARGE_INTEGER zero;
+    PLARGE_INTEGER timeout;
 
     if (count == 0) {
         g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
         return;
     }
+    apc = bridge_user_apc_pending(STACK_ARG(4), alertable);
+    timeout = bridge_user_apc_timeout(apc, timeout_va, &zero);
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
     for (i = 0; i < count; i++) {
@@ -5919,8 +6020,7 @@ static void bridge_KeWaitForMultipleObjects(void)
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
         STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
-        XBOX_TO_NATIVE(STACK_ARG(7)));
+        (BOOLEAN)alertable, timeout, XBOX_TO_NATIVE(STACK_ARG(7)));
 
     /* Only a successful wait consumes synchronization events. WaitAny's
      * result selects one member; WaitAll consumes every signalled member. */
@@ -5930,6 +6030,7 @@ static void bridge_KeWaitForMultipleObjects(void)
              (wait_type != 0 && g_eax < count && g_eax == i)))
             BRIDGE_MEM32(guest_events[i] + 4) = 0;
     }
+    bridge_user_apc_finish(apc);
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
@@ -7705,6 +7806,12 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
         if (!g_ke_shadow[i].in_use) {
             h = CreateEventA(NULL, *type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
             if (h) {
+#ifndef _WIN32
+                /* XDK code resets these by writing SignalState, often right
+                 * after its own wait ends; a set must still release every
+                 * thread that was waiting (see w32_event_release_on_set). */
+                w32_event_release_on_set(h);
+#endif
                 g_ke_shadow[i].in_use      = 2;
                 g_ke_shadow[i].guest_va    = guest_va;
                 g_ke_shadow[i].host_handle = h;

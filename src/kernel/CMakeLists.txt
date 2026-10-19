@@ -12,6 +12,7 @@ set(KERNEL_SOURCES
     kernel_file.c
     kernel_missing.c
     kernel_thread.c
+    kernel_user_apc.c
     kernel_sync.c
     kernel_hal.c
     kernel_prof.c

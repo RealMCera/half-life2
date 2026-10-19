@@ -270,6 +270,8 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    unsigned        set_gen;        /* SetEvent/PulseEvent count */
+    int             release_on_set; /* see w32_event_release_on_set */
 
     /* semaphore */
     long            sem_count;
@@ -655,11 +657,15 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    unsigned gen0 = o->set_gen;
 
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+            ready = o->signaled ||
+                    (o->release_on_set && o->manual_reset && o->set_gen != gen0);
+            break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
@@ -725,12 +731,45 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, D
     return WaitForMultipleObjectsEx(count, handles, waitAll, ms, FALSE);
 }
 
+/* The set generation of a manual-reset event marked by
+ * w32_event_release_on_set, or 0 when h is anything else. */
+static int marked_event_gen(HANDLE h, unsigned *gen)
+{
+    w32_object *o = (w32_object *)h;
+    int marked;
+    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return 0;
+    if (o->kind != K_EVENT) return 0;
+    pthread_mutex_lock(&o->lock);
+    marked = o->release_on_set && o->manual_reset;
+    *gen = o->set_gen;
+    pthread_mutex_unlock(&o->lock);
+    return marked;
+}
+
+/* One poll of handle i: ready now, or (marked events) set at any point since
+ * the wait began. The poll runs every millisecond, and a set followed by a
+ * reset inside one gap would otherwise be lost, as wait_single's generation
+ * check prevents for a single-object wait. */
+static int multi_ready(HANDLE h, int marked, unsigned gen0)
+{
+    unsigned gen;
+    if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) return 1;
+    return marked && marked_event_gen(h, &gen) && gen != gen0;
+}
+
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable)
 {
     struct timespec ts;
     int timed = (ms != INFINITE);
+    /* MAXIMUM_WAIT_OBJECTS; handles past it just go without the snapshot. */
+    unsigned gen0[64];
+    int marked[64];
+    DWORD snap = count < 64 ? count : 64;
     if (timed) deadline_from_ms(ms, &ts);
+    for (DWORD i = 0; i < snap; i++)
+        marked[i] = marked_event_gen(handles[i], &gen0[i]);
 
     for (;;) {
         if (alertable && drain_apcs() > 0)
@@ -739,11 +778,13 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
         if (waitAll) {
             DWORD got = 0;
             for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
+                if (multi_ready(handles[i], i < snap && marked[i],
+                                i < snap ? gen0[i] : 0)) got++;
             if (got == count) return WAIT_OBJECT_0;
         } else {
             for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
+                if (multi_ready(handles[i], i < snap && marked[i],
+                                i < snap ? gen0[i] : 0))
                     return WAIT_OBJECT_0 + i;
         }
 
@@ -782,6 +823,7 @@ BOOL SetEvent(HANDLE h)
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
+    o->set_gen++;
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
@@ -797,12 +839,32 @@ BOOL ResetEvent(HANDLE h)
     return TRUE;
 }
 
+/* Win32 and the NT kernel release every waiter of a manual-reset event when
+ * it is set, there and then. Here a waiter only wakes from the condition
+ * variable later and re-reads `signaled`, so a reset in between -- by the
+ * first waiter to run, typically -- sends the others back to sleep with the
+ * set lost. XDK D3D's BlockUntilVerticalBlank does exactly that: it writes 0
+ * to the vblank event's SignalState before each wait, so of two threads
+ * waiting on vblank one runs every frame and the other never does (JSRF's
+ * CRI file server thread). Marked events count a set that happened during the
+ * wait as satisfying it, as the kernel does. Opt-in per event so the shared
+ * shim's behaviour changes only where the kernel layer asks for it. */
+void w32_event_release_on_set(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o || o->kind != K_EVENT) return;
+    pthread_mutex_lock(&o->lock);
+    o->release_on_set = 1;
+    pthread_mutex_unlock(&o->lock);
+}
+
 BOOL PulseEvent(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
+    o->set_gen++;
     pthread_cond_broadcast(&o->cond);
     o->signaled = 0;
     pthread_mutex_unlock(&o->lock);

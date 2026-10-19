@@ -144,6 +144,9 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 BOOL   SetEvent(HANDLE h);
 BOOL   ResetEvent(HANDLE h);
 BOOL   PulseEvent(HANDLE h);
+/* Manual-reset waits also end on a SetEvent made during the wait, even if
+ * the event was reset again before the waiter ran (NT semantics). */
+void   w32_event_release_on_set(HANDLE h);
 
 /* ---- Semaphores ------------------------------------------------------- */
 HANDLE CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCSTR name);
