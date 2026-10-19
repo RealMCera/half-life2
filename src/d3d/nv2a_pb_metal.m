@@ -107,7 +107,8 @@ extern void xbox_FramebufferWindowPresentPixels(const void *px, uint32_t w, uint
  * this backend adopts so the slot textures and the present pass share them,
  * and the back slot a frame is blitted into. */
 extern int   xbox_FramebufferWindowMetal(void **device, void **queue);
-extern void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h);
+extern void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h, unsigned n,
+                                               uint32_t pad);
 extern void  xbox_FramebufferWindowPublishTexture(void);
 static int s_layer;                  /* the window takes GPU slot textures */
 static void guard_open(void);        /* metal_fb_guard: open the pages before we touch them */
@@ -3232,7 +3233,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                  * the two on the GPU). Published once committed, so the main
                  * thread's pass that shows it is committed after it. */
                 t = prof_t();
-                slot = (id<MTLTexture>)xbox_FramebufferWindowBackTexture(hcw, hch);
+                slot = (id<MTLTexture>)xbox_FramebufferWindowBackTexture(hcw, hch, rt->n,
+                                                                         rt->pad);
                 if (slot) {
                     id<MTLBlitCommandEncoder> b;
                     ensure_cmd();

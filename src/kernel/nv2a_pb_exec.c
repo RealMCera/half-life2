@@ -6509,6 +6509,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[ENHANCE] display.aspect=%u:%u ignored: the CPU rasteriser"
                     " draws the 4:3 frame into guest memory\n",
                     nv2a_host_opts()->aspect_w, nv2a_host_opts()->aspect_h);
+        /* display.overscan is a source rectangle on a GPU backend's present
+         * blit; the CPU path's SDL present has none (a TASKS follow-up). */
+        if (nv2a_host_opts()->overscan
+                && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
+            fprintf(stderr, "[ENHANCE] display.overscan=%u ignored by the CPU rasteriser:"
+                    " it presents the whole frame\n", nv2a_host_opts()->overscan);
         /* A texture pack is a host-side replacement at upload; the CPU
          * rasteriser samples guest memory and has no upload to replace. */
         if (nv2a_tex_pack_count()

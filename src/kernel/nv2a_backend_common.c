@@ -1122,6 +1122,41 @@ int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t d
     return 0;
 }
 
+void nv2a_present_crop(uint32_t fw, uint32_t fh, uint32_t tw, uint32_t th, unsigned n,
+                       unsigned pad, unsigned ov, int filter, struct nv2a_crop *c)
+{
+    float cx, cy;
+
+    if (n < 1)
+        n = 1;
+    c->x = c->y = 0.0f;
+    c->w = (float)fw;
+    c->h = (float)fh;
+    c->u_off = c->v_off = 0.0f;
+    c->u_scale = tw ? (float)fw / (float)tw : 1.0f;
+    c->v_scale = th ? (float)fh / (float)th : 1.0f;
+    c->fit_w = fw;
+    c->fit_h = fh;
+    if (!ov || pad || !fw || !fh || !tw || !th || fw / n <= 2u * ov)
+        return;
+    cx = (float)(ov * n);
+    cy = cx * (float)fh / (float)fw;
+    if (filter == NV2A_PRESENT_INTEGER)
+        cy = (float)(uint32_t)(cy + 0.5f);     /* positive: rounds */
+    c->x = cx;
+    c->y = cy;
+    c->w = (float)fw - 2.0f * cx;
+    c->h = (float)fh - 2.0f * cy;
+    c->u_off = cx / (float)tw;
+    c->v_off = cy / (float)th;
+    c->u_scale = c->w / (float)tw;
+    c->v_scale = c->h / (float)th;
+    if (filter == NV2A_PRESENT_INTEGER) {
+        c->fit_w = fw - 2u * ov * n;
+        c->fit_h = fh - 2u * (uint32_t)cy;
+    }
+}
+
 void nv2a_upscale_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t w, uint32_t h,
                             unsigned n, uint8_t *dst, uint32_t dst_pitch)
 {

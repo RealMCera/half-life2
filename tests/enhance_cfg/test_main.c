@@ -1040,6 +1040,60 @@ static void test_enhance_init(void)
         CHECK(strstr(out, "display.aspect=16:9x is not a W:H ratio") != NULL);
     }
 
+    /* display.overscan: 0 by default with the summary line as before, the
+     * file and the variable, 0..64 with a clamp line, a non-number reported
+     * with 0 used, refused under hor+ but not when the aspect fell back. */
+    recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
+    {
+        const char *out;
+        capture_begin();
+        recomp_env_set(RENV_CONFIG, "none");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 0);
+        out = capture_end();
+        CHECK(strstr(out, " (display.aspect=4:3)\n") != NULL);
+        CHECK(strstr(out, "overscan") == NULL);
+        write_file("ecfg_overscan.toml", "[display]\noverscan = 9\n");
+        recomp_env_set(RENV_CONFIG, "ecfg_overscan.toml");
+        capture_begin();
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 9);
+        out = capture_end();
+        CHECK(strstr(out, " (display.aspect=4:3 display.overscan=9)\n") != NULL);
+        recomp_env_set(RENV_DISPLAY_OVERSCAN, "12");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 12);
+        capture_begin();
+        recomp_env_set(RENV_DISPLAY_OVERSCAN, "65");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 64);
+        out = capture_end();
+        CHECK(strstr(out, "display.overscan=65 out of range 0..64; using 64") != NULL);
+        CHECK(strstr(out, " (display.aspect=4:3 display.overscan=64)\n") != NULL);
+        capture_begin();
+        recomp_env_set(RENV_DISPLAY_OVERSCAN, "-1");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 0);
+        out = capture_end();
+        CHECK(strstr(out, "display.overscan=-1 out of range 0..64; using 0") != NULL);
+        CHECK(strstr(out, " (display.aspect=4:3)\n") != NULL);
+        capture_begin();
+        recomp_env_set(RENV_DISPLAY_OVERSCAN, "wide");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 9);   /* the file answers */
+        out = capture_end();
+        CHECK(strstr(out, "RECOMP_DISPLAY_OVERSCAN") != NULL);
+        recomp_env_set(RENV_DISPLAY_OVERSCAN, "9");
+        capture_begin();
+        recomp_env_set(RENV_DISPLAY_ASPECT, "16:9");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 0 && o->aspect_w == 16);
+        out = capture_end();
+        CHECK(strstr(out, "display.overscan=9 ignored with display.aspect=16:9:") != NULL);
+        CHECK(strstr(out, " (display.aspect=16:9)\n") != NULL);
+        capture_begin();
+        recomp_env_set(RENV_DISPLAY_ASPECT, "16:9x");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->overscan == 9 && o->aspect_w == 0);
+        out = capture_end();
+        CHECK(strstr(out, "ignored with") == NULL);
+        recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
+        recomp_env_set(RENV_DISPLAY_OVERSCAN, NULL);
+        recomp_env_set(RENV_CONFIG, NULL);
+    }
+
     /* There is no HUD option: the HUD keeps its 4:3 layout. A config.toml
      * from a build that had display.hud (the user's Deck: hud = "edges")
      * loads, its other keys apply, and the stale key gets the generic

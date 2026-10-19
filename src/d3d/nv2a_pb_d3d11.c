@@ -3670,12 +3670,14 @@ static void flip_log(uint32_t surface_offset)
  * full-screen triangle. */
 static const char s_blit_vs_src[] =
     "struct VO { float4 p : SV_Position; float2 t : TEXCOORD0; };\n"
+    /* xy: the share of the target shown; zw: where it starts, the
+     * display.overscan crop's offset (0 without one) */
     "cbuffer C : register(b0) { float4 uv_scale; };\n"
     "VO main(uint i : SV_VertexID) {\n"
     "    VO o;\n"
     "    o.t = float2((i << 1) & 2, i & 2);\n"
     "    o.p = float4(o.t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
-    "    o.t *= uv_scale.xy;\n"
+    "    o.t = o.t * uv_scale.xy + uv_scale.zw;\n"
     "    return o;\n"
     "}\n";
 static const char s_blit_ps_src[] =
@@ -3817,14 +3819,17 @@ static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
 }
 
 /* rt's present extent into the back buffer at nv2a_present_rect's place,
- * filtered. */
-static void present_blit(RenderTarget *rt, int filter)
+ * filtered, less display.overscan's edges (nv2a_present_crop). Under
+ * present.surface=internal the back buffer is the frame: the crop fills it,
+ * point-sampled for integer as Metal's internal present is. */
+static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int internal)
 {
     static const float black[4] = {0, 0, 0, 1};
     ID3D11ShaderResourceView *none = NULL;
     struct nv2a_rect r;
     D3D11_VIEWPORT vp;
     UINT cw, ch, hcw, hch;
+    struct nv2a_crop c;
     int whole;
 
     if (!s_back || !blit_init())
@@ -3839,10 +3844,17 @@ static void present_blit(RenderTarget *rt, int filter)
     /* hor+: the pads go to the screen with the frame (Metal's present) */
     hcw = (cw + 2u * rt->pad) * rt->n;
     hch = ch * rt->n;
-    whole = nv2a_present_rect(hcw, hch, s_back_w, s_back_h, filter, &r);
+    nv2a_present_crop(hcw, hch, rt->hw, rt->hh, rt->n, rt->pad, overscan, filter, &c);
+    whole = nv2a_present_rect(c.fit_w, c.fit_h, s_back_w, s_back_h, filter, &r);
+    if (overscan && internal) {
+        r.x = r.y = 0;
+        r.w = (int32_t)s_back_w;
+        r.h = (int32_t)s_back_h;
+        whole = 1;
+    }
     {
         D3D11_MAPPED_SUBRESOURCE m;
-        float uv[4] = {(float)hcw / (float)rt->hw, (float)hch / (float)rt->hh, 0, 0};
+        float uv[4] = {c.u_scale, c.v_scale, c.u_off, c.v_off};
         if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
                                            D3D11_MAP_WRITE_DISCARD, 0, &m)))
             return;
@@ -3910,7 +3922,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
          * rest, the right pad cut off; it goes whole or through the blit. */
         int stock = nv2a_host_render_scale() == 1
                  && eo->present_filter == NV2A_PRESENT_NEAREST
-                 && !eo->fullscreen && !s_drawn->pad
+                 && !eo->fullscreen && !s_drawn->pad && !eo->overscan
                  && s_back_w == s_made_w && s_back_h == s_made_h;
         UINT cw, ch;
         int same;
@@ -3925,14 +3937,16 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         /* Under present.surface=internal nothing is scaled here, so no
          * filter has anything to do: the frame is copied as it is, at
          * scale > 1 too (the compositor gets the scaled frame whole). */
-        int blit = !stock && !(same && (eo->present_filter != NV2A_PRESENT_LINEAR || internal));
+        /* A display.overscan crop always blits: a copy shows the edges. */
+        int blit = !stock && (eo->overscan
+                || !(same && (eo->present_filter != NV2A_PRESENT_LINEAR || internal)));
         if (!s_back) {
             /* A failed ResizeBuffers/GetBuffer left no back buffer. */
             static int said_nb;
             if (!said_nb++)
                 fprintf(stderr, LOGP "no back buffer (resize failed): frame not shown\n");
         } else if (blit) {
-            present_blit(s_drawn, eo->present_filter);
+            present_blit(s_drawn, eo->present_filter, eo->overscan, internal);
             s_dump_rt = 1;
         } else if (same) {
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,

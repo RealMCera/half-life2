@@ -17,6 +17,8 @@
 
 #define LOGP "[ENHANCE] "
 #define SCALE_MAX 4
+/* display.overscan: 10% of a 640-wide frame a side, past any TV's overscan */
+#define OVERSCAN_MAX 64
 
 static int path_is_absolute(const char *p)
 {
@@ -73,9 +75,9 @@ int xbox_enhance_init(const char *root, const char *title)
 {
     struct nv2a_host_opts o;
     const char *aspect;
-    long long scale, aniso;
+    long long scale, aniso, overscan;
     int rc, pacing, surface;
-    char surface_txt[48];
+    char surface_txt[48], overscan_txt[32] = "";
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
@@ -147,6 +149,25 @@ int xbox_enhance_init(const char *root, const char *title)
         }
     }
     o.movie_mode = enhance_cfg_choice("display.movie", s_movie, NV2A_MOVIE_BLACK);
+    /* A TV's overscan: guest px cut from each side edge at present, the
+     * top and bottom in proportion (nv2a_present_crop), for a title that
+     * left a border its CRT hid. Under hor+ the 4:3 edges sit inside the
+     * padded frame, where no source rectangle can cut them: refused. */
+    overscan = enhance_cfg_int("display.overscan", 0);
+    if (overscan < 0 || overscan > OVERSCAN_MAX) {
+        long long c = overscan < 0 ? 0 : OVERSCAN_MAX;
+        fprintf(stderr, LOGP "display.overscan=%lld out of range 0..%d; using %lld\n",
+                overscan, OVERSCAN_MAX, c);
+        overscan = c;
+    }
+    if (overscan && o.aspect_w) {
+        fprintf(stderr, LOGP "display.overscan=%lld ignored with display.aspect=%s:"
+                " the 4:3 edges are inside the padded frame; using 0\n", overscan, aspect);
+        overscan = 0;
+    }
+    o.overscan = (unsigned)overscan;
+    if (o.overscan)
+        snprintf(overscan_txt, sizeof overscan_txt, " display.overscan=%u", o.overscan);
 
     /* The pack's kinds a player can turn off; read whether or not a pack
      * is configured, so the keys are never reported unused. */
@@ -158,8 +179,9 @@ int xbox_enhance_init(const char *root, const char *title)
     nv2a_host_opts_set(&o);
     fprintf(stderr, LOGP "render.scale=%u render.aniso=%u present.filter=%s"
             " present.fullscreen=%d present.pacing=%s present.surface=%s"
-            " (display.aspect=%s)\n", o.render_scale, o.aniso,
-            s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], surface_txt, aspect);
+            " (display.aspect=%s%s)\n", o.render_scale, o.aniso,
+            s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], surface_txt, aspect,
+            overscan_txt);
     if (o.aspect_w)
         fprintf(stderr, LOGP "display.aspect=%s display.movie=%s\n", aspect,
                 s_movie[o.movie_mode]);

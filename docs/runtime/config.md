@@ -157,6 +157,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
 | `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
+| `display.overscan` | int | guest pixels cropped from each left and right edge at present, top and bottom in proportion: `0` (stock) to `64` ([Overscan](#display-overscan-displayoverscan)); ignored with a wide `display.aspect` and by the CPU rasteriser, each with a log line | `0` | `RECOMP_DISPLAY_OVERSCAN` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
@@ -222,6 +223,34 @@ and its title movie at 100:
 
 `RECOMP_TRACE=aspect` prints one `[aspect.program]` line per program,
 texture and placement, and the target size per flip.
+
+### Display overscan (display.overscan)
+
+Some titles leave a dark border at the left and right edges of their 4:3
+frame, because the televisions they were made for hid the outer few percent
+of the picture. `display.overscan = n` does what such a TV did: it cuts `n`
+guest columns from each side and `n * h / w` guest rows from the top and
+bottom, then zooms the rest uniformly into the place the whole frame would
+take. 640x480 at 9 shows guest (9, 6.75) to (631, 473.25). The value is in
+guest pixels, so it reads the same at every `render.scale`. Above 64 is
+clamped to 64 and below 0 to 0, each with a warning.
+
+- **Present only.** The crop is a source rectangle on the Metal and D3D11
+  present. The guest frame, the host targets, the write-back, `fb_dump`,
+  `metal_host_dump` and the D3D11 dump are unchanged; `window_shot` reads
+  the window, so it shows the crop.
+- **Filter.** With `nearest`, a zoom of 622 columns into the window draws
+  uneven columns; `present.filter = "linear"` hides that. Under `integer`
+  the vertical cut is rounded to whole host rows (7 at scale 1), so the
+  picture's aspect is off by up to one row.
+- **Not with Hor+.** With a `display.aspect` wider than 4:3 the 4:3 frame's
+  edges sit inside the padded frame, where no source rectangle can cut them,
+  so a non-zero value is reported once and 0 is used.
+- **Every frame.** The crop applies to every screen, so a title whose border
+  shows only on some screens loses those columns everywhere.
+- Ignored by the CPU rasteriser (one log line) and by the Metal readback
+  debug present (`metal_present=readback`). A non-zero value adds
+  ` display.overscan=N` to the `[ENHANCE]` line, after `display.aspect`.
 
 ### What the render and present keys do
 
@@ -538,6 +567,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_RENDER_SCALE` | overrides `render.scale` |
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
 | `RECOMP_DISPLAY_MOVIE` | overrides `display.movie` |
+| `RECOMP_DISPLAY_OVERSCAN` | overrides `display.overscan` |
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |

@@ -1272,6 +1272,8 @@ struct nv2a_host_opts {
      * and square targets get hor+ padding (nv2a_host_pad). */
     unsigned aspect_w, aspect_h;
     int      movie_mode;        /* enum nv2a_movie_mode: display.movie */
+    unsigned overscan;          /* display.overscan: guest px cropped from each
+                                 * side edge at present, 0 = stock (nv2a_present_crop) */
 };
 
 /* pack_off bits: the whole pack, or one kind of entry (nv2a_tex_pack.h). */
@@ -1514,6 +1516,25 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
 struct nv2a_rect { int32_t x, y, w, h; };
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r);
+
+/* display.overscan: the part of a frame of host size fw x fh (render scale
+ * n, hor+ pad guest px) that a crop of ov guest px a side shows, in a
+ * texture of tw x th. The top and bottom lose ov * fh / fw so the picture
+ * keeps its shape, a TV's overscan zoom. x/y/w/h are host px, the u_ and
+ * v_ terms map the presenter's 0..1 quad onto that part of the texture,
+ * and fit_w x fit_h is what to hand nv2a_present_rect: the whole frame for
+ * NEAREST/LINEAR (the crop has its aspect exactly; a rounded cropped size
+ * would leave a one-column bar), the cropped size for INTEGER, whose cut is
+ * rounded to whole host rows so whole multiples exist. ov 0, a pad (hor+
+ * refuses the key) or a frame no wider than 2 * ov guest px gives the whole
+ * frame. */
+struct nv2a_crop {
+    float x, y, w, h;
+    float u_scale, v_scale, u_off, v_off;
+    uint32_t fit_w, fit_h;
+};
+void nv2a_present_crop(uint32_t fw, uint32_t fh, uint32_t tw, uint32_t th, unsigned n,
+                       unsigned pad, unsigned ov, int filter, struct nv2a_crop *c);
 
 /* 32-bit pixels: nearest N x upscale of a w x h image (src_pitch bytes a
  * row) into dst (w*n x h*n, dst_pitch bytes a row), and the box filter back:

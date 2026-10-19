@@ -976,6 +976,53 @@ static int clear16_cases(uint32_t buf)
     return f;
 }
 
+/* display.overscan (present-crop): a 640x480 frame whose columns 0..8 are
+ * green and the rest red, SSX 3's title border in miniature. At 0 the back
+ * buffer's column 0 is the frame's column 0, green. At 9 the crop starts at
+ * guest column 9, so back-buffer (0,240) is red; the vertical cut keeps
+ * 4:3, so the frame still fills the 640x480 back buffer with no bar. */
+static uint32_t overscan_flips(uint32_t buf, unsigned ov)
+{
+    struct nv2a_host_opts o = *nv2a_host_opts(), stock = o;
+    uint32_t got;
+    int k;
+
+    o.overscan = ov;
+    nv2a_host_opts_set(&o);
+    nv2a_pb_d3d11_back_pixel(0, 240);
+    for (k = 0; k < 3; k++) {
+        surf_clear(buf, 640, 480, 0xFFFF0000u);
+        M(0x1D98, (8u << 16) | 0u);
+        M(0x1D9C, (479u << 16) | 0u);
+        M(0x1D90, 0xFF00FF00u);
+        M(0x1D94, 0xF0);
+        M(0x1D98, (639u << 16) | 0u);
+        M(0x1D9C, (479u << 16) | 0u);
+        M(0x012C, 0);
+        M(0x0130, 0);
+    }
+    got = nv2a_pb_d3d11_back_pixel(-1, -1);
+    nv2a_host_opts_set(&stock);
+    return got;
+}
+
+/* overscan_flips at 0 and 9. Returns the failures. */
+static int overscan_cases(uint32_t buf)
+{
+    static const struct { unsigned ov; uint32_t want; } c[2] = {
+        {0, 0xFF00FF00u}, {9, 0xFFFF0000u},
+    };
+    int f = 0, i;
+
+    for (i = 0; i < 2; i++) {
+        uint32_t got = overscan_flips(buf, c[i].ov);
+        fprintf(stderr, "[backend-smoke] overscan %u: back buffer (0,240) 0x%08X (want"
+                " 0x%08X) %s\n", c[i].ov, got, c[i].want, got == c[i].want ? "PASS" : "FAIL");
+        f += got != c[i].want;
+    }
+    return f;
+}
+
 /* present.surface=internal follows a live render.scale change (the
  * in-game menu): the swap chain becomes the frame's host size, 1280x960 at
  * 2x, instead of staying at the starting 640x480 behind a scaling blit, and
@@ -1581,6 +1628,10 @@ int main(int argc, char **argv)
     if (clear16_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: 16-bit clear value\n");
         return 12;
+    }
+    if (overscan_cases(buf[0])) {
+        fprintf(stderr, "[backend-smoke] FAIL: display.overscan present crop\n");
+        return 13;
     }
     if (surface_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: present.surface=internal scale change\n");

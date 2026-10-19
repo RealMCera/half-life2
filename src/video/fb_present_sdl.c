@@ -101,6 +101,10 @@ struct fb_slot {
     size_t   cap;
     uint32_t w, h, bpp;
     uint32_t flip;                 /* the walker's flip count at this frame */
+    /* Layer mode: the render scale and hor+ pad the frame was drawn at, for
+     * display.overscan's crop (1 and 0 for an uploaded guest-size frame). */
+    unsigned n;
+    uint32_t pad;
 };
 
 static struct fb_slot  s_slot[3];
@@ -253,8 +257,11 @@ static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
 
 #if defined(__APPLE__)
     if (s_layer) {
-        if (fbm_upload(s_back, src, w, h, pitch, bpp))
+        if (fbm_upload(s_back, src, w, h, pitch, bpp)) {
+            s_slot[s_back].n = 1;
+            s_slot[s_back].pad = 0;
             publish(w, h, 4, t0);
+        }
         return;
     }
 #endif
@@ -292,11 +299,12 @@ int xbox_FramebufferWindowMetal(void **device, void **queue)
 }
 
 /* The back slot's id<MTLTexture> at w x h, for the backend to blit its frame
- * into, or NULL (no layer, window closing). A non-NULL return must be
+ * into, or NULL (no layer, window closing). n and pad are the render scale
+ * and hor+ pad the frame was drawn at. A non-NULL return must be
  * followed by xbox_FramebufferWindowPublishTexture: the ack thread counts as
  * inside a present from here to there (the close path's handshake). */
 static uint64_t s_tex_t0;
-void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
+void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h, unsigned n, uint32_t pad)
 {
 #if defined(__APPLE__)
     void *t;
@@ -315,10 +323,14 @@ void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
     }
     s_slot[s_back].w = w;
     s_slot[s_back].h = h;
+    s_slot[s_back].n = n;
+    s_slot[s_back].pad = pad;
     return t;
 #else
     (void)w;
     (void)h;
+    (void)n;
+    (void)pad;
     return NULL;
 #endif
 }
@@ -730,7 +742,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
-                            filter, shoot ? path : NULL, shown_flip)) {
+                            f->n, f->pad, filter, shoot ? path : NULL, shown_flip)) {
                 dirty = 0;
                 shoot = 0;
                 presents++;

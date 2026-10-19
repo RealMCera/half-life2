@@ -25,6 +25,9 @@
  *                  size, the slot is drawn into it 1:1, and the layer scales
  *                  it to the view (aspect fit, the present filter's sampler),
  *                  as gamescope scales D3D11's frame-sized swap chain.
+ *   overscan       display.overscan > 0: a second pipeline (vs_crop) samples
+ *                  nv2a_present_crop's part of the slot. At 0 the stock
+ *                  pipeline draws, so nothing changes.
  *
  * Manual retain/release, like nv2a_pb_metal.m. Every entry point is wrapped in
  * an autorelease pool: the main loop and the ack thread have none of their own.
@@ -52,6 +55,7 @@
 static id<MTLDevice>               s_dev;
 static id<MTLCommandQueue>         s_queue;
 static id<MTLRenderPipelineState>  s_pso;
+static id<MTLRenderPipelineState>  s_pso_crop; /* display.overscan > 0 */
 static id<MTLSamplerState>         s_smp[2];   /* nearest, linear */
 static SDL_MetalView               s_view;
 static CAMetalLayer               *s_layer;
@@ -71,10 +75,16 @@ static const char s_blit_msl[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct VO { float4 p [[position]]; float2 t; };\n"
-    "vertex VO vs_blit(uint i [[vertex_id]]) {\n"
+    "static VO tri(uint i) {\n"
     "    VO o;\n"
     "    o.t = float2((i << 1) & 2, i & 2);\n"
     "    o.p = float4(o.t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "    return o;\n"
+    "}\n"
+    "vertex VO vs_blit(uint i [[vertex_id]]) { return tri(i); }\n"
+    "vertex VO vs_crop(uint i [[vertex_id]], constant float4 &crop [[buffer(0)]]) {\n"
+    "    VO o = tri(i);\n"
+    "    o.t = o.t * crop.xy + crop.zw;\n"
     "    return o;\n"
     "}\n"
     "fragment float4 fs_blit(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
@@ -120,9 +130,11 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_blit"] autorelease];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.vertexFunction = [[lib newFunctionWithName:@"vs_crop"] autorelease];
+        s_pso_crop = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         [pd release];
         [lib release];
-        if (!s_pso)
+        if (!s_pso || !s_pso_crop)
             return fail(err, errn, "present pipeline failed");
         for (k = 0; k < 2; k++) {
             sd = [[MTLSamplerDescriptor alloc] init];
@@ -201,6 +213,8 @@ void fbm_destroy(void)
         s_view = NULL;
         [s_pso release];
         s_pso = nil;
+        [s_pso_crop release];
+        s_pso_crop = nil;
         [s_smp[0] release];
         [s_smp[1] release];
         s_smp[0] = s_smp[1] = nil;
@@ -314,10 +328,11 @@ static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *pat
     SDL_FreeSurface(surf);
 }
 
-/* Slot k (fw x fh) into the window. 0 when no drawable came (timeout, display
- * asleep, window hidden): the caller keeps the frame and tries again. */
-int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
-                const char *shot_path, uint32_t flip)
+/* Slot k (fw x fh, drawn at render scale n with hor+ pad pad) into the
+ * window. 0 when no drawable came (timeout, display asleep, window hidden):
+ * the caller keeps the frame and tries again. */
+int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
+                uint32_t pad, int filter, const char *shot_path, uint32_t flip)
 {
     int ok = 0;
 
@@ -329,6 +344,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         id<MTLBuffer> shot = nil;
         struct nv2a_rect r;
         int whole, dw = 0, dh = 0;
+        unsigned ov = nv2a_host_opts()->overscan;
         CGSize cur = s_layer.drawableSize;
 
         /* Checked every present, not only on resize events: a move between
@@ -362,20 +378,34 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         enc = [cb renderCommandEncoderWithDescriptor:rp];
         if (s_slot[k] && fw && fh) {
-            whole = nv2a_present_rect(fw, fh, (uint32_t)dw, (uint32_t)dh, filter, &r);
+            struct nv2a_crop c = {0};
+            /* The slot is exactly the frame, so the texture size is fw x fh. */
+            if (ov)
+                nv2a_present_crop(fw, fh, fw, fh, n, pad, ov, filter, &c);
+            whole = nv2a_present_rect(ov ? c.fit_w : fw, ov ? c.fit_h : fh, (uint32_t)dw,
+                                      (uint32_t)dh, filter, &r);
             if (s_internal) {
-                /* 1:1: the layer does the scaling. */
+                /* 1:1: the layer does the scaling. A crop is zoomed into the
+                 * whole drawable with the present filter's sampler, except
+                 * integer, which stays nearest (D3D11 matches). */
                 r.x = r.y = 0;
                 r.w = dw;
                 r.h = dh;
                 whole = 1;
-                filter = NV2A_PRESENT_NEAREST;
+                if (!ov || filter == NV2A_PRESENT_INTEGER)
+                    filter = NV2A_PRESENT_NEAREST;
             }
             if (r.w > 0 && r.h > 0) {
                 MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
                 int lin = filter == NV2A_PRESENT_LINEAR
                           || (filter == NV2A_PRESENT_INTEGER && !whole);
-                [enc setRenderPipelineState:s_pso];
+                if (ov) {
+                    float crop[4] = { c.u_scale, c.v_scale, c.u_off, c.v_off };
+                    [enc setRenderPipelineState:s_pso_crop];
+                    [enc setVertexBytes:crop length:sizeof crop atIndex:0];
+                } else {
+                    [enc setRenderPipelineState:s_pso];
+                }
                 [enc setViewport:vp];
                 [enc setFragmentTexture:s_slot[k] atIndex:0];
                 [enc setFragmentSamplerState:s_smp[lin] atIndex:0];
