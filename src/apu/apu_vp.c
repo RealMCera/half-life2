@@ -494,8 +494,30 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET: {
+        /* Output buffer handles index the GP FIFO table (GPFADDR, entries 0
+         * to GPFMAXSGE inclusive) and share their numbers with the inbuf
+         * handles, so writing them to VPSGEADDR overwrote voice pages (JSRF's
+         * stream ring lost its first page to its output buffer). The target
+         * table is inferred: xemu leaves this method a FIXME in vp.c. GP was
+         * chosen over EP on JSRF's evidence: it remaps handles 0-1 with
+         * GPFMAXSGE=1 (EPFMAXSGE=5). With the table unset or the handle out
+         * of range there is no entry to write, so the write is dropped,
+         * reported once in case a title needs the EP table instead. */
+        if (!d->regs[NV_PAPU_GPFADDR] ||
+            d->vp.outbuf_sge_handle > d->regs[NV_PAPU_GPFMAXSGE]) {
+            static int s_dropped_logged;
+            if (!s_dropped_logged) {
+                s_dropped_logged = 1;
+                fprintf(stderr, "[APU] outbuf SGE write dropped: handle %u, "
+                        "GPFADDR 0x%08X, GPFMAXSGE %u (reported once)\n",
+                        (unsigned)d->vp.outbuf_sge_handle,
+                        (unsigned)d->regs[NV_PAPU_GPFADDR],
+                        (unsigned)d->regs[NV_PAPU_GPFMAXSGE]);
+            }
+            break;
+        }
         hwaddr sge_address =
-            d->regs[NV_PAPU_VPSGEADDR] + d->vp.outbuf_sge_handle * 8;
+            d->regs[NV_PAPU_GPFADDR] + d->vp.outbuf_sge_handle * 8;
         stl_le_phys(address_space_memory, sge_address,
                     argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         break;

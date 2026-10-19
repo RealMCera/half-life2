@@ -5,6 +5,9 @@
  *   - adpcm_*: the decode buffers held two 36-byte blocks' worth, so a
  *     wider samples-per-block value overran them on the stack (a mono
  *     voice already at two).
+ *   - outbuf_sge_*: output buffer SGE entries were written into the voices'
+ *     table (VPSGEADDR), so an output buffer at handle 1 overwrote the first
+ *     page of a voice buffer at inbuf handle 1.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -24,6 +27,7 @@ uint8_t *g_apu_ram_ptr;
 #define VOICE_BASE 0x10000u   /* NV_PAPU_VPVADDR */
 #define SGE_BASE   0x20000u   /* NV_PAPU_VPSGEADDR */
 #define DATA_BASE  0x30000u   /* what SGE entry 0 names */
+#define GPF_BASE   0x40000u   /* NV_PAPU_GPFADDR */
 
 static uint8_t *s_ram;
 static int s_failures;
@@ -109,6 +113,86 @@ static void adpcm_too_wide_block_is_refused(void)
           ADPCM_MAX_BLOCKS + 1, n);
 }
 
+static uint32_t ram32(uint32_t addr)
+{
+    uint32_t v;
+    memcpy(&v, s_ram + addr, 4);
+    return v;
+}
+
+/* The order JSRF uses: a voice buffer mapped at inbuf handles 1-2, then its
+ * output buffer remapped at outbuf handles 0-1. */
+static void outbuf_sge_goes_to_gp_fifo_table(void)
+{
+    static MCPXAPUState d;
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(&d, 0, sizeof(d));
+    d.regs[NV_PAPU_VPSGEADDR] = SGE_BASE;
+    d.regs[NV_PAPU_GPFADDR] = GPF_BASE;
+    d.regs[NV_PAPU_GPFMAXSGE] = 1;
+
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_INBUF_SGE, 1);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET, 0x014B0000u);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_INBUF_SGE, 2);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_INBUF_SGE_OFFSET, 0x014B1000u);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE, 0);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET, 0x00379000u);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE, 1);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET, 0x0037A000u);
+
+    CHECK(ram32(SGE_BASE + 0) == 0, "voice SGE 0 is %08X, expected untouched",
+          ram32(SGE_BASE + 0));
+    CHECK(ram32(SGE_BASE + 8) == 0x014B0000u,
+          "voice SGE 1 is %08X, expected 014B0000", ram32(SGE_BASE + 8));
+    CHECK(ram32(SGE_BASE + 16) == 0x014B1000u,
+          "voice SGE 2 is %08X, expected 014B1000", ram32(SGE_BASE + 16));
+    CHECK(ram32(GPF_BASE + 0) == 0x00379000u,
+          "GP FIFO SGE 0 is %08X, expected 00379000", ram32(GPF_BASE + 0));
+    CHECK(ram32(GPF_BASE + 8) == 0x0037A000u,
+          "GP FIFO SGE 1 is %08X, expected 0037A000", ram32(GPF_BASE + 8));
+}
+
+/* With no GP FIFO table set up, the entry has nowhere to go: it must not
+ * land at physical 0 or in the voices' table. */
+static void outbuf_sge_without_table_is_dropped(void)
+{
+    static MCPXAPUState d;
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(&d, 0, sizeof(d));
+    d.regs[NV_PAPU_VPSGEADDR] = SGE_BASE;
+
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE, 1);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET, 0x0037A000u);
+
+    CHECK(ram32(8) == 0, "physical 8 is %08X, expected untouched", ram32(8));
+    CHECK(ram32(SGE_BASE + 8) == 0, "voice SGE 1 is %08X, expected untouched",
+          ram32(SGE_BASE + 8));
+}
+
+/* GPFMAXSGE bounds the table (inclusive): a handle past it would write past
+ * the table into whatever follows it. */
+static void outbuf_sge_past_max_is_dropped(void)
+{
+    static MCPXAPUState d;
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(&d, 0, sizeof(d));
+    d.regs[NV_PAPU_VPSGEADDR] = SGE_BASE;
+    d.regs[NV_PAPU_GPFADDR] = GPF_BASE;
+    d.regs[NV_PAPU_GPFMAXSGE] = 1;
+
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE, 2);
+    fe_method(&d, NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET, 0x0037B000u);
+
+    CHECK(ram32(GPF_BASE + 16) == 0,
+          "GP FIFO SGE 2 is %08X, expected untouched (GPFMAXSGE 1)",
+          ram32(GPF_BASE + 16));
+    CHECK(ram32(SGE_BASE + 16) == 0, "voice SGE 2 is %08X, expected untouched",
+          ram32(SGE_BASE + 16));
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -116,6 +200,9 @@ int main(void)
 
     adpcm_wide_block_decodes();
     adpcm_too_wide_block_is_refused();
+    outbuf_sge_goes_to_gp_fifo_table();
+    outbuf_sge_without_table_is_dropped();
+    outbuf_sge_past_max_is_dropped();
 
     free(s_ram);
     if (s_failures) {
@@ -123,6 +210,6 @@ int main(void)
         return 1;
     }
     puts("PASS: ADPCM blocks up to the hardware limit decode, wider ones are "
-         "refused.");
+         "refused; output buffer SGE entries go to the GP FIFO table.");
     return 0;
 }
