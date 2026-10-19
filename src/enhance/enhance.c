@@ -10,6 +10,7 @@
 #include "enhance_cfg.h"
 #include "enhance_input.h"
 #include "kernel_pacing.h"
+#include "mod.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_exe_dir.h"
@@ -164,6 +165,9 @@ int xbox_enhance_init(const char *root, const char *title)
                 s_movie[o.movie_mode]);
     load_tex_pack(&o);
     enhance_input_init();
+    /* Last: a mod's init reads its keys over every file and the [input]
+     * keys already applied (mod.h). */
+    xbox_mod_init();
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

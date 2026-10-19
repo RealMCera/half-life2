@@ -359,12 +359,43 @@ int xbox_InputMouseModel(int counts, double sensitivity, double min_deflection)
     return c < 0 ? -(int)lround(out) : (int)lround(out);
 }
 
+#ifdef XBOXRECOMP_ENHANCE
+/* A mod's input capture (src/enhance/enhance_input.h): the motion is the
+ * mod's, not the pad's. */
+static int s_divert;
+
+void xbox_InputMouseDivert(int on)
+{
+    STORE(&s_divert, on != 0);
+    /* What gathered for one side must not reach the other: the stick
+     * would jump when the capture ends, the mod's view when it starts. */
+    XCHG(&s_dx, 0);
+    XCHG(&s_dy, 0);
+}
+
+int xbox_InputMouseTakeCounts(int *dx, int *dy)
+{
+    *dx = *dy = 0;
+    if (!LOAD(&s_divert))
+        return 0;
+    *dx = XCHG(&s_dx, 0);
+    *dy = XCHG(&s_dy, 0);
+    return 1;
+}
+#endif
+
 int xbox_InputMouseLook(int *x, int *y)
 {
     static unsigned traced;
-    int dx = XCHG(&s_dx, 0), dy = XCHG(&s_dy, 0);
+    int dx, dy;
 
     *x = *y = 0;
+#ifdef XBOXRECOMP_ENHANCE
+    if (LOAD(&s_divert))
+        return s_opts.look;
+#endif
+    dx = XCHG(&s_dx, 0);
+    dy = XCHG(&s_dy, 0);
     if (s_opts.look == XBOX_MOUSE_LOOK_NONE || (!dx && !dy))
         return s_opts.look;
     *x = xbox_InputMouseModel(dx, s_opts.sensitivity, s_opts.min_deflection);
@@ -394,6 +425,9 @@ void xbox_InputMouseReset(void)
     STORE(&s_captured, 0);
     STORE(&s_activate_click, 0);
     STORE(&s_focus_armed, 0);
+#ifdef XBOXRECOMP_ENHANCE
+    STORE(&s_divert, 0);
+#endif
     release_all();
     s_wheel_held[0] = s_wheel_held[1] = 0;
 }

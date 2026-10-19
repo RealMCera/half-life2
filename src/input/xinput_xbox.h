@@ -110,6 +110,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
  */
 DWORD xbox_InputGetPadState(DWORD slot, XBOX_INPUT_STATE *pState);
 
+#ifdef XBOXRECOMP_ENHANCE
+/**
+ * Port 0 as the last xbox_InputGetState(0) returned it: its result and the
+ * state (all zero when not connected). For the enhancements layer's mods,
+ * which must not poll themselves: a poll consumes the mouse motion and
+ * moves the keyboard's stick ramp. Any thread. Other ports, and before the
+ * first read: ERROR_DEVICE_NOT_CONNECTED.
+ */
+DWORD xbox_InputLastState(DWORD dwPort, XBOX_INPUT_STATE *pState);
+#endif
+
 /**
  * The keyboard-and-mouse state `kb` merged on top of the pad state `pad`,
  * as xbox_InputGetState does on port 0: buttons OR-ed, analog values the

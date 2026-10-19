@@ -3119,6 +3119,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 
     if (!init())
         return;
+    /* A mod's batch filter (nv2a_backend_common.h); Metal asks it at the
+     * same point. Nothing without the enhancements layer. */
+    if (nv2a_batch_skip(d, g, v))
+        return;
     rt = surface();
     vs = vertex_shader(d->program);
     if (!rt || !vs || !d->idx_count) {

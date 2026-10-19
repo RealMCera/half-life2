@@ -466,3 +466,32 @@ int enhance_input_init(void)
     fflush(stderr);
     return 0;
 }
+
+/* ---- a mod's input ---------------------------------------------------- */
+
+static int s_mod_capture;
+
+void enhance_input_capture(int on)
+{
+    on = on != 0;
+    if (__atomic_exchange_n(&s_mod_capture, on, __ATOMIC_ACQ_REL) != on)
+        xbox_InputMouseDivert(on);
+}
+
+int enhance_input_captured(void)
+{
+    return __atomic_load_n(&s_mod_capture, __ATOMIC_ACQUIRE);
+}
+
+void enhance_input_state(struct enhance_input_state *out)
+{
+    int b;
+
+    memset(out, 0, sizeof *out);
+    out->connected = xbox_InputLastState(0, &out->pad) == ERROR_SUCCESS;
+    xbox_InputMouseTakeCounts(&out->mouse_dx, &out->mouse_dy);
+    for (b = XBOX_MOUSE_LEFT; b <= XBOX_MOUSE_5; b++)
+        if (xbox_InputMouseHeld(b))
+            out->mouse_buttons |= 1u << (b - 1);
+    out->captured = enhance_input_captured();
+}

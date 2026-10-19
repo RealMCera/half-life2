@@ -919,6 +919,23 @@ static void test_migration(void)
 static int s_pacing_mode = -1;
 void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
+/* mod.c and enhance_input.c's links into the runtime; no mods run here
+ * (tests/enhance_mod has them). */
+ptrdiff_t xbox_GetMemoryOffset(void);
+ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
+/* The batch info's present offset (nv2a_pb_exec.c); never asked here. */
+const struct nv2a_pb_present *nv2a_pb_present_state(void);
+const struct nv2a_pb_present *nv2a_pb_present_state(void)
+{
+    static struct nv2a_pb_present p;
+    return &p;
+}
+DWORD xbox_InputLastState(DWORD port, XBOX_INPUT_STATE *st)
+{
+    (void)port;
+    memset(st, 0, sizeof *st);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
 
 static void enhance_reset_env(void)
 {

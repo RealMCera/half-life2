@@ -1208,3 +1208,55 @@ void nv2a_bump_trace(const struct nv2a_pb_vsh *v, const struct nv2a_stage st[4],
                 t->bump_scale, t->bump_offset, t->color, t->width, t->height);
     }
 }
+
+#ifdef XBOXRECOMP_ENHANCE
+nv2a_batch_filter_fn nv2a_batch_filter_installed;
+
+void nv2a_batch_filter_set(nv2a_batch_filter_fn fn)
+{
+    __atomic_store_n(&nv2a_batch_filter_installed, fn, __ATOMIC_RELEASE);
+}
+
+int nv2a_batch_filter_ask(const struct nv2a_pb_draw *d, const struct nv2a_pb_gpu *g,
+                          const struct nv2a_pb_vsh *v)
+{
+    /* The hash walks the whole program; programs only change by upload
+     * (prog_dwords) or a new start slot, as the backends' shader caches
+     * know. Ack thread only, like every caller of on_draw. */
+    static struct { int valid; uint32_t dwords, start, hash; } memo;
+    struct nv2a_batch_info b;
+    nv2a_batch_filter_fn fn = __atomic_load_n(&nv2a_batch_filter_installed, __ATOMIC_ACQUIRE);
+
+    if (!fn)
+        return 0;
+    memset(&b, 0, sizeof b);
+    if (d->program) {
+        if (!memo.valid || memo.dwords != v->prog_dwords || memo.start != v->start) {
+            memo.hash = nv2a_vsh_program_hash(v, NULL);
+            memo.dwords = v->prog_dwords;
+            memo.start = v->start;
+            memo.valid = 1;
+        }
+        b.program_hash = memo.hash;
+        b.program = 1;
+    }
+    b.prim = d->prim;
+    b.idx_count = d->idx_count;
+    b.color_offset = g->color_offset;
+    b.surface_w = g->clip_x + g->clip_w;
+    b.surface_h = g->clip_y + g->clip_h;
+    b.surface_format = g->format;
+    b.depth_test = v->depth_enable;
+    b.depth_write = v->depth_mask;
+    b.stencil_test = v->stencil_enable;
+    b.alpha_test = v->atest_enable;
+    b.blend = g->blend_enable != 0;
+    b.blend_sfactor = g->blend_sfactor;
+    b.blend_dfactor = g->blend_dfactor;
+    b.color_keep = g->color_keep;
+    b.flip = g->flips;
+    b.present_offset = nv2a_pb_present_state()->offset;
+    b.draw = d;
+    return fn(&b) != 0;
+}
+#endif

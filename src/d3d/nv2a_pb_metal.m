@@ -2030,6 +2030,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
 
     if (!init())
         return;
+    /* A mod's batch filter (nv2a_backend_common.h); D3D11 asks it at the
+     * same point. Nothing without the enhancements layer. */
+    if (nv2a_batch_skip(d, g, v))
+        return;
     /* A batch that writes nothing is dropped, unless a visibility test is
      * counting it: a test's bounding draws typically mask every write. */
     if (g->color_keep == 0xFFFFFFFFu && !(v->depth_enable && v->depth_mask) && !use_s

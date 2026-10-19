@@ -611,6 +611,65 @@ Read the values during init (one thread) and keep them; the layer is not
 meant to be read per frame. Tests: `tests/enhance_cfg` (ctest
 `enhance_cfg`).
 
+## Mods
+
+A mod is game code built into the title's executable that reads and steers
+the guest through one small API (`src/enhance/mod.h`). It exists only with
+`XBOXRECOMP_ENHANCE=ON`. A title with no mods logs and runs exactly as
+before. The draw paths then have one untaken branch.
+
+The title lists its mods in a NULL-terminated table and hands it over before
+`xbox_enhance_init`, which runs each `init` in table order as its last step:
+
+```c
+static int cam_init(const struct xbox_mod_api *api)
+{
+    s_api = api;
+    s_speed = api->cfg_float("mods.free_camera.speed", 1.0);
+    api->on_frame(cam_frame, NULL);
+    api->batch_filter(cam_hide_hud, NULL);
+    return 0;                                   /* non-zero leaves the mod out */
+}
+static const struct xbox_mod free_camera = { "free_camera", cam_init, cam_shutdown };
+static const struct xbox_mod *const mods[] = { &free_camera, NULL };
+
+xbox_mod_register_table(mods);
+xbox_enhance_init(".", NULL);
+```
+
+The table is handed over with a call, not a self-registering macro, for
+three reasons:
+
+- A static library drops an object that nothing names.
+- A linker section is spelled differently for PE, Mach-O and ELF.
+- The table fixes the order.
+
+The title's glue calls two entries:
+
+- `xbox_mod_frame()` once per guest frame, on the guest's thread.
+- `xbox_mod_input_captured()` from its pad read. While it returns true, the
+  title must see a released pad.
+
+`struct xbox_mod_api` (version 1, `XBOX_MOD_API_VERSION`) holds:
+
+| Member | What it gives |
+| --- | --- |
+| `mem`, `XBOX_MOD_MEM32(api, va)`, `XBOX_MOD_MEMF(api, va)` | The guest's memory. It is valid from the first `on_frame` or filter call; it is 0 during init. |
+| `cfg_string`, `cfg_int`, `cfg_float`, `cfg_bool`, `cfg_choice`, `cfg_bind_env` | The getters above. A mod's keys go under `[mods.<name>]` by convention and count as used. |
+| `log(mod, fmt, ...)` | One `[MOD <name>]` line. |
+| `on_frame(fn, user)` | Called from `xbox_mod_frame`, in table order. Init only; up to `XBOX_MOD_MAX_FRAME`. |
+| `input_state(out)` | The title's last port-0 read (the keyboard merged), and the mouse's raw counts and buttons while captured. A mod never polls, because a poll would move the keyboard's stick ramp. |
+| `input_capture(on)` | Takes port 0. While captured, the mouse's motion goes to the mod instead of the look stick, and the title's pad glue releases the pad. Either edge drops the motion gathered so far. |
+| `batch_filter(fn, user)` | Asked before each Metal or D3D11 draw, on the render thread, with the program hash and draw state (`struct nv2a_batch_info`). If any filter returns non-zero, the batch is skipped. `present_offset` is the surface the last flip presented, to tell a back buffer from an offscreen target. A skipped batch inside a visibility test counts as occluded. Init only; up to `XBOX_MOD_MAX_FILTER`. The CPU rasteriser does not ask. |
+
+A failed init leaves nothing behind. Its registrations are dropped and the
+capture goes back to what the earlier mods left. Shutdown runs in reverse
+order, once, at exit. The guest and the render thread may still be running
+then, and a frame or filter call may be in flight. So a mod's shutdown must
+not free anything its callbacks use.
+Hotkeys come from `xbox_FramebufferKeyDown` and the names in
+`src/input/input_names.h`. Tests: `tests/enhance_mod` (ctest `enhance_mod`).
+
 ## Design note: why the reader is our own
 
 The config format is TOML because the user asked for TOML, or failing that

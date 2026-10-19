@@ -17,6 +17,7 @@ add_executable(enhance_cfg_test
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/enhance/enhance.c
     ${XR_SRC}/enhance/enhance_input.c
+    ${XR_SRC}/enhance/mod.c
     ${XR_SRC}/input/keyboard.c
     ${XR_SRC}/input/mouse.c
     ${XR_SRC}/input/input_names.c
@@ -29,7 +30,8 @@ add_executable(enhance_cfg_test
 target_include_directories(enhance_cfg_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
     ${XR_SRC}/input
     ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC})
-target_compile_definitions(enhance_cfg_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS)
+target_compile_definitions(enhance_cfg_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS
+    XBOXRECOMP_ENHANCE)
 if(NOT MSVC)
     target_compile_options(enhance_cfg_test PRIVATE -Wall -Wextra)
 endif()

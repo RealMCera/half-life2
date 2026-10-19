@@ -1524,6 +1524,73 @@ void nv2a_upscale_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t w, 
 void nv2a_downscale_box32(const uint8_t *src, uint32_t src_pitch, uint32_t w, uint32_t h,
                           unsigned n, uint8_t *dst, uint32_t dst_pitch);
 
+/* ------------------------------------------------------------------------ */
+/* Batch filter (enhancements layer only)                                    */
+/* ------------------------------------------------------------------------ */
+
+/* A predicate the enhancements layer's mods install (src/enhance/mod.h,
+ * batch_filter) to drop whole batches, such as a HUD hidden for a photo.
+ * Both GPU backends ask it at the top of on_draw, after their init, so
+ * Metal and D3D11 drop the same batches; the executor has already counted
+ * the batch and noted its surface, so the flip still presents what it
+ * would. The CPU rasteriser does not ask.
+ *
+ * With XBOXRECOMP_ENHANCE off this compiles to nothing. On, with no filter
+ * installed, the cost is one load and one well-predicted branch per batch;
+ * nothing is computed and nothing changes. Installed before the guest
+ * starts (mod init) and removed at shutdown, while the ack thread may still
+ * be drawing: the pointer is stored with release and loaded with acquire.
+ *
+ * A skipped batch inside a visibility test (GET_REPORT) adds no samples, so
+ * the test reads it as occluded: a title that hides a lens flare or a sprite
+ * behind such a test hides it too when its bounding draw is filtered. */
+struct nv2a_batch_info {
+    uint32_t program_hash;  /* nv2a_vsh_program_hash; 0 for a fixed-function batch */
+    int      program;       /* the batch runs the vertex program */
+    uint32_t prim;          /* NV_PRIM_* */
+    uint32_t idx_count;
+    uint32_t color_offset;  /* SET_SURFACE_COLOR_OFFSET, as the title set it */
+    uint32_t surface_w, surface_h;   /* the clip's extent: clip_x + clip_w, clip_y + clip_h */
+    uint32_t surface_format;         /* SET_SURFACE_FORMAT */
+    int      depth_test, depth_write, stencil_test, alpha_test;
+    int      blend;                  /* BLEND_ENABLE */
+    uint32_t blend_sfactor, blend_dfactor;   /* raw GL codes */
+    uint32_t color_keep;    /* SET_COLOR_MASK inverted: 0 writes every channel */
+    uint32_t flip;          /* flips completed so far */
+    /* The colour surface the last flip presented (nv2a_pb_present_state),
+     * 0 before the first. A title swaps two or three back buffers, so a
+     * batch drawing into one of them has color_offset equal to the offset
+     * one or two flips ago; a filter that wants "into a back buffer, not an
+     * offscreen target" keeps the offsets it has seen here. */
+    uint32_t present_offset;
+    const struct nv2a_pb_draw *draw;   /* the batch itself */
+};
+
+/* Returns 1 to drop the batch. */
+typedef int (*nv2a_batch_filter_fn)(const struct nv2a_batch_info *b);
+
+#ifdef XBOXRECOMP_ENHANCE
+extern nv2a_batch_filter_fn nv2a_batch_filter_installed;
+/* Install (NULL removes) the filter. One: the mod table composes its own. */
+void nv2a_batch_filter_set(nv2a_batch_filter_fn fn);
+/* The slow half of nv2a_batch_skip: fills the info and asks the filter. */
+int nv2a_batch_filter_ask(const struct nv2a_pb_draw *d, const struct nv2a_pb_gpu *g,
+                          const struct nv2a_pb_vsh *v);
+#endif
+
+/* 1 when the installed filter drops this batch. The backends pass the
+ * executor's state they already hold. */
+static inline int nv2a_batch_skip(const struct nv2a_pb_draw *d, const struct nv2a_pb_gpu *g,
+                                  const struct nv2a_pb_vsh *v)
+{
+#ifdef XBOXRECOMP_ENHANCE
+    if (__atomic_load_n(&nv2a_batch_filter_installed, __ATOMIC_ACQUIRE))
+        return nv2a_batch_filter_ask(d, g, v);
+#endif
+    (void)d; (void)g; (void)v;
+    return 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

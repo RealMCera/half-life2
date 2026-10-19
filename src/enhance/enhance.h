@@ -24,6 +24,9 @@
  * which scripts/golden.py reads to refuse a non-stock golden run; with a
  * wide aspect a second line gives display.aspect and display.movie.
  *
+ * Last, it runs the mods' inits (mod.h), the table the title registered
+ * with xbox_mod_register_table before this call; none, no lines.
+ *
  * It does not report unused keys: the title reads its own keys after this
  * and then calls enhance_cfg_report_unused() (enhance_cfg.h), so a title
  * key in config.toml is not reported as unused.

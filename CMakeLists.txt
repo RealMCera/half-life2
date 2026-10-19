@@ -46,10 +46,12 @@ add_subdirectory(src/platform)
 # files, config.toml over config.default.toml. Opt-in: off by default; a
 # title turns it on and calls it.
 # ON adds the xbox_enhance library and the layer's RECOMP_* config keys
-# (recomp_env.h, RECOMP_ENV_HAVE_ENHANCE_KEYS).
+# (recomp_env.h, RECOMP_ENV_HAVE_ENHANCE_KEYS), and defines
+# XBOXRECOMP_ENHANCE for the runtime's few seams the layer's mods use (the
+# batch filter, the input capture); OFF compiles those out.
 option(XBOXRECOMP_ENHANCE "Build the opt-in enhancements layer (src/enhance)" OFF)
 if(XBOXRECOMP_ENHANCE)
-    target_compile_definitions(recomp_env PUBLIC RECOMP_ENV_HAVE_ENHANCE_KEYS)
+    target_compile_definitions(recomp_env PUBLIC RECOMP_ENV_HAVE_ENHANCE_KEYS XBOXRECOMP_ENHANCE)
     add_subdirectory(src/enhance)
 endif()
 

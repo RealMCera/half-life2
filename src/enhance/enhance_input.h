@@ -1,9 +1,12 @@
 /*
  * enhance_input.h - the [input] and [input.bindings] keys (the port-0
- * keyboard and mouse) read from the configuration files into src/input.
+ * keyboard and mouse) read from the configuration files into src/input,
+ * and the input a mod reads and captures (mod.h).
  */
 #ifndef ENHANCE_INPUT_H
 #define ENHANCE_INPUT_H
+
+#include "xinput_xbox.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +18,29 @@ extern "C" {
  * "[INPUT] config:" line. Errors are [INPUT] lines and never fatal; returns
  * 0. A second call re-reads (tests). */
 int enhance_input_init(void);
+
+/* ---- a mod's input (src/enhance/mod.h) --------------------------------- */
+
+/* What a mod reads each frame. */
+struct enhance_input_state {
+    XBOX_INPUT_STATE pad;       /* port 0 as the title last read it, with
+                                 * the keyboard merged; all zero when none */
+    int connected;              /* whether port 0 answered that read */
+    int mouse_dx, mouse_dy;     /* raw counts since the last call, while
+                                 * captured (mouse forward is negative dy);
+                                 * 0, 0 otherwise */
+    unsigned mouse_buttons;     /* bit (XBOX_MOUSE_x - 1) per held button */
+    int captured;               /* enhance_input_captured() */
+};
+
+/* Takes port 0 for a mod, or gives it back. While captured the mouse's
+ * motion goes to the mod (enhance_input_state) instead of the pad's look
+ * stick, and the title's pad glue, which asks enhance_input_captured(),
+ * gives the title a released pad: the title's own read is never touched
+ * here, so the pad's state stays readable for the mod. Any thread. */
+void enhance_input_capture(int on);
+int  enhance_input_captured(void);
+void enhance_input_state(struct enhance_input_state *out);
 
 #ifdef __cplusplus
 }

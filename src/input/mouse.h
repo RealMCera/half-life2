@@ -97,6 +97,15 @@ int  xbox_InputMouseHeld(int code);
  * values for the opts.look stick (0, 0 when none or at rest). Returns the
  * stick (XBOX_MOUSE_LOOK_*). */
 int  xbox_InputMouseLook(int *x, int *y);
+#ifdef XBOXRECOMP_ENHANCE
+/* The enhancements layer's input capture (src/enhance/enhance_input.h).
+ * While diverted, xbox_InputMouseLook gives the pad no motion and the
+ * counts wait for xbox_InputMouseTakeCounts, the mod's reader: raw counts
+ * since its last call (mouse forward is negative dy), 1 while diverted, else
+ * 0 with 0, 0. Either edge drops the counts gathered so far. Any thread. */
+void xbox_InputMouseDivert(int on);
+int  xbox_InputMouseTakeCounts(int *dx, int *dy);
+#endif
 /* The model alone: counts on one axis to a stick value. */
 int  xbox_InputMouseModel(int counts, double sensitivity, double min_deflection);
 

@@ -17,6 +17,18 @@
 
 #include <stdlib.h>
 #include <string.h>
+#ifdef XBOXRECOMP_ENHANCE
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#define last_yield() SwitchToThread()
+#else
+#include <sched.h>
+#define last_yield() sched_yield()
+#endif
+#endif
 
 static const xbox_input_backend *g_be = &xbox_input_host_backend;
 static int      g_inited;
@@ -101,6 +113,62 @@ void xbox_InputMergeKbm(XBOX_INPUT_STATE *pad, const XBOX_INPUT_STATE *kb)
     pad->dwPacketNumber = kb->dwPacketNumber;
 }
 
+#ifdef XBOXRECOMP_ENHANCE
+/* Port 0 as the title's last read saw it, for a mod (xbox_InputLastState).
+ * The title's poll writes it (the USB thread) and a mod reads it from the
+ * guest's frame, so it sits behind a spin lock held for a copy. */
+static XBOX_INPUT_STATE g_last;
+static DWORD g_last_rc = ERROR_DEVICE_NOT_CONNECTED;
+static unsigned char g_last_lock;   /* the type __atomic_test_and_set is defined on */
+
+static void last_lock(void)
+{
+    unsigned spins = 0;
+
+    /* Held for a 20-byte copy, so a spin is short; but the holder may be
+     * preempted, and on a busy host (Proton's threads plus the guest's) a
+     * waiter that never yields can keep it off the core. */
+    while (__atomic_test_and_set(&g_last_lock, __ATOMIC_ACQUIRE))
+        if (++spins >= 64) {
+            spins = 0;
+            last_yield();
+        }
+}
+
+static void last_unlock(void)
+{
+    __atomic_clear(&g_last_lock, __ATOMIC_RELEASE);
+}
+
+static DWORD keep_last(DWORD rc, const XBOX_INPUT_STATE *st)
+{
+    last_lock();
+    g_last_rc = rc;
+    if (rc == ERROR_SUCCESS)
+        g_last = *st;
+    else
+        memset(&g_last, 0, sizeof g_last);
+    last_unlock();
+    return rc;
+}
+
+DWORD xbox_InputLastState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    DWORD rc;
+
+    if (dwPort != 0 || !pState)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    last_lock();
+    rc = g_last_rc;
+    *pState = g_last;
+    last_unlock();
+    return rc;
+}
+#define KEEP(port, rc, st) ((port) == 0 ? keep_last((rc), (st)) : (rc))
+#else
+#define KEEP(port, rc, st) (rc)
+#endif
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XBOX_INPUT_STATE kb;
@@ -115,11 +183,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort == 0 && g_be->keyboard && g_be->keyboard(&kb)) {
         if (rc != ERROR_SUCCESS) {
             *pState = kb;
-            return ERROR_SUCCESS;
+            return KEEP(dwPort, ERROR_SUCCESS, pState);
         }
         xbox_InputMergeKbm(pState, &kb);
     }
-    return rc;
+    return KEEP(dwPort, rc, pState);
 }
 
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
