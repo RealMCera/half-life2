@@ -1088,16 +1088,18 @@ static void d3d11_on_clear(uint32_t param)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     RenderTarget *rt;
     float c[4];
+    uint32_t argb;
 
     if (!(param & 0xF0) || !init())
         return;
     rt = surface();
     if (!rt)
         return;
-    c[0] = (float)((g->clear_color >> 16) & 0xFF) / 255.0f;
-    c[1] = (float)((g->clear_color >> 8) & 0xFF) / 255.0f;
-    c[2] = (float)(g->clear_color & 0xFF) / 255.0f;
-    c[3] = (float)(g->clear_color >> 24) / 255.0f;
+    argb = nv2a_clear_argb(g);   /* in the surface's format */
+    c[0] = (float)((argb >> 16) & 0xFF) / 255.0f;
+    c[1] = (float)((argb >> 8) & 0xFF) / 255.0f;
+    c[2] = (float)(argb & 0xFF) / 255.0f;
+    c[3] = (float)(argb >> 24) / 255.0f;
     clear_region(rt, g, c);
     rt->last_clear = ++s_seq;
     s_clears++;

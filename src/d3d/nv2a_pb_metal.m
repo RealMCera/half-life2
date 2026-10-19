@@ -967,6 +967,7 @@ static void metal_on_clear(uint32_t param)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     RenderTarget *rt;
     double c[4];
+    uint32_t argb;
     uint32_t b[4];
     id<MTLRenderPipelineState> pso;
 
@@ -976,10 +977,11 @@ static void metal_on_clear(uint32_t param)
         rt = surface();
         if (!rt || !nv2a_clear_box(g, rt->w, rt->h, b))
             return;
-        c[0] = (double)((g->clear_color >> 16) & 0xFF) / 255.0;
-        c[1] = (double)((g->clear_color >> 8) & 0xFF) / 255.0;
-        c[2] = (double)(g->clear_color & 0xFF) / 255.0;
-        c[3] = (double)(g->clear_color >> 24) / 255.0;
+        argb = nv2a_clear_argb(g);   /* in the surface's format */
+        c[0] = (double)((argb >> 16) & 0xFF) / 255.0;
+        c[1] = (double)((argb >> 8) & 0xFF) / 255.0;
+        c[2] = (double)(argb & 0xFF) / 255.0;
+        c[3] = (double)(argb >> 24) / 255.0;
         s_clears++;
         if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
             begin_encoder(rt, 1, c);

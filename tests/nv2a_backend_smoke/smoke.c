@@ -727,6 +727,8 @@ static int redraw_case(const struct nv2a_pb_backend *b)
     static const uint32_t white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
     static const float uv[4][2] = {{0, 0}, {64, 0}, {64, 64}, {0, 64}};
     static const uint32_t col[2] = {0xFFFF0000u, 0xFF00FF00u};
+    /* The clear value comes in the target's format, R5G6B5 here. */
+    static const uint32_t clr[2] = {0xF800u, 0x07E0u};
     const struct nv2a_pb_present *p;
     uint32_t got[2];
     int a, k, f = 0;
@@ -739,7 +741,7 @@ static int redraw_case(const struct nv2a_pb_backend *b)
         M(0x0208, 0x00000123u);            /* R5G6B5, Z24S8 */
         M(0x020C, 128u);
         M(0x0210, BUF6);
-        M(0x1D90, col[k]);
+        M(0x1D90, clr[k]);
         M(0x1D94, 0xF0);
         surf(BUF0, W, H, 0, 0);
         for (a = 0; a < 16; a++)

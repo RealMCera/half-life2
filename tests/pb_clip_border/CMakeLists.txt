@@ -1,6 +1,7 @@
 # pb_clip_border - the CPU rasteriser's vertex-program path (nv2a_pb_exec.c):
 # the near plane clips with the depth test off too, and texture address
-# mode 4 samples SET_TEXTURE_BORDER_COLOR. Feeds nv2a_pb_exec_method() a
+# mode 4 samples SET_TEXTURE_BORDER_COLOR, and a 16-bit surface's clear value
+# is written in its own format (clear16). Feeds nv2a_pb_exec_method() a
 # hand-written method stream on the CPU path; no GPU backend, so it runs on
 # every POSIX host.
 #   cmake --build <build> --target pb_clip_border

@@ -1639,6 +1639,7 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x, b[4];
+    uint16_t v16;
     /* The memory the clear may write (nv2a_clear_box clamps to the same
      * surface): a swizzled one is its power-of-two size, a pitch one ends
      * at the clip's far corner. */
@@ -1664,6 +1665,13 @@ static void clear_surface(uint32_t param)
      * clear: Burnout 3 clears 159x344 regions of its back buffer. */
     if (!nv2a_clear_box(&s_gpu, sw, sh, b))
         b[0] = b[1] = b[2] = b[3] = 0;   /* nothing to fill; still a clear */
+    /* A 16-bit RGB surface gets its clear value already packed
+     * (nv2a_clear_packed16); any other 16-bit one, from an A8R8G8B8 value
+     * reduced to 5:6:5 as before. */
+    if (!nv2a_clear_packed16(&s_gpu, &v16))
+        v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+                       | ((s_gpu.clear_color >> 5) & 0x07E0)
+                       | ((s_gpu.clear_color >> 3) & 0x001F));
 
     for (y = b[1]; y < b[3]; y++) {
         uint8_t *row = mem + s_gpu.color_base + (size_t)y * s_gpu.pitch;
@@ -1678,10 +1686,7 @@ static void clear_surface(uint32_t param)
                 if (bpp == 4)
                     ((uint32_t *)base)[i] = s_gpu.clear_color;
                 else if (bpp == 2)
-                    ((uint16_t *)base)[i] = (uint16_t)(
-                        ((s_gpu.clear_color >> 8) & 0xF800)
-                      | ((s_gpu.clear_color >> 5) & 0x07E0)
-                      | ((s_gpu.clear_color >> 3) & 0x001F));
+                    ((uint16_t *)base)[i] = v16;
             }
             continue;
         }
@@ -1690,14 +1695,9 @@ static void clear_surface(uint32_t param)
             for (x = b[0]; x < b[2]; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
             uint16_t *p = (uint16_t *)row;
             for (x = b[0]; x < b[2]; x++)
-                p[x] = v;
+                p[x] = v16;
         }
     }
     s_gpu.clears++;

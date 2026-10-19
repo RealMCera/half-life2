@@ -12,6 +12,10 @@
  *            texture are SET_TEXTURE_BORDER_COLOR, read through the
  *            decoded-texture cache (texel_cached), nearest and bilinear.
  *            With the texture as the source the edge texel stands in
+ *   clear16  SET_COLOR_CLEAR_VALUE in the colour surface's format: an
+ *            R5G6B5 or X1R5G5B5 surface takes the low 16 bits as they are
+ *            (JSRF's logos), and the format at CLEAR_SURFACE decides, not
+ *            the one current when the value arrived
  *
  * A pass-through program (mov oPos, v0; mov oD0, v3; mov oT0, v9, as
  * pb_tex_cache) on a 64x64 surface; pixels are read back from guest memory.
@@ -134,12 +138,42 @@ static uint32_t px32(uint32_t buf, uint32_t x, uint32_t y)
     return *(const uint32_t *)(guest(buf) + y * W * 4u + x * 4u);
 }
 
+static uint16_t px16(uint32_t buf, uint32_t x, uint32_t y)
+{
+    return *(const uint16_t *)(guest(buf) + y * W * 2u + x * 2u);
+}
+
 static void expect_px(const char *what, uint32_t got, uint32_t want)
 {
     int ok = got == want;
     fprintf(stderr, "[pb_clip_border] %-52s %08X want %08X %s\n", what, got, want,
             ok ? "PASS" : "FAIL");
     s_fail += !ok;
+}
+
+/* clear16: a 16-bit surface at buf, filled with `fill` from the CPU,
+ * SET_COLOR_CLEAR_VALUE sent while the surface format is `at_value` and
+ * CLEAR_SURFACE while it is `at_clear`, over the clear rect (8,8)-(23,23)
+ * (max edge inclusive). */
+static void clear16(uint32_t buf, uint16_t fill, uint32_t at_value, uint32_t at_clear,
+                    uint32_t value)
+{
+    uint16_t *p = (uint16_t *)guest(buf);
+    uint32_t i;
+    for (i = 0; i < W * H; i++)
+        p[i] = fill;
+    M(0x0200, W << 16);
+    M(0x0204, H << 16);
+    M(0x020C, W * 2u);
+    M(0x0210, buf);
+    M(0x0208, at_value);
+    M(0x1D98, (23u << 16) | 8u);
+    M(0x1D9C, (23u << 16) | 8u);
+    M(0x1D90, value);
+    M(0x0208, at_clear);
+    M(0x1D94, 0xF0);
+    M(0x1D98, (W - 1u) << 16);             /* back to the whole surface */
+    M(0x1D9C, (H - 1u) << 16);
 }
 
 /* (8,8)-(56,56), z from zl on the left edge to zr on the right, UVs from
@@ -246,6 +280,26 @@ int main(void)
         }
         end_frame(BUF1);
     }
+
+    /* clear16: JSRF's near-black on its R5G6B5 back buffer, with junk in the
+     * high half, sent while the surface was still A8R8G8B8. */
+    clear16(BUF0, 0xAAAAu, 0x00000128u, 0x00000123u, 0xFFFF20E4u);
+    expect_px("clear16 R5G6B5 0xFFFF20E4, format changed: inside", px16(BUF0, 10, 10), 0x20E4u);
+    expect_px("clear16 R5G6B5: the rect's max corner (23,23)", px16(BUF0, 23, 23), 0x20E4u);
+    expect_px("clear16 R5G6B5: past the rect (24,23) untouched", px16(BUF0, 24, 23), 0xAAAAu);
+    expect_px("clear16 R5G6B5: outside (30,30) untouched", px16(BUF0, 30, 30), 0xAAAAu);
+    /* X1R5G5B5_O1R5G5B5: red as sent, not an A8R8G8B8 value reduced. */
+    clear16(BUF0, 0xAAAAu, 0x00000122u, 0x00000122u, 0x00007C00u);
+    expect_px("clear16 X1R5G5B5_O1R5G5B5 0x7C00", px16(BUF0, 10, 10), 0x7C00u);
+    /* And back: a value sent on R5G6B5 and cleared on A8R8G8B8 is 32-bit. */
+    M(0x020C, W * 4u);
+    M(0x0210, BUF0);
+    M(0x0208, 0x00000123u);
+    M(0x1D90, 0x80204060u);
+    M(0x0208, 0x00000128u);
+    M(0x1D94, 0xF0);
+    expect_px("clear16 value sent on R5G6B5, cleared on A8R8G8B8", px32(BUF0, 10, 10),
+              0x80204060u);
 
     if (s_fail) {
         fprintf(stderr, "[pb_clip_border] FAIL: %d check(s)\n", s_fail);

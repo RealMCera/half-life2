@@ -19,6 +19,8 @@
  * and elem32: a quad list of 4800 ARRAY_ELEMENT16 indices whose quads from
  * index 4096 on have their own colour, and a triangle list whose odd last
  * index is an ARRAY_ELEMENT32; a pixel inside each must be drawn.
+ * Then 16-bit clears (clear16_cases): SET_COLOR_CLEAR_VALUE in the target's
+ * own format, R5G6B5 or X1R5G5B5, as JSRF clears its logos.
  * Then the display mode's frame: with a 640x480 mode the crop case shows
  * 640x480, and a buffer drawn only at 320x240 is grown to it.
  * Last, present.surface=internal: a live render.scale change resizes the
@@ -116,6 +118,7 @@ static uint32_t s_surf_base = 0x01000000u;
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
 #define RTT_A     0x10100000u   /* 64x64 render-to-texture targets, pitch 256 */
 #define RTT_B     0x10110000u
+#define RTT16     (RTT_A + 0x18000u)    /* clear16_cases: 64x64 16-bit, pitch 128 */
 #define VB_GUEST  0x10200000u   /* index cases: 96000 bytes of vertex arrays, 0x20000 committed */
 #define TEX_LOG2  6                            /* 64x64 */
 /* Four 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
@@ -935,6 +938,44 @@ static int border_cases(uint32_t buf)
     return f;
 }
 
+/* SET_COLOR_CLEAR_VALUE in the target's format (nv2a_clear_argb): a 64x64
+ * 16-bit target at RTT16 (alias_cases committed it) cleared to a packed
+ * value and read back as A8R8G8B8. JSRF's white and near-black on R5G6B5,
+ * one with junk in the high half and sent while the surface was A8R8G8B8
+ * (the format at CLEAR_SURFACE decides), then X1R5G5B5_O1R5G5B5 red.
+ * Alpha is forced: the host target's alpha is not what is checked. Leaves
+ * buf the A8R8G8B8 surface again. Returns the failures. */
+static int clear16_cases(uint32_t buf)
+{
+    static const struct { uint32_t at_value, at_clear, value, want; const char *what; } c[4] = {
+        {0x123u, 0x123u, 0x0000FFFFu, 0xFFFFFFFFu, "R5G6B5 white"},
+        {0x128u, 0x123u, 0xFFFF20E4u, 0xFF211C21u, "R5G6B5 0xFFFF20E4, format changed"},
+        {0x123u, 0x123u, 0x0000F800u, 0xFFFF0000u, "R5G6B5 red"},
+        {0x122u, 0x122u, 0x00007C00u, 0xFFFF0000u, "X1R5G5B5_O1R5G5B5 red"},
+    };
+    int f = 0, k;
+
+    for (k = 0; k < 4; k++) {
+        uint32_t got;
+        M(0x0200, 64u << 16);
+        M(0x0204, 64u << 16);
+        M(0x020C, 128u);
+        M(0x0210, RTT16);
+        M(0x0214, 0x02400000u);
+        M(0x1B0C, 0);
+        M(0x0208, c[k].at_value);
+        M(0x1D90, c[k].value);
+        M(0x0208, c[k].at_clear);
+        M(0x1D94, 0xF0);
+        got = nv2a_pb_d3d11_pixel(RTT16, 10, 10) | 0xFF000000u;
+        fprintf(stderr, "[backend-smoke] clear16 %s: 0x%08X (want 0x%08X) %s\n", c[k].what,
+                got, c[k].want, got == c[k].want ? "PASS" : "FAIL");
+        f += got != c[k].want;
+    }
+    surf_clear(buf, 640, 480, 0xFF000000u);   /* the back buffer again */
+    return f;
+}
+
 /* present.surface=internal follows a live render.scale change (the
  * in-game menu): the swap chain becomes the frame's host size, 1280x960 at
  * 2x, instead of staying at the starting 640x480 behind a scaling blit, and
@@ -1536,6 +1577,10 @@ int main(int argc, char **argv)
     if (clipplane_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: CLIPPLANE texture-shader kills\n");
         return 11;
+    }
+    if (clear16_cases(buf[0])) {
+        fprintf(stderr, "[backend-smoke] FAIL: 16-bit clear value\n");
+        return 12;
     }
     if (surface_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: present.surface=internal scale change\n");

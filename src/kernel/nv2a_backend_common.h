@@ -307,6 +307,54 @@ static inline int nv2a_clear_box(const struct nv2a_pb_gpu *g, uint32_t w, uint32
     return 1;
 }
 
+/* SET_COLOR_CLEAR_VALUE is in the colour surface's own format, not always
+ * A8R8G8B8: on a 16-bit surface D3D packs the colour before sending it, as
+ * xemu's clear unpacks it per format. JSRF (XDK 4134) draws its logos on an
+ * R5G6B5 back buffer and clears to 0x0000FFFF for white: read as A8R8G8B8
+ * that is cyan, and its near-black 0x20E4 came out blue.
+ *
+ * Nonzero, with the low 16 bits in *packed, when the surface is a 16-bit
+ * RGB format, so the CPU path writes the value as given. */
+static inline int nv2a_clear_packed16(const struct nv2a_pb_gpu *g, uint16_t *packed)
+{
+    switch (g->format & 0xFu) {
+    case 0x1: case 0x2: case 0x3:          /* X1R5G5B5 x2, R5G6B5 */
+        *packed = (uint16_t)g->clear_color;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* The clear colour as A8R8G8B8, for the GPU backends' 8-bit targets: a
+ * packed 16-bit value widened per channel (a 5-bit 31 to 255), opaque. */
+static inline uint32_t nv2a_clear_argb(const struct nv2a_pb_gpu *g)
+{
+    uint32_t v = g->clear_color & 0xFFFFu, r, gr, b;
+
+    switch (g->format & 0xFu) {
+    case 0x1: case 0x2:                    /* X1R5G5B5 */
+        r = (v >> 10) & 0x1Fu;
+        gr = (v >> 5) & 0x1Fu;
+        b = v & 0x1Fu;
+        r = (r << 3) | (r >> 2);
+        gr = (gr << 3) | (gr >> 2);
+        b = (b << 3) | (b >> 2);
+        break;
+    case 0x3:                              /* R5G6B5 */
+        r = (v >> 11) & 0x1Fu;
+        gr = (v >> 5) & 0x3Fu;
+        b = v & 0x1Fu;
+        r = (r << 3) | (r >> 2);
+        gr = (gr << 2) | (gr >> 4);
+        b = (b << 3) | (b >> 2);
+        break;
+    default:
+        return g->clear_color;
+    }
+    return 0xFF000000u | (r << 16) | (gr << 8) | b;
+}
+
 /* What a draw may write, in guest pixels, box as nv2a_clear_box's: the
  * surface clip, clamped to a w x h target. The GPU scissors every draw to
  * the clip, and the CPU rasteriser bounds its spans by it. A GPU target
