@@ -5054,6 +5054,11 @@ static void heap_forget_ram_names(int m)
         g_phys_ram_named[p] = 0;
 }
 
+/* Readers (the APU and OHCI threads) take no lock and no acquire: a mark is
+ * a plain byte store by the naming thread and a clear is one under
+ * g_heap_lock, so on arm64 a reader can see either a little late. The title
+ * names a buffer before it hands the number to a device and frees it after
+ * the device is done, so the stale window costs at most one transfer. */
 const volatile uint8_t *xbox_PhysRamNameMap(void)
 {
     return g_phys_ram_named;

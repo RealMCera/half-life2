@@ -60,6 +60,7 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "video/video_player.h"   /* xbox_HostWindowSetTitle, xbox_HostWindowMain */
+#include "usb/ohci.h"              /* xbox_OhciInit: the pad's USB controller */
 #ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS   /* the toolkit's opt-in enhancements layer */
 #include "enhance.h"
 #include "enhance_cfg.h"
@@ -806,6 +807,23 @@ static int host_main(void)
         fprintf(stderr, "[BOOT] emulated APU %s\n",
                 g_apu_state ? "up" : "FAILED to initialise");
     }
+
+    /* The pad. XAPI is statically linked into the title and reaches the
+     * controller by programming the MCPX's USB OHCI registers itself
+     * (look for 0xFED00000 in the generated code); nothing in that path goes
+     * through a kernel export this runtime could answer. Without the
+     * toolkit's controller model the registers read as zeroed RAM, XAPI
+     * finds no root hub ports, and no pad -- host, keyboard or
+     * RECOMP_PAD_SCRIPT -- ever reaches the title. With it, the host's pad
+     * (SDL GameController on POSIX, XInput on Windows; the keyboard merges
+     * onto port 0) is presented as an Xbox controller on port 1. Must follow
+     * the memory mapping: the model traps the aperture by protecting its
+     * pages. A title that overrides XInput itself instead drops these lines.
+     * An explicit RECOMP_USB in the environment still wins (=0 turns it
+     * off). */
+    if (!recomp_env(RENV_USB))
+        recomp_env_set(RENV_USB, "1");
+    xbox_OhciInit();
 
     /* Step 4: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");

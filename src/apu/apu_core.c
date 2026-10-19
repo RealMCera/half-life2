@@ -123,8 +123,10 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * 48 MB can have DirectSound's voice array at a window address inside
      * that range. Resolved to RAM, the VP never saw the driver take an idle
      * voice off its list and re-trapped it every frame. (The OHCI resolves
-     * the image first: a USB driver can read its descriptors into .data on a
-     * page the boot has also allocated as contiguous memory.) */
+     * the image first for data buffers: a USB driver can read its
+     * descriptors into .data on a page the boot has also allocated as
+     * contiguous memory. Its own descriptors, and a buffer in a TD's own
+     * allocation, resolve the window first, as here.) */
     if (xbox_ContiguousPageMap()[a >> 12])
         return g_apu_ram_ptr + 0x80000000u + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
