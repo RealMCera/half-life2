@@ -126,8 +126,31 @@ typedef void *(*QemuThreadFunc)(void *arg);
 static inline void qemu_thread_create(QemuThread *t, const char *name,
                                        void *(*func)(void *), void *arg,
                                        int mode) {
-    (void)name; (void)mode;
+    (void)mode;
     t->thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)func, arg, 0, NULL);
+#if defined(_WIN32)
+    /* Named so the thread can be found from the Linux side under Wine, which
+     * passes the description to the task's comm (15 characters there).
+     * Looked up each time (threads are created rarely, and no shared cache
+     * to race on): Windows before 10 1607 and older Wine lack it. */
+    if (t->thread && name) {
+        typedef HRESULT (WINAPI *set_desc_fn)(HANDLE, PCWSTR);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        set_desc_fn set_desc = k32 ? (set_desc_fn)(void (*)(void))
+                               GetProcAddress(k32, "SetThreadDescription") : NULL;
+        if (set_desc) {
+            WCHAR w[64];
+            int i;
+            for (i = 0; i < 63 && name[i]; i++) w[i] = (WCHAR)(unsigned char)name[i];
+            w[i] = 0;
+            set_desc(t->thread, w);
+        }
+    }
+#else
+    /* POSIX builds reach CreateThread through the compat shim; naming the
+     * thread there (pthread_setname_np) is a TASKS follow-up. */
+    (void)name;
+#endif
 }
 #endif
 

@@ -33,19 +33,17 @@
 
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS      2
-/* Device buffer size and count: the same defaults and knobs as the XAudio2
- * backend (512 x 4: 10.7 ms per buffer, 43 ms queued at the high mark). The
- * count is a pacing mark here, not a slot limit: SDL's queue is unbounded. */
-#define SDLA_BUF_SAMPLES_DEFAULT 512
-#define SDLA_NUM_BUFS_DEFAULT    4
+/* Device buffer size and count: the same defaults (apu_xaudio2.h) and knobs
+ * as the XAudio2 backend, with no Wine case. The count is a pacing mark
+ * here, not a slot limit: SDL's queue is unbounded. */
 #define SDLA_BUF_SAMPLES_MIN     128
 #define SDLA_BUF_SAMPLES_MAX     4096
 #define SDLA_NUM_BUFS_MIN        2
 #define SDLA_NUM_BUFS_MAX        8
 
 static SDL_AudioDeviceID g_dev;
-static int       g_buf_samples = SDLA_BUF_SAMPLES_DEFAULT;
-static int       g_num_bufs    = SDLA_NUM_BUFS_DEFAULT;
+static int       g_buf_samples = XA2_BUF_SAMPLES_DEFAULT;
+static int       g_num_bufs    = XA2_NUM_BUFS_DEFAULT;
 static int       g_initialized;
 static int       g_audio_opened;    /* this backend brought SDL audio up */
 static int       g_frames_written;  /* periods handed to the queue */
@@ -93,9 +91,9 @@ int xa2_init(void)
 
     if (g_initialized) return 1;
 
-    g_buf_samples = env_int(RENV_AUDIO_BUF_SAMPLES, SDLA_BUF_SAMPLES_DEFAULT,
+    g_buf_samples = env_int(RENV_AUDIO_BUF_SAMPLES, XA2_BUF_SAMPLES_DEFAULT,
                             SDLA_BUF_SAMPLES_MIN, SDLA_BUF_SAMPLES_MAX);
-    g_num_bufs = env_int(RENV_AUDIO_BUF_COUNT, SDLA_NUM_BUFS_DEFAULT,
+    g_num_bufs = env_int(RENV_AUDIO_BUF_COUNT, XA2_NUM_BUFS_DEFAULT,
                          SDLA_NUM_BUFS_MIN, SDLA_NUM_BUFS_MAX);
 
     /* Headless: no speakers unless the caller names a driver. Must be set

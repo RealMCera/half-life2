@@ -12,6 +12,7 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 #include "recomp_env.h"
+#include "host_time.h"
 
 /* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
  * the same xa2_* functions over SDL2. */
@@ -26,11 +27,9 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
- * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
- * override them at xa2_init, clamped to the static storage below. */
-#define XA2_BUF_SAMPLES_DEFAULT 512
-#define XA2_NUM_BUFS_DEFAULT    4
+/* Device buffer size and count: defaults in apu_xaudio2.h, deeper under
+ * Wine; RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT override them at
+ * xa2_init, clamped to the static storage below. */
 #define XA2_BUF_SAMPLES_MIN     128
 #define XA2_BUF_SAMPLES_MAX     4096
 #define XA2_NUM_BUFS_MIN        2
@@ -73,6 +72,7 @@ int xa2_init(void)
 {
     HRESULT hr;
     int com_initialized;
+    int under_wine, wine_default;
     WAVEFORMATEX wfx = { 0 };
 
     if (g_xa2_initialized) return 1;
@@ -80,8 +80,12 @@ int xa2_init(void)
     g_xa2_buf_samples = xa2_env_int(RENV_AUDIO_BUF_SAMPLES,
                                     XA2_BUF_SAMPLES_DEFAULT,
                                     XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
-    g_xa2_num_bufs = xa2_env_int(RENV_AUDIO_BUF_COUNT, XA2_NUM_BUFS_DEFAULT,
+    under_wine = xbox_HostUnderWine();
+    g_xa2_num_bufs = xa2_env_int(RENV_AUDIO_BUF_COUNT,
+                                 xa2_default_buf_count(under_wine),
                                  XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
+    wine_default = under_wine && !(recomp_env(RENV_AUDIO_BUF_COUNT) &&
+                                   *recomp_env(RENV_AUDIO_BUF_COUNT));
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -129,9 +133,10 @@ int xa2_init(void)
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
 
-    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
+    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)%s\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
-            1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE);
+            1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE,
+            wine_default ? " (wine default)" : "");
     return 1;
 
 fail:

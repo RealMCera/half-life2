@@ -1146,6 +1146,42 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+/* RECOMP_AUDIO_THREAD_PRIORITY: the frame thread feeds the device queue, and
+ * under Wine a burst of busy threads can preempt it past what the queue
+ * holds. Windows only; whether Wine turns it into a Linux nice value depends
+ * on the process's RLIMIT_NICE, so the log shows only what was asked. */
+static void mcpx_apu_thread_priority(MCPXAPUState *d)
+{
+    const char *v = recomp_env(RENV_AUDIO_THREAD_PRIORITY);
+    int bad, prio;
+
+    if (!v || !*v) return;
+    prio = xa2_parse_priority(v, recomp_env_on(RENV_AUDIO_THREAD_TC), &bad);
+    if (bad)
+        fprintf(stderr, "[APU] RECOMP_AUDIO_THREAD_PRIORITY=%s not allowed;"
+                        " using %s\n", v, xa2_priority_name(prio));
+#if defined(_WIN32)
+    {
+        static const int level[] = { THREAD_PRIORITY_NORMAL,
+                                     THREAD_PRIORITY_HIGHEST,
+                                     THREAD_PRIORITY_TIME_CRITICAL };
+        if (!d->apu_thread.thread) return;
+        /* A refusal is the evidence task 2.1 looks for under Wine. */
+        if (!SetThreadPriority(d->apu_thread.thread, level[prio])) {
+            fprintf(stderr, "[APU] thread priority %s failed (error %lu)\n",
+                    xa2_priority_name(prio), (unsigned long)GetLastError());
+            return;
+        }
+        fprintf(stderr, "[APU] thread priority %s (read back %d)\n",
+                xa2_priority_name(prio),
+                GetThreadPriority(d->apu_thread.thread));
+    }
+#else
+    (void)d;
+    fprintf(stderr, "[APU] RECOMP_AUDIO_THREAD_PRIORITY ignored on this host\n");
+#endif
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -1417,6 +1453,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Start background frame thread */
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
+    mcpx_apu_thread_priority(d);
     mcpx_apu_wait_for_idle(d);
     qemu_mutex_unlock(&d->lock);
 
