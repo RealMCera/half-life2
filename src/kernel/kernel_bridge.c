@@ -1333,6 +1333,10 @@ static void bridge_NtAllocateVirtualMemory(void)
         return;
     }
 
+    /* NT rounds the region to whole pages and says so through RegionSize. */
+    if (size <= 0xFFFFF000u)
+        size = (size + 0xFFFu) & ~0xFFFu;
+
     /* Allocate from Xbox heap (MEM_RESERVE or MEM_RESERVE|MEM_COMMIT).
      *
      * A pure MEM_RESERVE costs no RAM on real hardware -- it takes address
@@ -1379,7 +1383,7 @@ static void bridge_NtAllocateVirtualMemory(void)
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         uint32_t want = size;
         while (want > 0x10000 && !xbox_va) {
-            want /= 2;
+            want = (want / 2 + 0xFFFu) & ~0xFFFu;
             xbox_va = xbox_HeapAlloc(want, 4096);
         }
         if (xbox_va) {
@@ -1620,8 +1624,12 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
         if (left && end - page_base > left)
             end = page_base + left;
         size = end - page_base;
-        if (size)
+        if (size) {
+            /* Decommitted pages come back read/write; the block stays, so
+             * the heap's own unprotect on free does not cover this. */
+            xbox_GuestUnprotect(page_base, size);
             memset(XBOX_TO_NATIVE(page_base), 0, size);
+        }
         decommits++;
         decommit_bytes += size;
     }
@@ -1694,6 +1702,7 @@ static void bridge_NtFreeVirtualMemory(void)
                     end = (uint64_t)vm_base + left;
                 if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
                     page_base = vm_base;
+                xbox_GuestUnprotect(page_base, (uint32_t)(end - page_base));
                 memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
                 BRIDGE_MEM32(base_ptr) = page_base;
                 BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
@@ -2486,7 +2495,10 @@ static void bridge_MmSetAddressProtect(void)
     uint32_t size = STACK_ARG(1);
     uint32_t prot = STACK_ARG(2);
 
-    xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
+    /* At the guest's page grain (xbox_GuestProtect) rather than through
+     * xbox_MmSetAddressProtect, which protects whole host pages. */
+    if (addr)
+        xbox_GuestProtect(addr, size, prot, NULL);
     g_eax = 0;
 }
 
@@ -9114,11 +9126,11 @@ static void bridge_NtProtectVirtualMemory(void)
     uint32_t old_ptr  = STACK_ARG(3);
     uint32_t base_va = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
     uint32_t size    = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
-    DWORD old = 0;
+    uint32_t old = 0;
 
-    if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
+    if (base_va && xbox_GuestProtect(base_va, size, new_prot, &old)) {
         if (old_ptr)
-            BRIDGE_MEM32(old_ptr) = (uint32_t)old;
+            BRIDGE_MEM32(old_ptr) = old;
         g_eax = 0;  /* STATUS_SUCCESS */
     } else {
         g_eax = 0xC0000005u;  /* STATUS_ACCESS_VIOLATION */

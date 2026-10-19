@@ -574,6 +574,26 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
 int xbox_HeapReclaimEnabled(void);
 
 /**
+ * Set the guest protection (NtProtectVirtualMemory, MmSetAddressProtect) of
+ * the 4 KB guest pages over [va, va + size). Each host page gets the most
+ * permissive protection of the guest pages in it, so on a host with larger
+ * pages a protected page never takes its neighbours with it. Only the base
+ * protection counts (no cache flags, no execute, write-copy as read/write).
+ * *old_protect gets the first page's previous guest protection. Returns 0 if
+ * the host refused.
+ */
+int xbox_GuestProtect(uint32_t va, uint32_t size, uint32_t xbox_protect,
+                      uint32_t *old_protect);
+
+/**
+ * Make the guest pages over [va, va + size) read/write again, as freed or
+ * decommitted memory is on the console. The heap and the contiguous arena
+ * call it when a block is freed. Costs nothing until a title has taken
+ * access away somewhere.
+ */
+void xbox_GuestUnprotect(uint32_t va, uint32_t size);
+
+/**
  * Get the file mapping handle for the Xbox memory region.
  * Used by the VEH handler to map additional mirror views on demand.
  * Returns NULL if file mapping is not available.

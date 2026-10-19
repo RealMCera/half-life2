@@ -4458,6 +4458,164 @@ ptrdiff_t xbox_GetMemoryOffset(void)
     return g_memory_offset;
 }
 
+/* ── Guest page protection ─────────────────────────────────
+ * A title changes guest page protection with NtProtectVirtualMemory and
+ * MmSetAddressProtect, and the protection outlives the memory: on the
+ * console, decommitted or released pages come back with fresh protection,
+ * but here the heap hands freed memory out again and zeroes it. Two things
+ * make that crash here where the console does not:
+ *
+ * - The host page can be larger than the guest's 4 KB (16 KB on Apple
+ *   silicon). JSRF makes a 480-byte table read-only; the host protected the
+ *   whole 16 KB around it, and the next heap block in that page faulted when
+ *   NtAllocateVirtualMemory zeroed it. So each guest page keeps its own
+ *   protection here, and a host page gets the most permissive protection of
+ *   the guest pages in it. A guest page the host cannot protect alone keeps
+ *   its neighbours' access; a title never relies on the fault, since a fault
+ *   on the console is a crash.
+ * - Freed memory keeps its protection. The heap and the contiguous arena
+ *   make a block's pages read/write again when it is freed, and NtFree when
+ *   it decommits, as the console's page tables are for that memory.
+ *
+ * Both tables are made the first time a title takes access away, so a
+ * title that never does pays no system call. 1 MB each: one byte per 4 KB
+ * of the 32-bit guest space. */
+#define GUEST_PAGES (1u << 20)
+static uint8_t *g_guest_prot;           /* the title's base protection, 0: never set */
+static uint8_t *g_host_restrict;        /* per host page: 0 read/write, 1 read-only, 2 no access */
+static SRWLOCK g_guest_prot_lock = SRWLOCK_INIT;
+
+static uint32_t guest_host_page(void)
+{
+    static uint32_t page;
+    if (!page) {
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        page = si.dwPageSize;
+#else
+        long n = sysconf(_SC_PAGESIZE);
+        page = n > 0 ? (uint32_t)n : 4096u;
+#endif
+        if (page < 4096u)
+            page = 4096u;
+    }
+    return page;
+}
+
+/* How much a guest protection takes away: 0 nothing, 1 write, 2 all.
+ * Only the base protection counts. The cache attributes (PAGE_NOCACHE,
+ * PAGE_WRITECOMBINE, which D3D sets on vertex buffers) mean nothing for host
+ * memory, and neither does execute, since the host never runs guest bytes.
+ * Write-copy is plain read/write: copy-on-write on the shared RAM view would
+ * split it from its mirrors. No base protection at all is read/write, as in
+ * xbox_protect_to_win32. */
+static int guest_prot_restrict(uint32_t base)
+{
+    if (!base || (base & 0xCCu))        /* READWRITE, WRITECOPY, EXECUTE_READWRITE, EXECUTE_WRITECOPY */
+        return 0;
+    if (base & 0x32u)                   /* READONLY, EXECUTE, EXECUTE_READ */
+        return 1;
+    return 2;                           /* NOACCESS */
+}
+
+/* Re-derive the host protection of the host pages over guest pages
+ * [first, last) and apply it where it changed, a run at a time. Caller holds
+ * g_guest_prot_lock. Returns 0 if the host refused. */
+static int guest_prot_apply(uint32_t first, uint32_t last)
+{
+    static const DWORD host[3] = { PAGE_READWRITE, PAGE_READONLY, PAGE_NOACCESS };
+    uint32_t per = guest_host_page() >> 12;     /* guest pages per host page */
+    uint32_t h = first / per, hend = (last + per - 1) / per, run = 0, run_r = 0;
+    int ok = 1;
+
+    for (; h <= hend; h++) {
+        uint32_t r = 3;                         /* ends the last run */
+        if (h < hend) {
+            r = 2;
+            for (uint32_t g = h * per; g < (h + 1) * per; g++) {
+                uint32_t gr = guest_prot_restrict(g_guest_prot[g]);
+                if (gr < r)
+                    r = gr;
+            }
+            if (r == g_host_restrict[h])
+                r = 3;                          /* unchanged: no call */
+        }
+        if (run && r != run_r) {
+            uint32_t start = h - run;
+            DWORD old;
+            if (!VirtualProtect((void *)((uintptr_t)start * per * 4096u + g_memory_offset),
+                                (SIZE_T)run * per * 4096u, host[run_r], &old))
+                ok = 0;
+            else
+                memset(&g_host_restrict[start], (int)run_r, run);
+            run = 0;
+        }
+        if (r < 3) {
+            run_r = r;
+            run++;
+        }
+    }
+    return ok;
+}
+
+int xbox_GuestProtect(uint32_t va, uint32_t size, uint32_t xbox_protect,
+                      uint32_t *old_protect)
+{
+    uint32_t base = xbox_protect & 0xFFu;
+    uint32_t first = va >> 12;
+    uint64_t end = ((uint64_t)va + size + 0xFFFu) >> 12;
+    int ok = 1;
+
+    if (!base)
+        base = PAGE_READWRITE;
+    if (end > GUEST_PAGES)
+        end = GUEST_PAGES;
+    AcquireSRWLockExclusive(&g_guest_prot_lock);
+    if (!g_guest_prot && guest_prot_restrict(base)) {
+        uint8_t *p = calloc(GUEST_PAGES, 1), *h = calloc(GUEST_PAGES, 1);
+        if (p && h) {
+            g_host_restrict = h;
+            __atomic_store_n(&g_guest_prot, p, __ATOMIC_RELEASE);
+        } else {
+            free(p);
+            free(h);
+        }
+    }
+    if (old_protect)
+        *old_protect = g_guest_prot && first < end && g_guest_prot[first]
+                     ? g_guest_prot[first] : PAGE_READWRITE;
+    /* No tables: nothing was ever taken away and nothing is now, so every
+     * host page is already read/write. */
+    if (g_guest_prot && first < end) {
+        memset(&g_guest_prot[first], (int)base, (size_t)(end - first));
+        ok = guest_prot_apply(first, (uint32_t)end);
+    }
+    ReleaseSRWLockExclusive(&g_guest_prot_lock);
+    return ok;
+}
+
+void xbox_GuestUnprotect(uint32_t va, uint32_t size)
+{
+    uint32_t first = va >> 12, g;
+    uint64_t end = ((uint64_t)va + size + 0xFFFu) >> 12;
+
+    if (!__atomic_load_n(&g_guest_prot, __ATOMIC_ACQUIRE) || !size)
+        return;
+    if (end > GUEST_PAGES)
+        end = GUEST_PAGES;
+    AcquireSRWLockExclusive(&g_guest_prot_lock);
+    /* Most freed memory was never protected: only call the host when some
+     * page of it was. */
+    for (g = first; g < end && !guest_prot_restrict(g_guest_prot[g]); g++)
+        ;
+    if (first < end)
+        memset(&g_guest_prot[first], 0, (size_t)(end - first));
+    if (g < end)
+        guest_prot_apply(first, (uint32_t)end);
+    ReleaseSRWLockExclusive(&g_guest_prot_lock);
+}
+
 /* ── Dynamic heap allocator ────────────────────────────────
  *
  * Simple bump allocator for MmAllocateContiguousMemory and similar.
@@ -4481,7 +4639,9 @@ static int g_heap_alloc_count = 0;
  * in bump order, so index order is address order and coalescing is a
  * neighbour check. */
 #define XBOX_HEAP_MAX_BLOCKS 65536
-static struct { uint32_t addr; uint32_t size; uint8_t free; }
+/* req only feeds the exhaustion report: what was asked for, since a reused
+ * block can be far larger. */
+static struct { uint32_t addr; uint32_t size; uint32_t req; uint8_t free; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
 
@@ -4495,13 +4655,17 @@ static SRWLOCK g_heap_lock = SRWLOCK_INIT;
  * and freeing skips over the empty slots that merging leaves behind, so a
  * title that allocates and frees a lot drains the heap far faster than it
  * uses it. Fixing that changes which address every later allocation gets, in
- * every title that ever frees, so it is off unless asked for. Read once: the
- * heap is hit constantly and the answer does not change. */
+ * every title that ever frees, so it is off unless asked for. A game that
+ * needs it turns it on through its env defaults, so "0" must mean off for an
+ * A/B run against that default. Read once: the heap is hit constantly and the
+ * answer does not change. */
 int xbox_HeapReclaimEnabled(void)
 {
     static int on = -1;
-    if (on < 0)
-        on = recomp_env(RENV_HEAP_RECLAIM) != NULL;
+    if (on < 0) {
+        const char *v = recomp_env(RENV_HEAP_RECLAIM);
+        on = v && *v && strcmp(v, "0") != 0;
+    }
     return on;
 }
 
@@ -4544,6 +4708,7 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
             i++;        /* the taken piece moved up one slot */
         g_heap_blocks[i].addr = start;
         g_heap_blocks[i].size = size;
+        g_heap_blocks[i].req = size;
         g_heap_blocks[i].free = 0;
         if (back && !heap_insert_free(i + 1, start + size, back))
             g_heap_blocks[i].size += back;   /* table full: keep it attached */
@@ -4919,6 +5084,7 @@ int xbox_ContiguousFree(uint32_t va)
         }
         return 0;
     }
+    xbox_GuestUnprotect(va, n * CONTIG_PAGE);
     memset(&g_contig_used[first], 0, n);
     g_contig_len[first] = 0;
     g_contig_pages_in_use -= n;
@@ -5065,6 +5231,92 @@ const volatile uint8_t *xbox_PhysRamNameMap(void)
 }
 
 
+/* Who ate the heap? Printed once, at the first failure.
+ *
+ * "used" in the failure line is the bump cursor, not what is live: freed
+ * blocks below it count as used until something reuses them. So say how the
+ * range splits -- live, held as slack (a reused block larger than its
+ * request), free in blocks, free above the cursor -- and the largest free
+ * run, which is what a big request needs. Then the live blocks grouped by
+ * block size with what their requests add up to: an exhausted heap is nearly
+ * always one size repeated, or a few big blocks holding small requests.
+ * (No caller address: kernel thunks reach the bridge with a dummy return
+ * address.) Caller holds g_heap_lock. */
+static void heap_report_exhaustion(void)
+{
+    static int dumped = 0;
+    static struct { uint32_t size; uint32_t n; uint64_t req; } by[256];
+    uint64_t live = 0, slack = 0, free_b = 0, run = 0, best = 0;
+    uint32_t nlive = 0, nfree = 0, prev_end = 0;
+    int used = 0;
+
+    if (dumped)
+        return;
+    dumped = 1;
+    for (int i = 0; i < g_heap_block_count; i++) {
+        int j = 0;
+        if (!g_heap_blocks[i].size)
+            continue;
+        if (g_heap_blocks[i].free) {
+            nfree++;
+            free_b += g_heap_blocks[i].size;
+            /* Neighbours that never merged still make one run. */
+            run = (prev_end == g_heap_blocks[i].addr ? run : 0)
+                + g_heap_blocks[i].size;
+            if (run > best)
+                best = run;
+        } else {
+            run = 0;
+            nlive++;
+            live += g_heap_blocks[i].req;
+            slack += g_heap_blocks[i].size - g_heap_blocks[i].req;
+            while (j < used && by[j].size != g_heap_blocks[i].size) j++;
+            if (j == used) {
+                if (used == 256) continue;   /* 256 distinct sizes is plenty */
+                by[used].size = g_heap_blocks[i].size;
+                by[used].n = 0;
+                by[used++].req = 0;
+            }
+            by[j].n++;
+            by[j].req += g_heap_blocks[i].req;
+        }
+        prev_end = g_heap_blocks[i].addr + g_heap_blocks[i].size;
+    }
+    /* A free run that reaches the cursor goes on above it; a longer run
+     * lower down still wins. */
+    if (run && prev_end == g_heap_next) {
+        if (run + (XBOX_HEAP_TOP - g_heap_next) > best)
+            best = run + (XBOX_HEAP_TOP - g_heap_next);
+    } else if (XBOX_HEAP_TOP - g_heap_next > best) {
+        best = XBOX_HEAP_TOP - g_heap_next;
+    }
+    fprintf(stderr, "  [HEAP] exhausted: %u live blocks %llu KB (+%llu KB slack "
+            "in reused blocks), %u free blocks %llu KB, %u KB above the "
+            "cursor; largest free run %llu KB; reclaim %s\n",
+            nlive, (unsigned long long)(live / 1024),
+            (unsigned long long)(slack / 1024), nfree,
+            (unsigned long long)(free_b / 1024),
+            (unsigned)((XBOX_HEAP_TOP - g_heap_next) / 1024),
+            (unsigned long long)(best / 1024),
+            xbox_HeapReclaimEnabled() ? "on" : "off");
+    /* Biggest holders first, without sorting the table. */
+    for (int k = 0; k < 24; k++) {
+        int m = -1;
+        for (int j = 0; j < used; j++)
+            if (by[j].n && (m < 0 || (uint64_t)by[j].n * by[j].size >
+                                     (uint64_t)by[m].n * by[m].size))
+                m = j;
+        if (m < 0 || (uint64_t)by[m].n * by[m].size < 256 * 1024)
+            break;
+        fprintf(stderr, "  [HEAP]   %u live blocks of %u bytes (%llu KB) "
+                "holding %llu KB of requests\n", by[m].n, by[m].size,
+                (unsigned long long)((uint64_t)by[m].n * by[m].size / 1024),
+                (unsigned long long)(by[m].req / 1024));
+        by[m].n = 0;
+    }
+    fflush(stderr);
+}
+
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
 
 static uint32_t heap_alloc(uint32_t size, uint32_t alignment)
@@ -5091,6 +5343,15 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
      * minimum of 4096 bytes so each allocation gets its own memory. */
     if (size < 16) size = 16;
 
+    /* A page-aligned request is a page allocation (NtAllocateVirtualMemory,
+     * MmAllocateSystemMemory): it owns whole pages, as on the console, so the
+     * next small block cannot start in its last page. Sharing that page broke
+     * JSRF under Proton: it makes a 0x46500-byte buffer read-only, and the
+     * page protection rounds out over the start of the next allocation, which
+     * the game then zeroes. Hosts with larger pages hid it. */
+    if (alignment >= 4096 && size <= 0xFFFFF000u)
+        size = (size + 4095) & ~4095u;
+
     /* Reuse a freed block first. Without this the heap only ever grows: Halo's
      * debug build allocates and releases heavily through init, exhausted all
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
@@ -5111,6 +5372,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
                 continue;   /* wrong alignment for this request */
             }
             g_heap_blocks[i].free = 0;
+            g_heap_blocks[i].req = size;
             result = g_heap_blocks[i].addr;
             memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
             return result;
@@ -5125,34 +5387,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
                 (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
-        /* Who ate the heap? Group live blocks by size -- an exhausted heap is
-         * nearly always one request size repeated, and the count names it. */
-        {
-            static int dumped = 0;
-            static struct { uint32_t size; int n; } hist[256];
-            if (!dumped) {
-                int used = 0;
-                dumped = 1;
-                for (int i = 0; i < g_heap_block_count; i++) {
-                    int j = 0;
-                    if (g_heap_blocks[i].free || !g_heap_blocks[i].size) continue;
-                    while (j < used && hist[j].size != g_heap_blocks[i].size) j++;
-                    if (j == used) {
-                        if (used == 256) continue;   /* ponytail: 256 distinct sizes is plenty */
-                        hist[used].size = g_heap_blocks[i].size;
-                        hist[used++].n = 0;
-                    }
-                    hist[j].n++;
-                }
-                for (int j = 0; j < used; j++) {
-                    if ((uint64_t)hist[j].n * hist[j].size < 1024 * 1024) continue;
-                    fprintf(stderr, "  [HEAP] %d live blocks of %u bytes (%u KB)\n",
-                            hist[j].n, hist[j].size,
-                            (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
-                }
-                fflush(stderr);
-            }
-        }
+        heap_report_exhaustion();
         return 0;
     }
 
@@ -5164,6 +5399,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
         g_heap_blocks[g_heap_block_count].addr = result;
         g_heap_blocks[g_heap_block_count].size = size;
+        g_heap_blocks[g_heap_block_count].req = size;
         g_heap_blocks[g_heap_block_count].free = 0;
         g_heap_block_count++;
     }
@@ -5235,6 +5471,14 @@ static void heap_free(uint32_t xbox_va)
             continue;
         }
         g_heap_blocks[i].free = 1;
+        /* Under the lock, so the block cannot be handed out again (and
+         * zeroed) while it is still read-only. Heap blocks are not
+         * page-aligned, so this rounds out to whole guest pages and also
+         * clears the recorded protection of a live neighbour sharing an
+         * edge page. That only loosens it, which is safe; rounding inward
+         * would leave a read-only edge on the freed block and bring back
+         * the faults when the heap reuses it. */
+        xbox_GuestUnprotect(g_heap_blocks[i].addr, g_heap_blocks[i].size);
         if (++matched % 512 == 0) {
             fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
                     frees, matched, g_heap_block_count);

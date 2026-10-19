@@ -107,7 +107,7 @@ extern "C" {
     X(TITLE_KEVENTS,     CONFIG, "RECOMP_TITLE_KEVENTS",     NULL, "1: a KEVENT the title builds itself gets a host event (upstream, default off)") \
     X(FILE_APC_DEFER,    CONFIG, "RECOMP_FILE_APC_DEFER",    NULL, "0: run a file I/O APC inside the request (old inline delivery); default 1 runs it at the issuing thread's next alertable wait, as the kernel does") \
     X(GUEST_LOCK,        CONFIG, "RECOMP_GUEST_LOCK",        NULL, "1: one guest thread runs guest code at a time, released in kernel calls (upstream, default off)") \
-    X(HEAP_RECLAIM,      CONFIG, "RECOMP_HEAP_RECLAIM",      NULL, "set: the heap splits and merges freed blocks exactly (upstream, default off)") \
+    X(HEAP_RECLAIM,      CONFIG, "RECOMP_HEAP_RECLAIM",      NULL, "1: on, the heap splits and merges freed blocks (upstream); 0 or empty: off; a game may default it on") \
     X(EXT_VMA,           CONFIG, "RECOMP_EXT_VMA",           NULL, "set: honour reservations at fixed addresses above the RAM mirrors (upstream, default off)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(MOUSE,             CONFIG, "RECOMP_MOUSE",             NULL, "1: the mouse drives pad 1 (a stick and buttons); 0: off") \

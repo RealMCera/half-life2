@@ -15,7 +15,8 @@ One test per mode, one process each, because the switches are read once and cach
 
 | Test | What it checks |
 |---|---|
-| `memory_regressions_default` | No switch set. Pins what every title gets today: reuse hands a freed block over whole, a freed contiguous block is reused (this fork's first-fit contiguous arena works in every mode), an explicit high base is not honoured. A change to the default fails here. |
+| `memory_regressions_default` | No switch set. Pins what every title gets today: reuse hands a freed block over whole, a freed contiguous block is reused (this fork's first-fit contiguous arena works in every mode), an explicit high base is not honoured. A change to the default fails here. Every mode also checks that a page allocation owns whole pages: `NtAllocateVirtualMemory` of 0x46500 bytes reports 0x47000, and the next small block starts past it. Before, it started in the last page, so when JSRF made that buffer read-only, zeroing the next block faulted on 4 KB host pages (Proton). |
+| `memory_regressions_reclaim_zero` | `RECOMP_HEAP_RECLAIM=0`, which must mean off: a game may default the switch on, and 0 is how a run turns it back off. The default mode's checks. |
 | `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1`. The first table below. |
 | `memory_regressions_ext_vma` | `RECOMP_EXT_VMA=1`. The second table. |
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |
@@ -28,6 +29,7 @@ Each check fails without the change and passes with it.
 |---|---|
 | A 16-byte request after a 2 MB free takes 16 bytes | The whole 2 MB block, so a few thousand small requests drain the heap. |
 | The rest of that block is still available | Not reachable: it went with the first request. |
+| Four 256-byte requests after four 1 MB blocks are freed still leave a 768 KB request room inside them | It lands above them: each small request took a whole 1 MB block. This is how JSRF ran out of heap loading `Misc.dat`, with half the heap held as slack in reused blocks. |
 | Freeing three neighbours in the order first, second, third merges all three | The third never joins: the merge of the first two left an empty slot that the neighbour search stopped at. |
 | `NtFreeVirtualMemory(MEM_RELEASE)` on memory the heap supplied returns it | `STATUS_UNSUCCESSFUL`. The 32-bit guest slot went to the host `VirtualFree` as a pointer, so nothing came back. |
 | A page `MEM_DECOMMIT` then `MEM_COMMIT` again reads as zero; its neighbours keep their data | The old contents: both calls were no-ops on heap memory, while the console hands recommitted pages back zeroed. |
