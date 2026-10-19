@@ -31,6 +31,7 @@
 
 #include <stdint.h>
 #include "nv2a_vsh_cpu.h"   /* NV2A_VSH_SLOTS / NV2A_VSH_CONSTANTS */
+#include "nv2a_vsh_ff.h"    /* struct nv2a_ff_regs */
 
 #ifdef __cplusplus
 extern "C" {
@@ -214,10 +215,17 @@ struct nv2a_pb_vsh {
     int      stencil_enable;
     uint32_t stencil_func, stencil_ref, stencil_rmask, stencil_wmask;
     uint32_t stencil_op[3];
+    /* The fixed-function registers (lights, material, texgen, skinning), for
+     * the program nv2a_vsh_ff.c builds; ff_ready once nv2a_ff_init ran.
+     * ff_composite: a COMPOSITE_MATRIX row was written, so a fixed-function
+     * batch has a transform to run. */
+    struct nv2a_ff_regs ff;
+    int      ff_ready, ff_composite;
     /* survey */
     uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
     uint32_t mode_sets, ff_matrix_dwords, vp_dwords;
     uint32_t batches_prog, batches_fixed, verts_run, verts_bad;
+    uint32_t batches_ff, ff_too_long, ff_programs;
     uint32_t tris, tris_culled, tris_clipped, tris_textured;
     uint64_t z_rejected, a_rejected;
     uint32_t clears_seen, zclears, batches_3d, dumps_3d;

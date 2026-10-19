@@ -177,6 +177,7 @@ extern "C" {
     X(STUB_LOG,          TRACE, "stub",            "RECOMP_STUB_LOG",          "name each unresolved stub reached") \
     /* ── debug: RECOMP_DEBUG=key[=value],... ─────────────────────────── */ \
     X(PB_VSH,            DEBUG, "pb_vsh",          "RECOMP_PB_VSH",            "=0: no vertex-program interpreter") \
+    X(PB_FF,             DEBUG, "pb_ff",           "RECOMP_PB_FF",             "=0: fixed-function batches drawn untransformed") \
     X(PB_RC,             DEBUG, "pb_rc",           "RECOMP_PB_RC",             "=0: no register combiners (MODULATE)") \
     X(PB_FAST,           DEBUG, "pb_fast",         "RECOMP_PB_FAST",           "=0: CPU raster without fast paths") \
     X(PB_FAST_AB,        DEBUG, "pb_fast_ab",      "RECOMP_PB_FAST_AB",        "compare fast and slow raster per batch") \

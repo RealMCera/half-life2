@@ -13,8 +13,11 @@ add_executable(nv2a-vsh-epilogue nv2a_vsh_epilogue_test.c ${KERNEL}/nv2a_vsh_cpu
 add_executable(nv2a-vsh-fuzz nv2a_vsh_fuzz.c
     ${KERNEL}/nv2a_vsh_cpu.c ${D3D}/d3d8_vsh_parse.c
     oracle/nv2a_vsh_cpu_frozen.c oracle/d3d8_vsh_parse_frozen.c)
+# The fixed-function pipeline as microcode, through interpreter and parser.
+add_executable(nv2a-vsh-ff nv2a_vsh_ff_test.c
+    ${KERNEL}/nv2a_vsh_ff.c ${KERNEL}/nv2a_vsh_cpu.c ${D3D}/d3d8_vsh_parse.c)
 
-foreach(t nv2a-vsh-test nv2a-vsh-epilogue nv2a-vsh-fuzz)
+foreach(t nv2a-vsh-test nv2a-vsh-epilogue nv2a-vsh-fuzz nv2a-vsh-ff)
     target_include_directories(${t} PRIVATE ${KERNEL} ${D3D})
     if(NOT WIN32)
         target_link_libraries(${t} PRIVATE m)
@@ -24,3 +27,4 @@ endforeach()
 add_test(NAME nv2a-vsh-programs COMMAND nv2a-vsh-test)
 add_test(NAME nv2a-vsh-epilogue COMMAND nv2a-vsh-epilogue)
 add_test(NAME nv2a-vsh-fuzz COMMAND nv2a-vsh-fuzz)
+add_test(NAME nv2a-vsh-ff COMMAND nv2a-vsh-ff)

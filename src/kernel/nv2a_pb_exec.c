@@ -2473,10 +2473,16 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * w beside it, which is everything the rasteriser needs.
  *
  * A batch takes this path when SET_TRANSFORM_EXECUTION_MODE says PROGRAM.
- * Fixed-function mode keeps the old screen-space path: no title run so far
- * sends a fixed-function matrix (no SET_MODEL_VIEW/COMPOSITE_MATRIX in the
- * stream), so there is nothing to synthesise yet, and the report says if that
- * changes.
+ * A fixed-function batch takes it too once the title has written a
+ * composite matrix: nv2a_vsh_ff.c writes the fixed-function pipeline out as
+ * a program, and the draw runs that in place of the title's (ff_begin). Jet
+ * Set Radio Future draws its city in fixed-function mode; drawn as screen
+ * space, every facade came out a flat rectangle. A fixed-function batch with
+ * no composite matrix behind it keeps the old screen-space path, as every
+ * batch did before. BLiNX 2 never sends one; Burnout 3 does, so its few
+ * fixed-function batches now take the transform, as on xemu. A program too
+ * long for the slots skips its batches rather than drawing them as screen
+ * space. RECOMP_PB_FF=0 turns the synthesis off.
  *
  * RECOMP_PB_VSH=0 turns the path off, which is the A/B switch for comparing
  * dumps against the old executor.
@@ -2574,6 +2580,12 @@ static int vsh_enabled(void)
 /* The transform-unit methods. Returns 1 if `method` was one of them. */
 static int vsh_method(uint32_t method, uint32_t param)
 {
+    if (!s_vsh.ff_ready) {
+        nv2a_ff_init(&s_vsh.ff);
+        s_vsh.ff_ready = 1;
+    }
+    if (nv2a_ff_method(&s_vsh.ff, method, param))
+        return 1;
     switch (method) {
     case 0x03B8: s_vsh.spec_enable = param != 0; return 1;  /* SET_SPECULAR_ENABLE */
     case 0x0294: s_vsh.light_ctl = param; return 1;         /* SET_LIGHT_CONTROL */
@@ -2643,6 +2655,8 @@ static int vsh_method(uint32_t method, uint32_t param)
                 s_vsh.c[row][slot % 4] = u2f(param);
                 if (i < 4)
                     s_vsh.ff_matrix_dwords++;
+                if (i == 0)
+                    s_vsh.ff_composite = 1;
                 return 1;
             }
         }
@@ -2772,9 +2786,136 @@ static void vsh_inline_attr(uint32_t method, uint32_t param)
     }
 }
 
+/* A fixed-function batch running its synthesised program (ff_begin). */
+static int s_ff_active;
+
 static int vsh_batch_active(void)
 {
-    return vsh_enabled() && (s_vsh.mode & 3u) == 2u;
+    return vsh_enabled() && ((s_vsh.mode & 3u) == 2u || s_ff_active);
+}
+
+static int ff_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_PB_FF);
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Fixed-function programs by their key fields: the hash picks the candidate,
+ * the fields confirm it, so a hash collision cannot draw with another
+ * state's program. serial is what the draw puts in prog_dwords: the
+ * backends memoise their shader on (prog_dwords, start), and a fresh serial
+ * per built program keeps a replaced entry from reusing a stale memo. */
+#define FF_CACHE 32
+static struct {
+    uint64_t key;
+    uint32_t fields[NV2A_FF_KEY_WORDS];
+    uint32_t serial;
+    int      n;                          /* slots; 0: did not fit */
+    uint32_t prog[NV2A_VSH_SLOTS][4];
+} s_ff_cache[FF_CACHE];
+static int s_ff_cache_n, s_ff_cache_next;
+static uint32_t s_ff_serial;
+
+/* What ff_begin displaced, for ff_end. */
+static struct {
+    uint32_t prog[NV2A_VSH_SLOTS][4];
+    float    c[NV2A_FF_LC_ROWS][4];
+    uint32_t start, prog_dwords;
+    int      n;
+} s_ff_save;
+
+/* A fixed-function batch with a transform behind it: put its program in
+ * slots 0.. and its light constants in the top NV2A_FF_LC_ROWS rows, so every
+ * consumer of the program state (the CPU interpreter, the Metal and D3D11
+ * translators) draws it through the path programs take. Hardware keeps the
+ * fixed-function pipeline apart from program memory, so ff_end puts the
+ * title's slots and rows back before the next method. Returns 1 if it did,
+ * 0 for a batch that is not this path's, and -1 for one whose program does
+ * not fit the 136 slots: drawn as screen space its object-space vertices
+ * would only smear rectangles over the frame, so the caller skips it. */
+static int ff_begin(void)
+{
+    uint64_t key;
+    uint32_t fields[NV2A_FF_KEY_WORDS];
+    int i, e = -1;
+
+    if ((s_vsh.mode & 3u) != 0u || !s_vsh.ff_composite
+            || !vsh_enabled() || !ff_enabled())
+        return 0;
+    if (!s_vsh.ff_ready) {
+        nv2a_ff_init(&s_vsh.ff);
+        s_vsh.ff_ready = 1;
+    }
+    s_vsh.ff.light_ctl = s_vsh.light_ctl;
+    s_vsh.ff.spec_enable = s_vsh.spec_enable;
+    s_vsh.ff.fog_enable = (uint32_t)s_vsh.fog_enable;
+    s_vsh.ff.fog_gen = s_vsh.fog_gen;
+    key = nv2a_ff_key(&s_vsh.ff);
+    nv2a_ff_key_fields(&s_vsh.ff, fields);
+    for (i = 0; i < s_ff_cache_n; i++)
+        if (s_ff_cache[i].key == key
+                && !memcmp(s_ff_cache[i].fields, fields, sizeof fields)) {
+            e = i;
+            break;
+        }
+    if (e < 0) {
+        if (s_ff_cache_n < FF_CACHE)
+            e = s_ff_cache_n++;
+        else {
+            e = s_ff_cache_next;
+            s_ff_cache_next = (s_ff_cache_next + 1) % FF_CACHE;
+        }
+        s_ff_cache[e].key = key;
+        memcpy(s_ff_cache[e].fields, fields, sizeof fields);
+        s_ff_cache[e].serial = ++s_ff_serial;
+        s_ff_cache[e].n = nv2a_ff_build(&s_vsh.ff, s_ff_cache[e].prog,
+                                        NV2A_VSH_SLOTS, NULL);
+        s_vsh.ff_programs++;
+        if (recomp_env(RENV_VSH_TRACE))
+            fprintf(stderr, "  [VSH] fixed-function program %u: key %016llX,"
+                            " %d slots (lighting %u mask 0x%X skin %u"
+                            " texgen0 %X/%X texmat %u%u%u%u fog %u/%u)\n",
+                    s_ff_cache[e].serial, (unsigned long long)key,
+                    s_ff_cache[e].n, s_vsh.ff.lighting, s_vsh.ff.light_mask,
+                    s_vsh.ff.skin, s_vsh.ff.texgen[0][0], s_vsh.ff.texgen[0][1],
+                    s_vsh.ff.texmat[0], s_vsh.ff.texmat[1], s_vsh.ff.texmat[2],
+                    s_vsh.ff.texmat[3], s_vsh.ff.fog_enable, s_vsh.ff.fog_gen);
+    }
+    if (s_ff_cache[e].n <= 0) {
+        if (s_vsh.ff_too_long++ == 0)
+            fprintf(stderr, "  [VSH] a fixed-function program (lighting %u,"
+                            " mask 0x%X) needs more than %d slots: its batches"
+                            " are skipped and counted in the report\n",
+                    s_vsh.ff.lighting, s_vsh.ff.light_mask, NV2A_VSH_SLOTS);
+        return -1;
+    }
+    s_ff_save.n = s_ff_cache[e].n;
+    s_ff_save.start = s_vsh.start;
+    s_ff_save.prog_dwords = s_vsh.prog_dwords;
+    memcpy(s_ff_save.prog, s_vsh.prog, (size_t)s_ff_save.n * sizeof s_vsh.prog[0]);
+    memcpy(s_ff_save.c, &s_vsh.c[NV2A_FF_LC_BASE], sizeof s_ff_save.c);
+    memcpy(s_vsh.prog, s_ff_cache[e].prog, (size_t)s_ff_save.n * sizeof s_vsh.prog[0]);
+    nv2a_ff_consts(&s_vsh.ff, &s_vsh.c[NV2A_FF_LC_BASE]);
+    s_vsh.start = 0;
+    s_vsh.prog_dwords = 0x80000000u | s_ff_cache[e].serial;
+    s_ff_active = 1;
+    s_vsh.batches_ff++;
+    return 1;
+}
+
+static void ff_end(void)
+{
+    if (!s_ff_active)
+        return;
+    memcpy(s_vsh.prog, s_ff_save.prog, (size_t)s_ff_save.n * sizeof s_vsh.prog[0]);
+    memcpy(&s_vsh.c[NV2A_FF_LC_BASE], s_ff_save.c, sizeof s_ff_save.c);
+    s_vsh.start = s_ff_save.start;
+    s_vsh.prog_dwords = s_ff_save.prog_dwords;
+    s_ff_active = 0;
 }
 
 /* Track the program a batch runs, for the report and for RECOMP_VSH_TRACE.
@@ -5401,6 +5542,11 @@ static void vsh_report(void)
             s_vsh.verts_bad, s_vsh.tris, s_vsh.tris_textured, s_vsh.tris_culled,
             s_vsh.tris_clipped, (unsigned long long)s_vsh.z_rejected,
             vsh_enabled() ? "" : "  [pb_vsh=0: path off]");
+    fprintf(stderr, "[VSH] fixed-function: %u batches through %u synthesised"
+                    " program(s), %u skipped (program too long)%s%s\n",
+            s_vsh.batches_ff, s_vsh.ff_programs, s_vsh.ff_too_long,
+            s_vsh.ff_composite ? "" : "  [no composite matrix sent]",
+            ff_enabled() ? "" : "  [pb_ff=0: off]");
     tex_log_report();
     fprintf(stderr, "[VSH] clipping %s: %llu tris clipped (%llu partly behind"
                     " the eye, %llu wholly behind, %llu guard band, %llu z) ->"
@@ -6155,6 +6301,10 @@ static void draw_primitive(void)
 
     if (s_gpu.color_keep != 0xFFFFFFFFu)   /* a depth/stencil-only pass draws no colour */
         present_note(0);
+    if (ff_begin() < 0) {
+        s_perf.batches++;
+        return;
+    }
     vsh_const_dump_draw();
     vsh_note_gpu();
     fb_prog_draw();
@@ -6185,6 +6335,7 @@ static void draw_primitive(void)
         if (s_backend->writes_back)
             s_gpu_backend_batches++;
     }
+    ff_end();
     s_perf.batches++;
 
     if (recomp_env(RENV_PB_EXEC_VERBOSE)) {
