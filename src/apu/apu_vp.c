@@ -869,8 +869,8 @@ struct VpVoiceStat {
     double   sq;
     float    last, ea, rate;
     uint32_t addr, fmt;
-    uint16_t vol0, vol1;
-    uint8_t  bin0, bin1;
+    uint16_t vol[8];
+    uint8_t  bin[8];
     const char *cls;
 };
 static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
@@ -974,7 +974,8 @@ static void vp_stat_report(MCPXAPUState *d)
         struct VpVoiceStat *s = &s_vstat[v];
         if (!s->frames) continue;
         vp_trace("[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
-                " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
+                " rate=%.3f ea=%.2f vol=%03X/%03X/%03X/%03X/%03X/%03X/%03X/%03X"
+                " bin=%u/%u/%u/%u/%u/%u/%u/%u addr=%08X %s"
                 " frames=%u rms=%.0f zcr=%.2f\n",
                 s_vstat_secs, v, s->fmt,
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
@@ -982,7 +983,10 @@ static void vp_stat_report(MCPXAPUState *d)
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE)),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE)),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
-                s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
+                s->rate, s->ea, s->vol[0], s->vol[1], s->vol[2], s->vol[3],
+                s->vol[4], s->vol[5], s->vol[6], s->vol[7],
+                s->bin[0], s->bin[1], s->bin[2], s->bin[3],
+                s->bin[4], s->bin[5], s->bin[6], s->bin[7], s->addr,
                 s->cls ? s->cls : "?", s->frames,
                 sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
         s->frames = 0; s->zc = 0; s->sq = 0;
@@ -1654,8 +1658,10 @@ static void voice_process(MCPXAPUState *d,
     if (s_vstat_on > 0) {
         s_vstat[v].ea = ea_value;
         s_vstat[v].rate = rate;
-        s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
-        s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
+        for (int i = 0; i < 8; i++) {
+            s_vstat[v].vol[i] = vol[i];
+            s_vstat[v].bin[i] = (uint8_t)bin[i];
+        }
     }
 
     if (voice_should_mute(v)) return;
