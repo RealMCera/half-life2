@@ -518,6 +518,11 @@ struct MCPXAPUState {
      * off write re-arms it by moving ssl_starts on, with no lock and no
      * re-arm lost to the frame thread's read-check-set. */
     uint32_t ssl_fired_at;
+    /* Set by the code that runs an emulated GP, while it runs. That GP takes
+     * every sequencer frame as it comes, so it is taken to keep pace, and the
+     * sample-limit tick (a stand-in for the stub GP falling behind) stays
+     * off: see mcpx_apu_ssl_tick. The frame thread's alone. */
+    bool gp_emulated;
 
     int ep_frame_div;
     int sleep_acc_us;

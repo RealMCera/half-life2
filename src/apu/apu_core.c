@@ -1098,14 +1098,23 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
  *
  * Firing once per sequencer start is a concession to the stub DSPs,
  * not emulation: the first interrupt is the one Black needs, and a
- * SECTL off write re-arms it (see mcpx_apu_write). */
+ * SECTL off write re-arms it (see mcpx_apu_write).
+ *
+ * An emulated GP keeps the tick off (gp_emulated). The restart is lossy:
+ * DirectSound (JSRF) reloads the GP from the scratch image with the
+ * command block it saved at the first download. Its effect parameter
+ * commit reads the effect state back from the live GP, sets its update
+ * bit and writes it into that image with command 2, and that state
+ * carries the bit the effect code sets once its init has run. A restart
+ * after such a commit loads code that skips its init, leaves its DMA
+ * descriptors zero and stalls the title. */
 void mcpx_apu_ssl_tick(MCPXAPUState *d)
 {
     uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
     uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
     uint32_t armed = qatomic_read(&d->ssl_starts) + 1;
     d->sample_count += NUM_SAMPLES_PER_FRAME;
-    if (ssl
+    if (ssl && !d->gp_emulated
             && d->ssl_fired_at != armed
             && d->sample_count >= ssl
             && (sectl & NV_PAPU_SECTL_XCNTMODE)

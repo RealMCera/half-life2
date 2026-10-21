@@ -8,7 +8,7 @@
  * restart ran 23 times a second (JSRF). This checks the tick fires once at
  * the limit, not again after the title's restart or a running mode written
  * while running, again after the sequencer is switched off and on, and never
- * with no limit or the counter off.
+ * with no limit, the counter off or an emulated GP.
  *
  * mcpx_apu_ssl_tick is the frame thread's per-frame step; an ISTS write of 0
  * (acks nothing) stands in for the frame thread turning set_irq into the
@@ -114,6 +114,23 @@ int main(void)
     mcpx_apu_mmio_write(d, NV_PAPU_SSL, 0, 4);
     ticks(d, frames * 4);
     CHECK("SSL 0: no SSLINTSTS", !ssl_status(d));
+
+    /* 6. An emulated GP keeps pace, so a fresh start reaches the limit with
+     *    no tick, while XGSCNT still counts. The tick would make DirectSound
+     *    restart the GP from a scratch image its effect commits have
+     *    changed. Clearing the flag brings the stub's tick back. */
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, 0, 4);
+    d->gp_emulated = true;
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_RUN, 4);
+    program(d);
+    ticks(d, frames * 2);
+    CHECK("emulated GP: no SSLINTSTS", !ssl_status(d));
+    CHECK("emulated GP: XGSCNT counts",
+          mcpx_apu_mmio_read(d, NV_PAPU_XGSCNT, 4) == 2 * SSL_SAMPLES);
+    d->gp_emulated = false;
+    ticks(d, 1);
+    CHECK("stub GP again: SSLINTSTS", ssl_status(d));
+    ack(d);
 
     if (failures) { printf("apu_ssl: %d failure(s)\n", failures); return 1; }
     printf("apu_ssl: all passed\n");
