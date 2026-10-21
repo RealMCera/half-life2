@@ -9,6 +9,56 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.6.0] - 2026-10-21
+
+### Added
+- Hor+ widescreen for 4:3 titles, opt-in through `display.aspect` (16:9,
+  16:10 or 21:9; the default 4:3 is stock): the render target and the
+  projection are padded so the 3D view widens, full-width 2D passes
+  stretch, the HUD keeps its centred 4:3 layout and `display.movie` places
+  movies. Square render targets are padded too, so screen-space
+  reflections reach the new edges. Metal and D3D11 match; the CPU
+  rasteriser ignores the key.
+- `display.overscan = n` crops n guest columns from each side (and the
+  matching rows) at present and zooms the rest, as a TV's overscan did.
+  0 is stock; it is refused with a wide `display.aspect`.
+- A static module table and a versioned mod API (v1) behind
+  `XBOXRECOMP_ENHANCE`, so enhancement code such as a game's free camera
+  hooks frames, input capture and exit without patching the runtime.
+- The fixed-function vertex pipeline: the executor builds the equivalent
+  vertex program from the fixed-function state (skinning, lighting,
+  texgen, fog, point size) and caches it, so the CPU, Metal and D3D11
+  paths all transform those batches. `RECOMP_PB_FF=0` turns it off.
+- `RECOMP_AUDIO_THREAD_PRIORITY` raises the APU thread's priority where
+  the host allows it; the thread is named `mcpx.apu_thread`.
+
+### Changed
+- Under Wine the XAudio2 source queue holds 6 buffers instead of 4, which
+  removes the idle underruns on the Steam Deck. Native Windows keeps 4.
+- Page-aligned allocations own whole pages and `NtAllocateVirtualMemory`
+  reports the rounded size, as NT does; on hosts with pages larger than
+  4 KB, guest page protection applies per guest page. The first heap
+  exhaustion prints a report of live, slack and free memory.
+- The GP stub's mixdown stages bins 6-9 at half and drops bin 10 (the
+  reverb send), as the real GP mixes them; titles that do not use those
+  bins are bit-identical.
+
+### Fixed
+- The sample-limit audio interrupt fires once per sequencer start instead
+  of every 2048 samples, so a title's DirectSound service no longer
+  restarts the DSPs many times a second (Jet Set Radio Future's first city
+  went from 48 to 55.5 fps on macOS).
+- ReadFileEx/WriteFileEx completion routines run at the issuing thread's
+  next alertable wait, as on hardware, and a manual-reset event set or
+  pulsed releases every waiter that started before it on POSIX hosts.
+- The colour clear value is read in the colour surface's format when the
+  clear runs, so 16-bit targets clear to the right colour.
+- Output-buffer scatter-gather entries go to the GP FIFO table instead of
+  overwriting the voice table, which cut gaps into streamed audio.
+- USB: the new-game template brings up the OHCI model, and a title that
+  links its own XAPI gets its pad, with physical addresses resolved as
+  XAPI meant them.
+
 ## [blinx2-v0.5.1] - 2026-10-17
 
 ### Added
