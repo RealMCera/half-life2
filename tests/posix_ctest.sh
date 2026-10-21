@@ -44,9 +44,9 @@ build_one() {
     # The dsp56300 archive (cmake/dsp56300.cmake, about 12 MB packed and 26 MB
     # unpacked) once per suite, not once per build that links it. They never
     # configure at the same time: apu_dsp_link runs in the parallel phase,
-    # template_main_apu_dsp after it.
+    # apu_dsp_emu and template_main_apu_dsp one after the other after it.
     case $t in
-        apu_dsp_link|template_main_apu_dsp)
+        apu_dsp_link|apu_dsp_emu|template_main_apu_dsp)
             set -- "$@" "-DXBOXRECOMP_DSP56300_CACHE=$B/_deps/dsp56300" ;;
     esac
     if ! cmake -S "$d" -B "$B/$t" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release "$@" \
@@ -75,7 +75,8 @@ export gen_str="${gen[*]-}"
 built=$B/built.txt
 for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] && is_project "$d" && basename "$d"
-done | xargs -P "${JOBS:-6}" -I{} bash -c 'build_one "$@"' _ {} >"$built"
+done | grep -vx apu_dsp_emu | xargs -P "${JOBS:-6}" -I{} bash -c 'build_one "$@"' _ {} >"$built"
+[ -f "$here/apu_dsp_emu/CMakeLists.txt" ] && build_one apu_dsp_emu >>"$built"
 # template_main once more with the enhancements layer in: the template starts
 # it only under XBOXRECOMP_ENHANCE, and a new game may build either way.
 if [ -f "$here/template_main/CMakeLists.txt" ]; then

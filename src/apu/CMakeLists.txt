@@ -22,8 +22,10 @@ target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # XBOXRECOMP_APU_DSP (top-level CMakeLists.txt): the dsp56300 JIT. PRIVATE,
 # so its header stays inside the APU; a static xbox_apu still carries the
-# archive and its system libraries to the game's link.
+# archive and its system libraries to the game's link. apu_dsp_emu.c is the
+# GP/EP device on it.
 if(XBOXRECOMP_APU_DSP_TARGET)
+    target_sources(xbox_apu PRIVATE apu_dsp_emu.c)
     target_link_libraries(xbox_apu PRIVATE ${XBOXRECOMP_APU_DSP_TARGET})
 endif()
 

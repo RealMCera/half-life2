@@ -18,6 +18,11 @@ LGPL-2.1-or-later — extracted from xemu
                           2019-2025 Matt Borgerson
     src/apu/apu_dsp.c     MCPX APU DSP (GP/EP)
                           (c) 2012 espes; 2019-2025 Matt Borgerson
+    src/apu/apu_dsp_emu.c MCPX APU GP/EP device on the dsp56300 JIT
+    src/apu/apu_dsp_emu.h (gp_ep.c and dsp_dma.c; the glue to the core
+                          is this project's own)
+                          (c) 2012, 2015 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
     src/apu/apu_vp.c      MCPX APU voice processor
                           (c) 2012 espes; 2018-2019 Jannik Vogel;
                           2019-2025 Matt Borgerson
