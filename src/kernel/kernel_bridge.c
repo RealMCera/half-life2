@@ -5531,17 +5531,42 @@ static void bridge_KeDisconnectInterrupt(void)
 /* ── KeSetBasePriorityThread (ordinal 143, 2 args) */
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
- * missing, so the thunk fell through to the fallback and returned 0. */
+ * missing, so the thunk fell through to the fallback and returned 0.
+ *
+ * Both take a PKTHREAD -- the guest thread object -- not a handle, and the
+ * implementation reaches the thread through a host HANDLE. Passing
+ * XBOX_TO_NATIVE(object) handed it a native pointer into guest memory that was
+ * never a thread handle, so the set did nothing and the query answered 0
+ * whatever had been asked for. Resolve the object to the handle that owns it.
+ *
+ * thobj_attach_token records token index -> object VA, and the handle table is
+ * indexed the same way, so the mapping inverts by scan. Linear, but these are
+ * rare calls -- a title sets a thread's priority when it creates it. */
+static HANDLE thobj_handle_from_object(uint32_t va)
+{
+    uint32_t i;
+
+    if (!va)
+        return NULL;
+    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+        if (s_token_thobj[i] == va)
+            return s_handle_table[i];
+    return NULL;
+}
+
 static void bridge_KeQueryBasePriorityThread(void)
 {
+    /* NULL rather than the object when it does not resolve: the shim answers
+     * a normal priority for an unknown handle, where the guest pointer used to
+     * be dereferenced as one. */
     g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+        thobj_handle_from_object(STACK_ARG(0)));
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+        thobj_handle_from_object(STACK_ARG(0)), (LONG)STACK_ARG(1));
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
