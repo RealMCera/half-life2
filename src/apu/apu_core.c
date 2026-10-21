@@ -455,6 +455,14 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
+        /* Only an explicit off write re-arms the sample limit: a running
+         * mode written while running is not a new start. DirectSound
+         * switches the counter off before each start in the titles this
+         * was checked on (Black, JSRF); one that changes mode without
+         * passing through off gets no second interrupt. */
+        if (addr == NV_PAPU_SECTL
+                && (val & NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF)
+            qatomic_inc(&d->ssl_starts);
         /* Starting the APU has to start the frame thread.
          *
          * The thread idles on pause_requested, which init sets and only the
@@ -1069,6 +1077,45 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
     return 0;
 }
 
+/* The SSL tick: the sequencer's sample-limit interrupt.
+ *
+ * DirectSound (Black, XDK 5849) resets XGSCNT to 0, programs SSL
+ * (0x800 = 2048 samples) and enables ISTS bit 3 in IEN. Its service
+ * routine -- dispatched on that bit, kicking the GP doorbell and
+ * reposting front-end commands -- is what lets the rest of
+ * DirectSound initialisation finish. Without the tick the title
+ * re-runs the sequencer setup forever and never gets past audio.
+ *
+ * What the hardware does here is inferred from that service routine,
+ * not documented: xemu never raises ISTS bit 3. The bit is probably
+ * the "delta panic" interrupt, which fires only when the GP falls
+ * behind the sequencer; the routine restarts the GP and EP, stalls
+ * 10 ms and programs XGSCNT and SSL again, which reads as recovery,
+ * and on hardware the DSP code it loaded would keep the limit from
+ * being reached. Our DSPs are stubs and never keep up, so a re-armed
+ * limit fires every 2048 samples and the title runs that recovery
+ * 23 times a second.
+ *
+ * Firing once per sequencer start is a concession to the stub DSPs,
+ * not emulation: the first interrupt is the one Black needs, and a
+ * SECTL off write re-arms it (see mcpx_apu_write). */
+void mcpx_apu_ssl_tick(MCPXAPUState *d)
+{
+    uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+    uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
+    uint32_t armed = qatomic_read(&d->ssl_starts) + 1;
+    d->sample_count += NUM_SAMPLES_PER_FRAME;
+    if (ssl
+            && d->ssl_fired_at != armed
+            && d->sample_count >= ssl
+            && (sectl & NV_PAPU_SECTL_XCNTMODE)
+                   != NV_PAPU_SECTL_XCNTMODE_OFF) {
+        d->ssl_fired_at = armed;
+        qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
+        d->set_irq = true;
+    }
+}
+
 /* A period that pace_step admitted has been rendered: advance the clock. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d)
 {
@@ -1270,27 +1317,7 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (div0 % 8 == 0 && d->ep_frame_div != div0)
             mcpx_apu_pace_rendered(d);
 
-        /* The SSL tick: the sequencer's periodic sample-limit interrupt.
-         *
-         * DirectSound (Black, XDK 5849) resets XGSCNT to 0, programs SSL
-         * (0x800 = 2048 samples) and enables ISTS bit 3 in IEN. Its service
-         * routine -- dispatched on that bit, kicking the GP doorbell and
-         * reposting front-end commands -- is what lets the rest of
-         * DirectSound initialisation finish. Without the tick the title
-         * re-runs the sequencer setup forever and never gets past audio. */
-        {
-            uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
-            uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
-            d->sample_count += NUM_SAMPLES_PER_FRAME;
-            if (ssl
-                    && d->sample_count >= ssl
-                    && (sectl & NV_PAPU_SECTL_XCNTMODE)
-                           != NV_PAPU_SECTL_XCNTMODE_OFF) {
-                d->sample_count -= ssl;
-                qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
-                d->set_irq = true;
-            }
-        }
+        mcpx_apu_ssl_tick(d);
 
         /* What xemu's frame thread does after each frame: turn a pending
          * notification (set by the voice processor or a trapped method) into
@@ -1376,6 +1403,8 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
                sizeof(d->ep.dsp->core.pram_opcache));
     }
     d->set_irq = false;
+    qatomic_set(&d->ssl_starts, 0);
+    d->ssl_fired_at = 0;
 }
 
 /* ============================================================

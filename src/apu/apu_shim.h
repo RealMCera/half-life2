@@ -36,6 +36,14 @@
 #endif
 #endif
 
+#ifndef qatomic_inc
+#ifdef _MSC_VER
+#define qatomic_inc(ptr) _InterlockedIncrement((long volatile*)(ptr))
+#else
+#define qatomic_inc(ptr) __sync_add_and_fetch((ptr), 1)
+#endif
+#endif
+
 /* 32-bit compare-and-swap: returns the value *p held, so the swap happened
  * when that equals old. A function rather than a macro so the width is fixed
  * by the prototype: long is 32 bits under MSVC but not on LP64 hosts. */

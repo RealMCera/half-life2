@@ -510,6 +510,14 @@ struct MCPXAPUState {
     /* The sequencer's sample counter (what XGSCNT reads back). Resets when
      * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
     uint64_t sample_count;
+    /* Sequencer starts: bumped by every SECTL write that switches the
+     * counter off (the guest's MMIO thread). */
+    uint32_t ssl_starts;
+    /* ssl_starts + 1 when the sample-limit interrupt last fired, so the
+     * zeroed state counts as not fired; the frame thread's alone. A SECTL
+     * off write re-arms it by moving ssl_starts on, with no lock and no
+     * re-arm lost to the frame thread's read-check-set. */
+    uint32_t ssl_fired_at;
 
     int ep_frame_div;
     int sleep_acc_us;
@@ -574,6 +582,10 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
 /* The period pace_step admitted was rendered: spend its credit. A pass that
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);
+
+/* The sequencer's sample-limit interrupt: advance the sample counter by one
+ * frame and raise SSLINTSTS once per sequencer start. See apu_core.c. */
+void mcpx_apu_ssl_tick(MCPXAPUState *d);
 
 /* Host starvation accounting (RECOMP_AUDIO_HOST; see apu_core.c). The
  * deficit is the wall clock since the baseline, in samples, less what the
