@@ -10,3 +10,14 @@ and remaining the copyright of espes, Jannik Vogel and Matt Borgerson.
 
 Shipping the verbatim text alongside those files is an LGPL requirement, not
 a courtesy.
+
+The rest are for dsp56300, linked only in builds with
+`-DXBOXRECOMP_APU_DSP=ON` (see "dsp56300" in the top-level NOTICE):
+
+- `MIT-dsp56300.txt`: dsp56300's own licence, verbatim from its v1.0.0
+  release archive.
+- `THIRDPARTY-dsp56300-emu.txt`: the archive's third-party file, verbatim:
+  every bundled crate with its licence and copyright.
+- `Apache-2.0.txt`, `LLVM-exception.txt`, `Unicode-3.0.txt`,
+  `Zlib-foldhash.txt`: the licence texts those crates use, taken from that
+  file.

@@ -20,6 +20,13 @@ add_library(xbox_apu STATIC
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# XBOXRECOMP_APU_DSP (top-level CMakeLists.txt): the dsp56300 JIT. PRIVATE,
+# so its header stays inside the APU; a static xbox_apu still carries the
+# archive and its system libraries to the game's link.
+if(XBOXRECOMP_APU_DSP_TARGET)
+    target_link_libraries(xbox_apu PRIVATE ${XBOXRECOMP_APU_DSP_TARGET})
+endif()
+
 # qemu_shim.h lives in nv2a/ - shared QEMU type abstraction
 target_include_directories(xbox_apu PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../nv2a

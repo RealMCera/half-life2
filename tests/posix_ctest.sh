@@ -41,6 +41,14 @@ build_one() {
     local t=$1 d=$here/${2:-$1} log=$B/$1.cfg.log
     shift; [ $# -gt 0 ] && shift
     gen=($gen_str)
+    # The dsp56300 archive (cmake/dsp56300.cmake, about 12 MB packed and 26 MB
+    # unpacked) once per suite, not once per build that links it. They never
+    # configure at the same time: apu_dsp_link runs in the parallel phase,
+    # template_main_apu_dsp after it.
+    case $t in
+        apu_dsp_link|template_main_apu_dsp)
+            set -- "$@" "-DXBOXRECOMP_DSP56300_CACHE=$B/_deps/dsp56300" ;;
+    esac
     if ! cmake -S "$d" -B "$B/$t" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release "$@" \
             >"$log" 2>&1; then
         # n/a only when the one error is the harness's own refusal: an error
@@ -72,6 +80,9 @@ done | xargs -P "${JOBS:-6}" -I{} bash -c 'build_one "$@"' _ {} >"$built"
 # it only under XBOXRECOMP_ENHANCE, and a new game may build either way.
 if [ -f "$here/template_main/CMakeLists.txt" ]; then
     build_one template_main_enhance template_main -DXBOXRECOMP_ENHANCE=ON >>"$built"
+    # And with the APU DSP (XBOXRECOMP_APU_DSP), which adds the pinned
+    # dsp56300 archive and its system libraries to the game's link.
+    build_one template_main_apu_dsp template_main -DXBOXRECOMP_APU_DSP=ON >>"$built"
 fi
 for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] || echo "n/a   $(basename "$d"): no CMakeLists.txt, not a ctest"

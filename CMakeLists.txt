@@ -55,6 +55,28 @@ if(XBOXRECOMP_ENHANCE)
     add_subdirectory(src/enhance)
 endif()
 
+# MCPX APU DSP emulation: the GP and EP run the title's DSP56300 programs on
+# the MIT dsp56300 JIT (cmake/dsp56300.cmake, a pinned prebuilt archive per
+# target) instead of the stub's host-side ack and stereo fold. Opt-in: OFF
+# by default, and even ON the stub stays the run-time default until
+# RECOMP_APU_DSP=1. ON defines XBOXRECOMP_APU_DSP on recomp_env (PUBLIC, so
+# the APU and the key table agree) and links dsp56300 into xbox_apu.
+# A target without an archive (iPadOS, MSVC, universal macOS) builds as OFF,
+# with a warning; a failed download is an error. Until the device model
+# defines XBOXRECOMP_APU_DSP_DEVICE, RECOMP_APU_DSP=1 keeps the stub.
+option(XBOXRECOMP_APU_DSP "Build the opt-in MCPX APU DSP emulation (dsp56300 JIT)" OFF)
+set(XBOXRECOMP_APU_DSP_TARGET "")
+if(XBOXRECOMP_APU_DSP)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dsp56300.cmake)
+    xboxrecomp_dsp56300(XBOXRECOMP_APU_DSP_TARGET _dsp56300_why)
+    if(XBOXRECOMP_APU_DSP_TARGET)
+        target_compile_definitions(recomp_env PUBLIC XBOXRECOMP_APU_DSP)
+    else()
+        message(WARNING "XBOXRECOMP_APU_DSP=ON but ${_dsp56300_why}: "
+            "building without the APU DSP (the stub only)")
+    endif()
+endif()
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 

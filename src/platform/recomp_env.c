@@ -224,6 +224,55 @@ static void default_on(const char **values, int id, int supported)
     values[id] = on ? (v ? v : "1") : NULL;
 }
 
+/* RECOMP_APU_DSP: 1 runs the GP and EP on the DSP56300 JIT, 0 (the default)
+ * keeps the stub. Resolved to "1" or NULL, so a reader asks only "is it
+ * set". It runs after the game's defaults, so the override below also
+ * covers a game's own apu_dsp_ack default.
+ *
+ * With the DSP on, two stub keys no longer make sense: the GP answers its
+ * own doorbell, so the host ack (apu_dsp_ack, default auto) would clear a
+ * word the program is still to clear itself, and the output comes from the
+ * GP, not the stub's fold that apu_mixdown_all picks. Both are forced off,
+ * with one line when the user had set either.
+ *
+ * Until the device model is built in (XBOXRECOMP_APU_DSP_DEVICE, defined
+ * next to it), nothing would answer the doorbell once the host ack is off
+ * and audio init would wait for ever; so 1 keeps the stub, with a line, as
+ * it does in a build without the DSP (XBOXRECOMP_APU_DSP=OFF). The stub's
+ * ack and fold then keep working. */
+static void apu_dsp_resolve(const char **values, const char *set)
+{
+    const char *v = values[RENV_APU_DSP];
+
+    (void)set;                    /* read only once the device is in */
+    values[RENV_APU_DSP] = NULL;
+    if (!v || !*v || !strcmp(v, "0"))
+        return;
+    if (strcmp(v, "1")) {
+        note("[ENV] RECOMP_APU_DSP=%s: not 0 or 1; the stub (0)\n", v);
+        return;
+    }
+#if !defined(XBOXRECOMP_APU_DSP)
+    note("[ENV] RECOMP_APU_DSP=1: this build has no APU DSP"
+         " (XBOXRECOMP_APU_DSP=OFF); the stub\n");
+    return;
+#elif !defined(XBOXRECOMP_APU_DSP_DEVICE)
+    note("[ENV] RECOMP_APU_DSP=1: the APU DSP device is not wired yet;"
+         " the stub\n");
+    return;
+#else
+    values[RENV_APU_DSP] = "1";
+    if (set[RENV_APU_DSP_ACK] || set[RENV_APU_MIXDOWN_ALL])
+        note("[ENV] RECOMP_APU_DSP=1 overrides %s%s%s: the GP acks its own"
+             " doorbell and mixes the output\n",
+             set[RENV_APU_DSP_ACK] ? "apu_dsp_ack (now 0)" : "",
+             set[RENV_APU_DSP_ACK] && set[RENV_APU_MIXDOWN_ALL] ? " and " : "",
+             set[RENV_APU_MIXDOWN_ALL] ? "apu_mixdown_all (ignored)" : "");
+    values[RENV_APU_DSP_ACK] = "0";
+    values[RENV_APU_MIXDOWN_ALL] = NULL;
+#endif
+}
+
 static void load(void)
 {
     const char *values[RENV_COUNT];
@@ -295,6 +344,8 @@ static void load(void)
     RECOMP_ENV_GAME_DEFAULTS(RENV_GAME_DEFAULT)
 #undef RENV_GAME_DEFAULT
 #endif
+
+    apu_dsp_resolve(values, set);
 
     /* Generated code (the recompiler's unresolved-stub file) reads its
      * switch with getenv and only changes on a regen; hand it the value. */
