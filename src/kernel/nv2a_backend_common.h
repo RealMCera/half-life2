@@ -1676,6 +1676,59 @@ int nv2a_aspect_band(const float (*xy)[2], uint32_t n, uint32_t w, uint32_t h, u
 int nv2a_aspect_full_tris(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
                           uint32_t w);
 
+/* Whether w is a near layer's (nv2a_aspect_flat): under 1 and the
+ * reciprocal of a whole number from 2 to 1024. A game that draws a screen
+ * layer in front of everything writes a literal reciprocal w (rhw): Burnout
+ * 3's front end draws all of its menus at rhw 10, w 0.1. Its race tags the
+ * rival cars with their place ("3rd") through the same program at the
+ * car's depth, every vertex of a tag at one w that drifts from 0.54 to 1;
+ * a tag rides its car into the pads and must not be cut at the old 4:3
+ * edge, and it can't be: no 1/n lies between 0.5 and 1, so the range,
+ * not rarity, keeps the tags out. Further off, a computed depth landing
+ * within a few ulps of a 1/n is rare, as nv2a_aspect_layer_w's whole
+ * numbers are. The known limit: camera-locked geometry drawn without depth
+ * at a round view distance (w 0.5, 0.25, 0.1, often the near plane), such
+ * as a full-screen flash or tint quad or a lens or speed-lines overlay,
+ * passes too. Such a quad that overhangs the 4:3 frame on purpose is cut
+ * at the old 4:3 edge, and shows as a half-tinted pad. */
+static inline int nv2a_aspect_flat_w(float w)
+{
+    float n;
+
+    if (!(w > 0.0f && w < 1.0f))
+        return 0;
+    n = floorf(1.0f / w + 0.5f);
+    return n >= 2.0f && n <= 1024.0f && fabsf(w * n - 1.0f) <= 1e-6f;
+}
+
+/* The step between the vertices nv2a_aspect_flat samples from a count-
+ * vertex batch: all of them under 64, about 32 evenly spaced beyond. It
+ * samples at most NV2A_ASPECT_FLAT_MAX vertices (63, at step 1; 48 at
+ * most from step 2), so a backend that gathers the sample first passes
+ * at most that many and the helper takes them all. */
+#define NV2A_ASPECT_FLAT_MAX 63u
+static inline uint32_t nv2a_aspect_flat_step(uint32_t count)
+{
+    return count > 32 ? count / 32 : 1;
+}
+
+/* Whether a program batch drawn without the depth test is a flat near
+ * layer: every sampled vertex (nv2a_aspect_flat_step: all of them under
+ * 64, about 32 evenly spaced beyond) at one w that passes
+ * nv2a_aspect_flat_w. Such a batch keeps its centred place but is clipped
+ * like a 2D one (nv2a_aspect_box's two_d), to the guest columns. Burnout
+ * 3's front end draws its menu grid and selection lines through the
+ * program that draws its HUD, at w 0.1: not a whole number, so not 2D
+ * (nv2a_aspect_layer_w), and the grid's right edge overhangs the frame to
+ * x 656 and the lines to -271..911, which stock hides past the screen's
+ * edge. Clipped as 3D, the overhang reached into the pads as a strip at
+ * the old 4:3 edge, and menu text sliding in from off screen (x -235..-5)
+ * showed there too. A world batch has a depth per vertex, or, a camera-
+ * facing sprite, flare or tag, one computed w, and still reaches the pads.
+ * Returns 1 for a flat batch and its w in *w (when w is not NULL). */
+int nv2a_aspect_flat(const uint32_t prog[][4], uint32_t start, float c[][4], const float *vf,
+                     unsigned nf4, const int *slot, uint32_t count, float *w);
+
 /* Adjust vertex constants filled with `pad` (nv2a_vp_consts_fill) to a
  * placement. CENTRE leaves them; with pad 0 every placement is stock. */
 void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t pad,

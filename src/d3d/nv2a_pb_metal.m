@@ -2018,6 +2018,27 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
             t0->color, t0->width, t0->height, t0->pitch, names[place]);
 }
 
+/* RECOMP_TRACE=aspect: one line per program and w the first time a flat
+ * near layer of it is clipped to the guest columns (nv2a_aspect_flat). */
+static void aspect_log_flat(uint32_t hash, uint32_t count, float w, const RenderTarget *rt)
+{
+    enum { SET = 256 };
+    static uint64_t set[SET];
+    static unsigned used;
+    union { float f; uint32_t u; } wb = { w };
+    uint64_t key = ((uint64_t)hash << 32 | wb.u) * 0x9E3779B97F4A7C15ull + 1u;
+    unsigned h = (unsigned)(key >> 56) & (SET - 1u);
+    while (set[h] && set[h] != key)
+        h = (h + 1u) & (SET - 1u);
+    if (set[h] || used >= SET / 2u)
+        return;
+    set[h] = key;
+    used++;
+    fprintf(stderr, "[aspect.flat] %08X flip %llu: %u vertices at w %g on %ux%u pad %u at"
+            " 0x%08X\n", hash, (unsigned long long)s_presents, count, w, rt->w, rt->h, rt->pad,
+            rt->addr);
+}
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -2043,7 +2064,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     void *ip;
     int cull = 0, cull_all = 0;
     unsigned bump_src;
-    int full_w = 0, guest_tex = 0, flat_rt = 0, two_d = 0, have_x = 0, tris = 0;
+    int full_w = 0, guest_tex = 0, flat_rt = 0, two_d = 0, have_x = 0, tris = 0, flat = 0;
     int place = NV2A_PLACE_CENTRE;
     float lo_x = 0, hi_x = 0;   /* hor+: a 2D batch's x range, surface pixels */
     const RenderTarget *srcs[4] = { NULL, NULL, NULL, NULL };
@@ -2286,6 +2307,16 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 }
             }
         }
+        /* Hor+: a flat near layer drawn without depth keeps its place but
+         * is clipped to the guest columns like the 2D (nv2a_aspect_flat). */
+        flat = 0;
+        if (rt->pad && d->program && ve && !two_d && !v->depth_enable && count) {
+            float fw;
+            flat = nv2a_aspect_flat((const uint32_t (*)[4])v->prog, v->start,
+                                    (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, count, &fw);
+            if (flat && aspect_trace())
+                aspect_log_flat(ve->hash, count, fw, rt);
+        }
         /* A square target is a reflection, glow or shadow map, never a
          * movie: display.movie applies to the frame only. */
         place = rt->pad ? nv2a_aspect_place(two_d, full_w, guest_tex, flat_rt,
@@ -2344,7 +2375,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 s_draws_skipped++;
                 return;
             }
-            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, place, two_d, hb);
+            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, place, two_d || flat, hb);
             sr.x = hb[0];
             sr.y = hb[1];
             sr.width = hb[2] - hb[0];

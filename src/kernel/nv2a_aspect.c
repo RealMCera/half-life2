@@ -153,3 +153,32 @@ int nv2a_aspect_band(const float (*xy)[2], uint32_t n, uint32_t w, uint32_t h, u
     return lo_x >= -2.0f && hi_x <= (float)w + 2.0f
            && (lo_x <= 2.0f || hi_x >= (float)w - 2.0f);
 }
+
+int nv2a_aspect_flat(const uint32_t prog[][4], uint32_t start, float c[][4], const float *vf,
+                     unsigned nf4, const int *slot, uint32_t count, float *w)
+{
+    float in[NV2A_VSH_INPUTS][4], w0 = 0.0f;
+    Nv2aVshOut out;
+    uint32_t step = nv2a_aspect_flat_step(count), j;
+    unsigned k;
+
+    for (j = 0; j < count; j += step) {
+        float wj;
+        memset(in, 0, sizeof in);
+        for (k = 0; k < nf4; k++)
+            if (slot[k] >= 0 && slot[k] < NV2A_VSH_INPUTS)
+                memcpy(in[slot[k]], vf + ((size_t)j * nf4 + k) * 4u, 16);
+        nv2a_vsh_run((const uint32_t (*)[4])prog, start, (float (*)[4])c, 0,
+                     (const float (*)[4])in, &out);
+        if (!out.ok)
+            return 0;
+        wj = out.o[NV2A_VSH_O_POS][3];
+        /* The first vertex rules out the world's batches at once. */
+        if (j == 0 ? !nv2a_aspect_flat_w(wj) : wj != w0)
+            return 0;
+        w0 = wj;
+    }
+    if (w)
+        *w = w0;
+    return count != 0;
+}

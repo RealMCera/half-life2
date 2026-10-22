@@ -469,6 +469,116 @@ int main(void)
                   && !nv2a_aspect_full_tris((const float (*)[2])xy, cidx, 2, 640));
         }
         {
+            /* Flat near layers (nv2a_aspect_flat), as Burnout 3's menus
+             * draw them: its grid overhangs the frame to x 656 at w 0.1. */
+            float gr[4][4] = { { 0, 60, 0, 0.1f }, { 656, 60, 0, 0.1f },
+                               { 0, 420, 0, 0.1f }, { 656, 420, 0, 0.1f } };
+            float big[100][4];
+            float fw = 0.0f;
+            int j;
+            CHECK(nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                   &fw) == 1 && fw == 0.1f);
+            CHECK(nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                   NULL) == 1);
+            /* A tag at a car's depth, every vertex at one computed w. */
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = 0.774536f;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            gr[0][3] = gr[1][3] = gr[2][3] = 0.1f;
+            /* A depth per vertex: the world. */
+            gr[3][3] = 0.2f;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            /* One w past 1: a camera-facing sprite or flare (and the race
+             * HUD's 14..365) still reaches the pads. One w of 1 is 2D's. */
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = 0.71f * 20.0f;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = 1.0f;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            /* Zero, negative, NaN: not a layer. No vertices: none. */
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = 0.0f;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = -0.1f;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = NAN;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 0,
+                                    NULL));
+            /* A NaN past the first vertex breaks the one w. */
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = 0.1f;
+            gr[2][3] = NAN;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                    NULL));
+            gr[2][3] = 0.1f;
+            /* A program the interpreter can't finish (no final slot) is
+             * not a layer, though its oPos.w reads 0.1. */
+            {
+                static uint32_t nofin[NV2A_VSH_SLOTS][4];
+                memcpy(nofin[0], prog[0], sizeof nofin[0]);
+                nofin[0][3] &= ~1u;
+                CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])nofin, 0, cst, &gr[0][0], 1, slot,
+                                        4, NULL));
+            }
+            /* One ulp off rhw 10 is still the layer: the tolerance holds
+             * an authored 0.1 rounded either way. */
+            gr[0][3] = gr[1][3] = gr[2][3] = gr[3][3] = nextafterf(0.1f, 1.0f);
+            CHECK(nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &gr[0][0], 1, slot, 4,
+                                   NULL));
+            CHECK(nv2a_aspect_flat_w(nextafterf(0.1f, 0.0f)));
+            /* A large batch is sampled (every third of 100): a stray w
+             * off the sample goes unseen, one on it is found. */
+            for (j = 0; j < 100; j++) {
+                big[j][0] = (float)j;
+                big[j][1] = 0.0f;
+                big[j][2] = 0.0f;
+                big[j][3] = 0.1f;
+            }
+            CHECK(nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &big[0][0], 1, slot, 100,
+                                   NULL));
+            big[1][3] = 0.5f;
+            CHECK(nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &big[0][0], 1, slot, 100,
+                                   NULL));
+            big[3][3] = 0.5f;
+            CHECK(!nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &big[0][0], 1, slot, 100,
+                                    NULL));
+            /* The sample never passes NV2A_ASPECT_FLAT_MAX vertices, and a
+             * sample that size is taken whole: D3D11 gathers it first. */
+            {
+                uint32_t cnt, ok = 1;
+                for (cnt = 1; cnt <= 20000; cnt++) {
+                    uint32_t st = nv2a_aspect_flat_step(cnt), ns = (cnt + st - 1) / st;
+                    if (ns > NV2A_ASPECT_FLAT_MAX || nv2a_aspect_flat_step(ns) != 1)
+                        ok = 0;
+                }
+                CHECK(ok);
+            }
+            /* Clipped as 2D, its full surface clip keeps to the guest
+             * columns at 16:9, n 2; as 3D it reached the pads. */
+            {
+                uint32_t full[4] = { 0, 0, 640, 480 }, hb[4];
+                nv2a_aspect_box(full, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 1, hb);
+                CHECK(hb[0] == 214 && hb[2] == 1494);
+                nv2a_aspect_box(full, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 0, hb);
+                CHECK(hb[0] == 0 && hb[2] == 1708);
+            }
+            /* A layer's w is a literal reciprocal (rhw 2..1024); a race
+             * tag's is a computed depth and keeps reaching the pads. */
+            CHECK(nv2a_aspect_flat_w(0.1f) && nv2a_aspect_flat_w(1.0f / 10.0f)
+                  && nv2a_aspect_flat_w(0.5f) && nv2a_aspect_flat_w(0.25f)
+                  && nv2a_aspect_flat_w(1.0f / 3.0f) && nv2a_aspect_flat_w(1.0f / 1024.0f));
+            CHECK(!nv2a_aspect_flat_w(0.774536f) && !nv2a_aspect_flat_w(0.543762f)
+                  && !nv2a_aspect_flat_w(0.999878f) && !nv2a_aspect_flat_w(0.3f)
+                  && !nv2a_aspect_flat_w(0.1001f) && !nv2a_aspect_flat_w(1.0f / 1025.0f));
+            CHECK(!nv2a_aspect_flat_w(1.0f) && !nv2a_aspect_flat_w(0.0f)
+                  && !nv2a_aspect_flat_w(-0.5f) && !nv2a_aspect_flat_w(INFINITY)
+                  && !nv2a_aspect_flat_w(NAN));
+        }
+        {
             /* Letterbox band pieces (nv2a_aspect_band), as Burnout 3's
              * crash cam draws them: quads at w 24.37 on a 640x480 frame. */
             const float bw = 24.3671875f;

@@ -3086,6 +3086,65 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
             t0->color, t0->width, t0->height, t0->pitch, names[place]);
 }
 
+/* RECOMP_ASPECT_TRACE: each program and w the first time a flat near
+ * layer of it is clipped to the guest columns (Metal's aspect_log_flat,
+ * same line). */
+static void aspect_log_flat(uint32_t hash, uint32_t count, float w, const RenderTarget *rt)
+{
+    enum { SET = 256 };
+    static uint64_t set[SET];
+    static unsigned used;
+    union { float f; uint32_t u; } wb = { w };
+    uint64_t key = ((uint64_t)hash << 32 | wb.u) * 0x9E3779B97F4A7C15ull + 1u;
+    unsigned h = (unsigned)(key >> 56) & (SET - 1u);
+    while (set[h] && set[h] != key)
+        h = (h + 1u) & (SET - 1u);
+    if (set[h] || used >= SET / 2u)
+        return;
+    set[h] = key;
+    used++;
+    fprintf(stderr, "[aspect.flat] %08X flip %llu: %u vertices at w %g on %ux%u pad %u at"
+            " 0x%08X\n", hash, (unsigned long long)s_presents, count, w, rt->w, rt->h, rt->pad,
+            rt->addr);
+}
+
+/* Whether a program batch (count vertices from lo) is a flat near layer
+ * (nv2a_aspect_flat). Its inputs are gathered for the vertices the helper
+ * samples only, and the first alone settles a world batch. */
+static int aspect_flat(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
+                       const VsEntry *vs, const RenderTarget *rt, uint32_t lo, uint32_t count)
+{
+    /* nv2a_aspect_flat's sample (nv2a_aspect_flat_step), gathered here;
+     * at most NV2A_ASPECT_FLAT_MAX vertices, which the helper then takes
+     * at step 1, so both backends run the same vertices. */
+    static float vf[NV2A_ASPECT_FLAT_MAX * NV2A_VS_MAX_INPUTS * 4];
+    int slot[NV2A_VS_MAX_INPUTS];
+    uint32_t step = nv2a_aspect_flat_step(count), j, n = 0;
+    unsigned nf4 = 0, i;
+    float w;
+
+    if (!count)
+        return 0;
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+        if (vs->inputs & (1u << i))
+            slot[nf4++] = (int)i;
+    for (i = 0; i < nf4; i++)
+        vtx_input(d, v, (unsigned)slot[i], lo, vf + (size_t)i * 4u);
+    /* The first vertex alone rules out the world's batches. */
+    if (!nv2a_aspect_flat((const uint32_t (*)[4])v->prog, v->start,
+                          (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, 1, NULL))
+        return 0;
+    for (j = 0; j < count && n < NV2A_ASPECT_FLAT_MAX; j += step, n++)
+        for (i = 0; i < nf4; i++)
+            vtx_input(d, v, (unsigned)slot[i], lo + j, vf + ((size_t)n * nf4 + i) * 4u);
+    if (!nv2a_aspect_flat((const uint32_t (*)[4])v->prog, v->start,
+                          (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, n, &w))
+        return 0;
+    if (aspect_trace())
+        aspect_log_flat(vs->hash, count, w, rt);
+    return 1;
+}
+
 /* The pixels->NDC mapping at b2 and the scissor for one placement
  * (nv2a_aspect_map, nv2a_aspect_box; with pad 0 both are stock). cb is
  * the surface clip (nv2a_draw_box). */
@@ -3137,7 +3196,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     struct aspect_batch hp = {0, 0, NV2A_PLACE_CENTRE, 0, NULL};
-    int have_x = 0, tris = 0;
+    int have_x = 0, tris = 0, flat = 0;
     float lo_x = 0, hi_x = 0;      /* hor+: a 2D batch's x range, surface pixels */
     D3D11_PRIMITIVE_TOPOLOGY topo;
     ID3D11Buffer *vbs[NV2A_VS_MAX_INPUTS];
@@ -3480,7 +3539,12 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         }
         if (hp.two_d && rt->pad && aspect_trace())
             aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place);
-        set_vp(v, g, rt, hp.place, hp.two_d, cb);
+        /* A flat near layer drawn without depth keeps its place but is
+         * clipped to the guest columns like the 2D (nv2a_aspect_flat), as
+         * in metal_on_draw. */
+        flat = rt->pad && d->program && !hp.two_d && !v->depth_enable
+               && aspect_flat(d, v, vs, rt, lo, count);
+        set_vp(v, g, rt, hp.place, hp.two_d || flat, cb);
         if (px_on()) {
             uint32_t before[4];
             int n;

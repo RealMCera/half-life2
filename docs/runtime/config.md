@@ -235,9 +235,25 @@ and its title movie at 100:
     all reach the target's edges together while the text inside stays in
     the 4:3 frame. Its front-end menu frame has the same shape but no bar,
     so it keeps its 4:3 place.
+- A batch drawn with the depth test off whose vertices (all of them under
+  64, about 32 evenly spaced beyond) share one `w` under 1 that is the reciprocal of a whole number from 2 to
+  1024 (`nv2a_aspect_flat_w`, `nv2a_aspect_flat`) is a flat near layer: it
+  keeps its centred place but is scissored to the 4:3 frame like 2D.
+  Burnout 3 draws its whole front end at rhw 10 (`w` 0.1); its menu grid
+  overhangs the frame to x 656 and text slides in from off screen, which
+  stock hides past the screen's edge. Its race's place tags over the rival
+  cars use the same program at the car's computed depth, between 0.54 and
+  1, where no reciprocal lies, so they still follow their car into the
+  pads. The known limit: camera-locked geometry drawn without depth at a
+  round view distance (`w` 0.5, 0.25, 0.1), such as a full-screen flash
+  or tint quad or a lens overlay, is taken too. If it overhangs the 4:3
+  frame on purpose, it is cut at the old 4:3 edge: a pad tinted only up
+  to the 4:3 frame is this case.
 
 `RECOMP_TRACE=aspect` prints one `[aspect.program]` line per program,
-texture and placement, and the target size per flip.
+texture and placement, and the target size per flip, and one
+`[aspect.flat]` line per program and `w` the first time a flat near layer
+is clipped.
 
 ### Display overscan (display.overscan)
 
