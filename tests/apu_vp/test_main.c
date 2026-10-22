@@ -15,6 +15,10 @@
  *     effect returns from the GP) began each frame with the last frame's
  *     sample 0; and at rate 0.3 its source count (floorf of the summed
  *     steps) came out one short every few frames, dropping a sample.
+ *   - *_fetch_ending_before_ebo_*: a voice wrapped, ended or moved to its
+ *     next stream segment when a fetch stopped at cbo == ebo, before reading
+ *     sample ebo, so that sample was never played (and a segment was
+ *     signalled done a fetch early).
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -315,6 +319,116 @@ static void resample_rate_0_3_drops_no_source_sample(void)
     }
 }
 
+/* EBO is inclusive: an 8-sample loop (EBO 7) fetched in 7s must still play
+ * sample 7. The voice wrapped when a fetch ended at cbo == ebo, before
+ * sample ebo was read, so it played 0..6 over and over. */
+static void loop_fetch_ending_before_ebo_plays_ebo(void)
+{
+    static MCPXAPUState d;
+    float samples[7][2];
+    const unsigned len = 8;
+
+    setup_pcm_loop_voice(&d, len);
+    for (unsigned i = 0; i < len; i++)
+        put_s16(i, (int16_t)(i * 100 + 1));
+    unsigned at = 0;
+    for (int fetch = 0; fetch < 3; fetch++) {
+        int n = voice_get_samples(&d, 0, samples, 7);
+        CHECK(n > 0, "fetch %d: %d samples", fetch, n);
+        for (int i = 0; i < n; i++, at++) {
+            float want = int16_to_float((int16_t)((at % len) * 100 + 1));
+            if (samples[i][0] != want) {
+                CHECK(0, "fetch %d: sample %d is %f, loop position %u has %f",
+                      fetch, i, samples[i][0], at % len, want);
+                return;
+            }
+        }
+    }
+    /* A fetch stops at the loop end, so 7, 1 (sample 7), then 7 again. */
+    CHECK(at == 15, "3 fetches played %u samples, expected 7 + 1 + 7", at);
+}
+
+/* The same for a one-shot voice: a fetch that stops before EBO leaves the
+ * voice on, and the next one plays sample ebo before the voice ends. */
+static void one_shot_fetch_ending_before_ebo_plays_ebo(void)
+{
+    static MCPXAPUState d;
+    float samples[7][2];
+
+    setup_pcm_loop_voice(&d, 8);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
+                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28));
+    for (unsigned i = 0; i < 8; i++)
+        put_s16(i, (int16_t)(i * 100 + 1));
+    int n = voice_get_samples(&d, 0, samples, 7);
+    CHECK(n == 7, "first fetch: %d samples, expected 7", n);
+    CHECK(voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_STATE,
+                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+          "voice ended after sample 6, before playing sample 7");
+    n = voice_get_samples(&d, 0, samples, 7);
+    CHECK(n == 1, "second fetch: %d samples, expected sample 7 alone", n);
+    if (n >= 1)
+        CHECK(samples[0][0] == int16_to_float(701),
+              "second fetch played %f, sample 7 is %f", samples[0][0],
+              int16_to_float(701));
+    CHECK(!voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_STATE,
+                          NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+          "voice still on after its last sample");
+    uint32_t cbo = voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_OFFSET,
+                                  NV_PAVS_VOICE_PAR_OFFSET_CBO);
+    CHECK(cbo == 7, "ended voice has CBO %u, expected EBO 7", cbo);
+}
+
+#define SSL_BASE 0x50000u   /* NV_PAPU_VPSSLADDR */
+#define FEN_BASE 0x60000u   /* NV_PAPU_FENADDR */
+
+/* The same for a stream voice: one 8-sample SSL segment fetched in 7s plays
+ * sample 7, and the segment is done (SSLA_DONE, the move to the next SSL)
+ * only after it. The old test moved on at cbo == ebo, dropping a packet's
+ * last sample and signalling it done a fetch early. */
+static void stream_fetch_ending_before_ebo_plays_ebo(void)
+{
+    static MCPXAPUState d;
+    float samples[7][2];
+    uint32_t ssl[2] = { DATA_BASE,
+                        8u | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16) };
+    const uint32_t done_at = FEN_BASE + 16u * (MCPX_HW_NOTIFIER_BASE_OFFSET +
+                                               MCPX_HW_NOTIFIER_SSLA_DONE) + 15u;
+
+    setup_pcm_loop_voice(&d, 8);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
+                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
+                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE |
+                  NV_PAVS_VOICE_CFG_FMT_PERSIST);
+    d.regs[NV_PAPU_VPSSLADDR] = SSL_BASE;
+    d.regs[NV_PAPU_FENADDR] = FEN_BASE;
+    memcpy(s_ram + SSL_BASE, ssl, sizeof(ssl));
+    d.vp.ssl[0].base[0] = 0;
+    d.vp.ssl[0].count[0] = 1;
+    for (unsigned i = 0; i < 8; i++)
+        put_s16(i, (int16_t)(i * 100 + 1));
+
+    int n = voice_get_samples(&d, 0, samples, 7);
+    CHECK(n == 7, "first fetch: %d samples, expected 7", n);
+    CHECK(s_ram[done_at] == 0 && d.vp.ssl[0].ssl_index == 0 &&
+          d.vp.ssl[0].ssl_seg == 0,
+          "segment done after sample 6 (SSLA_DONE %u, ssl %d seg %d), before "
+          "playing sample 7", s_ram[done_at], d.vp.ssl[0].ssl_index,
+          d.vp.ssl[0].ssl_seg);
+    n = voice_get_samples(&d, 0, samples, 7);
+    CHECK(n == 1, "second fetch: %d samples, expected sample 7 alone", n);
+    if (n >= 1)
+        CHECK(samples[0][0] == int16_to_float(701),
+              "second fetch played %f, sample 7 is %f", samples[0][0],
+              int16_to_float(701));
+    CHECK(s_ram[done_at] == NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS &&
+          d.vp.ssl[0].ssl_index == 1,
+          "segment not done after sample 7 (SSLA_DONE %u, ssl %d)",
+          s_ram[done_at], d.vp.ssl[0].ssl_index);
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -328,6 +442,9 @@ int main(void)
     resample_rate_one_plays_this_frames_buffer();
     resample_half_rate_lands_on_source_samples();
     resample_rate_0_3_drops_no_source_sample();
+    loop_fetch_ending_before_ebo_plays_ebo();
+    one_shot_fetch_ending_before_ebo_plays_ebo();
+    stream_fetch_ending_before_ebo_plays_ebo();
 
     free(s_ram);
     if (s_failures) {
@@ -336,6 +453,7 @@ int main(void)
     }
     puts("PASS: ADPCM blocks up to the hardware limit decode, wider ones are "
          "refused; output buffer SGE entries go to the GP FIFO table; the "
-         "resampler plays each frame's source, no sample held back.");
+         "resampler plays each frame's source, no sample held back; a fetch "
+         "ending before EBO still plays sample EBO.");
     return 0;
 }

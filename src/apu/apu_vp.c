@@ -1409,7 +1409,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         vp_ring_check(d, v, ba, ebo, (uint32_t)block_size,
                       cbo - (uint32_t)sample_count, samples, sample_count);
 
-    if (cbo >= ebo) {
+    /* EBO is the last sample (inclusive): the fetch loop reads while
+     * cbo <= ebo, a stream segment sets it to its length - 1, and the ring
+     * check spans ebo + 1 samples. So the voice wraps, ends or moves to the
+     * next segment only once sample ebo has been read. Testing cbo >= ebo
+     * here dropped sample ebo whenever a fetch stopped just before it. */
+    if (cbo > ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
             cbo = 0;
