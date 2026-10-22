@@ -13,7 +13,8 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
-#include "recomp_env.h"           /* RECOMP_GUEST_CPUS */
+#include "recomp_env.h"           /* RECOMP_GUEST_CPUS, guest_priority */
+#include "platform/host_time.h"   /* xbox_HostUnderWine */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -248,6 +249,69 @@ static LONG win32_priority_to_xbox(int priority)
         case THREAD_PRIORITY_TIME_CRITICAL: return 16;
         default:                            return 0;
     }
+}
+
+/* Set when SetThreadAffinityMask refuses the pin: the guest threads then run
+ * on every core whatever RECOMP_GUEST_CPUS says (xbox_GuestPriorityOn). */
+static volatile LONG s_guest_pin_failed;
+
+/*
+ * Whether the title's thread priorities reach its host threads and
+ * read back. Titles use priority as a lock: on the console's one
+ * CPU a time-critical thread runs alone. CRI's ADX in JSRF (and in BLiNX 2)
+ * locks by raising itself to time critical and saving its old priority in
+ * one global slot; its waits drop every lock with "while
+ * (GetThreadPriority(self) == TIME_CRITICAL) unlock()". That holds only where
+ * a time-critical thread really excludes the others: native Windows, guest
+ * threads pinned to one core, and no guest CPU lock, whose handover
+ * (RECOMP_GUEST_LOCK) is FIFO and blind to priority. Wine does not make a
+ * time-critical thread exclusive (at most a nice value, which the Linux
+ * scheduler still shares out; on the Deck every thread stayed at nice 0) and
+ * the POSIX shim only records the value, so two threads took the ADX lock
+ * at once there, one restored the other's saved priority, and a thread left
+ * time critical with the count at zero spun in that loop for good (the DJ
+ * scene's music stuck). Where priorities do not exclude, the bridges leave
+ * them alone and report 0, as every title ran before the bridges resolved them. mode is
+ * guest_priority: 0 never, 1 where honoured (default), 2 always (the A/B
+ * that reproduces the stuck DJ music).
+ */
+int xbox_GuestPriorityPolicy(long mode, int host_strict, int one_core,
+                             int guest_lock)
+{
+    if (mode == 0)
+        return 0;
+    if (mode >= 2)
+        return 1;
+    return host_strict && one_core && !guest_lock;
+}
+
+/* Read by every guest thread; atomic so the lazy fill is not a data race
+ * (each racer computes the same value). -1: not decided yet. */
+static volatile LONG s_guest_priority = -1;
+
+int xbox_GuestPriorityOn(void)
+{
+    LONG v = InterlockedCompareExchange(&s_guest_priority, -1, -1);
+
+    if (v < 0) {
+#ifdef _WIN32
+        int strict = !xbox_HostUnderWine();
+#else
+        int strict = 0;
+#endif
+        int one_core = xbox_GuestCpuMask() != 0
+            && !InterlockedCompareExchange(&s_guest_pin_failed, 0, 0);
+
+        v = xbox_GuestPriorityPolicy(recomp_env_int(RENV_GUEST_PRIORITY, 1),
+                                     strict, one_core, xbox_GuestCpuOn());
+        InterlockedExchange(&s_guest_priority, v);
+    }
+    return (int)v;
+}
+
+void xbox_GuestPriorityReloadConfig(void)
+{
+    InterlockedExchange(&s_guest_priority, -1);
 }
 
 LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
@@ -522,6 +586,9 @@ void xbox_GuestThreadPin(const char *role)
     while (!((mask >> core) & 1))
         core++;
     if (!SetThreadAffinityMask(GetCurrentThread(), mask)) {
+        /* Not one core after all: priorities would not exclude. */
+        if (!InterlockedExchange(&s_guest_pin_failed, 1))
+            xbox_GuestPriorityReloadConfig();
         if (!failed) {
             failed = 1;
             fprintf(stderr, "  [KERNEL] guest threads: this host sets no thread"

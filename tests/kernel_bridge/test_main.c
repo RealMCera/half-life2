@@ -217,6 +217,10 @@ int main(void)
      * written its priority into these bytes and read the marker back. A VA no
      * host thread stands behind must be left alone: the bytes stay as they
      * were and the query reads 0. */
+    /* guest_priority=2, so the bridges try to resolve the object on every
+     * host: the checks below are about that resolve path. */
+    recomp_env_set(RENV_GUEST_PRIORITY, "2");
+    xbox_GuestPriorityReloadConfig();
     {
         enum { OBJ_VA = 0x00050000u, OBJ_WORDS = 0x100 };
         uint32_t *obj = (uint32_t *)(mem + OBJ_VA);
@@ -253,6 +257,42 @@ int main(void)
             check(g_esp == STACK_VA + 8, "ordinal 124 pops its stdcall argument", NULL);
         }
     }
+    recomp_env_set(RENV_GUEST_PRIORITY, NULL);
+    xbox_GuestPriorityReloadConfig();
+
+    /* Priorities reach the host thread, and read back, only where
+     * a time-critical thread runs alone. CRI's ADX in JSRF locks by going
+     * time critical and drops its locks with "while (GetThreadPriority(self)
+     * == TIME_CRITICAL) unlock()"; where the host does not exclude (Wine,
+     * the POSIX shim), two threads crossed its one saved priority and one
+     * stayed time critical with no lock left, spinning there for good. */
+    check(xbox_GuestPriorityPolicy(1, 1, 1, 0) == 1,
+          "guest_priority default: native Windows on one core applies", NULL);
+    check(xbox_GuestPriorityPolicy(1, 0, 1, 0) == 0,
+          "guest_priority default: Wine or POSIX leaves priorities", NULL);
+    check(xbox_GuestPriorityPolicy(1, 1, 0, 0) == 0,
+          "guest_priority default: threads on every core leave them", NULL);
+    /* The guest CPU lock hands over FIFO whatever the priority, so a
+     * time-critical holder does not run alone under it (BLiNX 2). */
+    check(xbox_GuestPriorityPolicy(1, 1, 1, 1) == 0,
+          "guest_priority default: the guest CPU lock leaves them", NULL);
+    check(xbox_GuestPriorityPolicy(0, 1, 1, 0) == 0, "guest_priority=0 never applies", NULL);
+    check(xbox_GuestPriorityPolicy(2, 0, 0, 1) == 1, "guest_priority=2 always applies", NULL);
+    /* The setting as the bridge reads it. The POSIX shim records a
+     * priority and enforces none, so its default leaves them alone. */
+    recomp_env_set(RENV_GUEST_PRIORITY, "0");
+    xbox_GuestPriorityReloadConfig();
+    check(xbox_GuestPriorityOn() == 0, "guest_priority=0 reaches the bridge", NULL);
+    recomp_env_set(RENV_GUEST_PRIORITY, "2");
+    xbox_GuestPriorityReloadConfig();
+    check(xbox_GuestPriorityOn() == 1, "guest_priority=2 reaches the bridge", NULL);
+#ifndef _WIN32
+    recomp_env_set(RENV_GUEST_PRIORITY, NULL);
+    xbox_GuestPriorityReloadConfig();
+    check(xbox_GuestPriorityOn() == 0, "default on POSIX leaves priorities alone", NULL);
+#endif
+    recomp_env_set(RENV_GUEST_PRIORITY, NULL);
+    xbox_GuestPriorityReloadConfig();
 
     VirtualFree(mem, 0, MEM_RELEASE);
     printf("\n%d failure(s)\n", failures);

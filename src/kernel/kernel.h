@@ -772,6 +772,15 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus);
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval);
 LONG     __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment);
 LONG     __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread);
+/* Whether KeSetBasePriorityThread and KeQueryBasePriorityThread reach the
+ * host thread (kernel_thread.c): only where a time-critical thread excludes
+ * the others, native Windows with the guest threads pinned to one core and
+ * no guest CPU lock, unless guest_priority says otherwise. The policy is
+ * split out for the tests. */
+int      xbox_GuestPriorityPolicy(long mode, int host_strict, int one_core,
+                                  int guest_lock);
+int      xbox_GuestPriorityOn(void);
+void     xbox_GuestPriorityReloadConfig(void);
 NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode);
 NTSTATUS __stdcall xbox_NtYieldExecution(void);
 NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options);

@@ -5704,14 +5704,12 @@ static void bridge_KeDisconnectInterrupt(void)
  * as a handle, as it used to be, the call failed on Windows and every guest
  * thread ran at normal priority: SSX 3's raised sound threads then lost the
  * one guest core to its main thread and the music crackled.
- * guest_priority=0 leaves host priorities alone, for A/B. */
+ * Only where the host makes a time-critical thread run alone, though
+ * (xbox_GuestPriorityOn): elsewhere a title that locks by priority loses
+ * the lock and the value it reads back sends it round a loop. */
 static HANDLE bridge_thread_host(uint32_t thread_va)
 {
-    static int s_on = -1;
-
-    if (s_on < 0)
-        s_on = recomp_env_int(RENV_GUEST_PRIORITY, 1) != 0;
-    if (!s_on || !thread_va)
+    if (!thread_va || !xbox_GuestPriorityOn())
         return NULL;
     if (thread_va == g_thread_obj_va)
         return GetCurrentThread();
