@@ -286,6 +286,60 @@ static void test_save_dir_root(void)
     }
 }
 
+/* The Xbox file system ignores case and titles rely on it (MEDIA\Sound.xwb
+ * for media/sound.xwb). Windows and default macOS volumes resolve that by
+ * themselves; on a case-sensitive one (Linux, the Deck) the POSIX backend
+ * matches each missing component against its directory. Checked on every
+ * host by whether the result opens, and by its exact spelling where the
+ * host is case-sensitive. */
+static void test_case_fallback(void)
+{
+    char dir[700], file[800], probe[800], want[1200];
+    const char *p;
+    FILE *f;
+    int sensitive;
+
+    printf("case-insensitive guest paths\n");
+    recomp_env_set(RENV_SAVE_DIR, "");
+    xbox_path_init(g_game, g_save);
+
+    snprintf(dir, sizeof dir, "%s" SEP "Media", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "Media" SEP "Sound", g_game);
+    make_dir(dir);
+    snprintf(file, sizeof file, "%s" SEP "Bank.xwb", dir);
+    f = fopen(file, "wb");
+    if (f) fclose(f);
+    snprintf(probe, sizeof probe, "%s" SEP "MEDIA", g_game);
+    sensitive = !is_dir(probe);
+    printf("  (host file system is case-%s)\n", sensitive ? "sensitive" : "insensitive");
+
+    expect("\\Device\\Harddisk0\\Partition1\\Media\\Sound\\Bank.xwb", file,
+           "an exact path is left alone");
+
+    p = host("\\Device\\Harddisk0\\Partition1\\MEDIA\\sound\\BANK.XWB");
+    f = fopen(p, "rb");
+    check(f != NULL, "MEDIA\\sound\\BANK.XWB opens Media/Sound/Bank.xwb");
+    if (f) fclose(f);
+    if (sensitive)
+        check(same(p, file), "and is rewritten to the name on disk");
+
+    /* A create: the directories resolve, the new name is kept as written. */
+    p = host("\\Device\\Harddisk0\\Partition1\\media\\SOUND\\New.bin");
+    snprintf(want, sizeof want, "%s" SEP "New.bin", dir);
+    if (sensitive)
+        expect("\\Device\\Harddisk0\\Partition1\\media\\SOUND\\New.bin", want,
+               "a new file lands in the existing directory");
+    else
+        check(p[0] != '\0', "a new file lands in the existing directory");
+
+    /* A missing directory ends the walk; the rest stays as written. */
+    snprintf(want, sizeof want, "%s" SEP "Media" SEP "Nope" SEP "a.bin", g_game);
+    if (sensitive)
+        expect("\\Device\\Harddisk0\\Partition1\\MEDIA\\Nope\\a.bin", want,
+               "a missing directory keeps the rest as written");
+}
+
 int main(int argc, char **argv)
 {
     /* argv[1]: write the report there (Proton drops a console exe's stdout) */
@@ -315,6 +369,7 @@ int main(int argc, char **argv)
 
     test_default_root();
     test_save_dir_root();
+    test_case_fallback();
     remove_root();
 
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");

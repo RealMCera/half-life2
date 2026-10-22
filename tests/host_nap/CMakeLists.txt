@@ -9,6 +9,10 @@ target_include_directories(host_nap_test PRIVATE ../../src/platform)
 if(WIN32)
     # timeBeginPeriod(1), as the runtime's timer thread sets it.
     target_link_libraries(host_nap_test PRIVATE winmm)
+else()
+    # pthread_once and the condvar clock are in libpthread before glibc 2.34.
+    find_package(Threads REQUIRED)
+    target_link_libraries(host_nap_test PRIVATE Threads::Threads)
 endif()
 enable_testing()
 add_test(NAME host_nap_test COMMAND host_nap_test)

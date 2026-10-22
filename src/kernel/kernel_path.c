@@ -688,6 +688,8 @@ translate:
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <strings.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -721,6 +723,90 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+/* The Xbox file system is case-insensitive and titles rely on it: a title
+ * opens MEDIA\Sound.xwb while the disc holds media/sound.xwb, and on
+ * Windows or an APFS default volume that resolves by itself. On a
+ * case-sensitive file system (ext4, btrfs: Linux, the Deck) it fails, so
+ * when the exact host path is missing each guest-supplied component past
+ * `fixed` (the host's own base and sub dir, never rewritten) is matched
+ * case-insensitively against its directory. A component with no match
+ * ends the walk and the rest stays as the title wrote it, so a create of
+ * a new file still lands in the right, existing directory. One warning per
+ * path: a title that polls a missing file must not flood the log. */
+#define CASE_WARNED_SLOTS 256
+static uint32_t s_case_warned[CASE_WARNED_SLOTS];
+
+static int case_warn_first(const char* path)
+{
+    uint32_t h = 2166136261u;
+    for (const char* p = path; *p; p++)
+        h = (h ^ (unsigned char)*p) * 16777619u;
+    if (!h) h = 1;
+    /* Open addressing; a full table only repeats warnings. Two threads
+     * racing on a slot can at worst warn twice. */
+    for (int i = 0; i < CASE_WARNED_SLOTS; i++) {
+        uint32_t* slot = &s_case_warned[(h + (uint32_t)i) % CASE_WARNED_SLOTS];
+        if (*slot == h) return 0;
+        if (*slot == 0) { *slot = h; return 1; }
+    }
+    return 1;
+}
+
+static void fix_case(char* path, size_t fixed)
+{
+    struct stat st;
+    char guest[MAX_PATH];
+    size_t pos = fixed;
+    BOOL changed = FALSE;
+
+    if (lstat(path, &st) == 0 || errno != ENOENT)
+        return;
+    snprintf(guest, sizeof(guest), "%s", path);
+
+    while (path[pos] == '/') pos++;
+    while (path[pos]) {
+        size_t end = pos;
+        char save;
+        DIR* d;
+        struct dirent* e;
+        BOOL found = FALSE;
+
+        while (path[end] && path[end] != '/') end++;
+        save = path[end];
+        path[end] = '\0';
+        if (lstat(path, &st) == 0) {
+            path[end] = save;
+        } else {
+            /* Open the parent: path[pos - 1] is the '/' before this one. */
+            path[pos - 1] = '\0';
+            d = opendir(pos > 1 ? path : "/");
+            path[pos - 1] = '/';
+            if (d) {
+                while ((e = readdir(d)) != NULL) {
+                    if (strlen(e->d_name) == end - pos
+                            && strcasecmp(e->d_name, path + pos) == 0) {
+                        memcpy(path + pos, e->d_name, end - pos);
+                        found = changed = TRUE;
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+            path[end] = save;
+            if (!found)
+                break;
+        }
+        pos = end;
+        while (path[pos] == '/') pos++;
+    }
+
+    /* Warn only when the corrected path is there: a miss further down still
+     * fails the open, and the missing-file report names it instead. */
+    if (changed && lstat(path, &st) == 0 && case_warn_first(guest))
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                 "%s: not found; opened %s (case differs)", guest, path);
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -886,6 +972,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     {
         char remainder_posix[MAX_PATH];
+        size_t fixed;
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);
 
         /* Xbox paths use backslashes -> POSIX slashes. */
@@ -893,6 +980,8 @@ translate:
             if (*p == '\\') *p = '/';
 
         if (sub_dir) {
+            fixed = (size_t)snprintf(host_path_buf, buf_size, "%s%s",
+                                     base_dir, sub_dir);
             snprintf(host_path_buf, buf_size, "%s%s/%s",
                      base_dir, sub_dir, remainder_posix);
 
@@ -901,6 +990,7 @@ translate:
             snprintf(dir_path, sizeof(dir_path), "%s%s", base_dir, sub_dir);
             mkdir_p(dir_path);
         } else {
+            fixed = strlen(base_dir);
             snprintf(host_path_buf, buf_size, "%s/%s", base_dir, remainder_posix);
         }
 
@@ -909,6 +999,8 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        if (fixed < strlen(host_path_buf))
+            fix_case(host_path_buf, fixed);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path

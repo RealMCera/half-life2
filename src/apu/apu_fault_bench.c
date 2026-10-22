@@ -56,13 +56,14 @@ double apu_hook_fault_bench(unsigned n)
 
 #endif /* _WIN32 */
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) || \
+    (defined(__linux__) && defined(__x86_64__)))
 #include <time.h>
 extern volatile int g_apu_hook_bench_active;    /* apu_mmio_hook.c */
 extern MCPXAPUState *g_apu_state;
 
-/* The POSIX arm64 twin: n trapped `ldr w` reads of PIO_FREE through SIGBUS,
- * the A64 decoder and the model. */
+/* The POSIX twin: n trapped `ldr w` (arm64) or `movl` (x86-64 Linux) reads
+ * of PIO_FREE through SIGBUS/SIGSEGV, the host's decoder and the model. */
 double apu_hook_fault_bench(unsigned n)
 {
     extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -78,7 +79,11 @@ double apu_hook_fault_bench(unsigned n)
     clock_gettime(CLOCK_MONOTONIC, &a);
     for (unsigned i = 0; i < n; i++) {
         uint32_t v;
+#if defined(__aarch64__)
         __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(p) : "memory");
+#else
+        __asm__ volatile("movl (%1), %0" : "=r"(v) : "r"(p) : "memory");
+#endif
         sink += v;
     }
     clock_gettime(CLOCK_MONOTONIC, &b);

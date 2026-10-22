@@ -45,6 +45,9 @@ else()
     if(NOT APPLE)
         target_link_libraries(platform PUBLIC m)   # feclearexcept etc.; libSystem has them on macOS
     endif()
+    # dladdr (the games' crash reports name the faulting function) lives in
+    # libdl before glibc 2.34; sniper's 2.31 links fail without it.
+    target_link_libraries(platform PUBLIC ${CMAKE_DL_LIBS})
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
     # glibc declares pthread_setname_np, pthread_[gs]etaffinity_np, the
     # CPU_* set macros and dladdr only under _GNU_SOURCE, and a header that

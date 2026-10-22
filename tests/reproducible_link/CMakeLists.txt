@@ -23,4 +23,5 @@ add_test(NAME reproducible-mingw
     COMMAND ${CMAKE_COMMAND} ${_args} -DMODE=mingw
             -DWORK=${CMAKE_CURRENT_BINARY_DIR}/mingw
             -P ${CMAKE_CURRENT_SOURCE_DIR}/check.cmake)
-set_tests_properties(reproducible-mingw PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(reproducible-mingw PROPERTIES
+    SKIP_REGULAR_EXPRESSION "no llvm-mingw \\(set LLVM_MINGW_ROOT\\): skipped")

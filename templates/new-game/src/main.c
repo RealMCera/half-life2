@@ -455,6 +455,8 @@ static void *host_fault_pc(void *ucv)
     return (void *)(uintptr_t)uc->uc_mcontext->__ss.__rip;
 #elif defined(__linux__) && defined(__aarch64__)
     return (void *)(uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__linux__) && defined(__x86_64__)
+    return (void *)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
 #else
     (void)uc;
     return NULL;
@@ -562,7 +564,7 @@ static void posix_crash_handler(int sig, siginfo_t *si, void *ucv)
      * dispatch: the APU, the AC'97 bus-master page (RECOMP_AC97_READY) and the
      * USB OHCI controllers. A serviced access returns here with pc advanced;
      * the kernel resumes the thread after the instruction. Hosts without a
-     * decoder (anything but arm64) get 0 and fall through to the report. */
+     * decoder (x86-64 macOS) get 0 and fall through to the report. */
     if (xbox_PosixMmioFault(ucv, (uintptr_t)si->si_addr))
         return;
 

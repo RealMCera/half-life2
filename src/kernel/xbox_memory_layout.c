@@ -87,10 +87,20 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * question. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
-/* POSIX, RECOMP_EXT_VMA only: the span holds the whole 4 GB guest window, and
- * every fixed-address window is carved out of it (layout_map_view,
- * layout_commit_at). See the span reservation in xbox_MemoryLayoutInit. */
+/* POSIX, with RECOMP_EXT_VMA and always on Linux: the span holds the whole
+ * 4 GB guest window, and every fixed-address window is carved out of it
+ * (layout_map_view, layout_commit_at). See the span reservation in
+ * xbox_MemoryLayoutInit. */
 static int g_span_whole_window = 0;
+
+/* POSIX: whether [addr, addr + size) lies inside our span reservation. Only
+ * there is releasing a range safe: outside it the addresses belong to someone
+ * else, and munmap would take their mapping with it. */
+static int span_holds(void *addr, size_t size)
+{
+    uintptr_t a = (uintptr_t)addr, lo = (uintptr_t)g_span_base;
+    return g_span_base && a >= lo && a + size <= lo + g_span_size;
+}
 
 /* POSIX: hand back the part of our span reservation a fixed-address window is
  * about to take. Only when the span holds the whole window; the stock span
@@ -101,8 +111,7 @@ static int g_span_whole_window = 0;
 static void span_release_for(void *addr, size_t size)
 {
 #if !defined(_WIN32)
-    uintptr_t a = (uintptr_t)addr, lo = (uintptr_t)g_span_base;
-    if (g_span_whole_window && a >= lo && a + size <= lo + g_span_size)
+    if (g_span_whole_window && span_holds(addr, size))
         VirtualFree(addr, size, MEM_RELEASE);
 #else
     (void)addr; (void)size;
@@ -660,8 +669,17 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32)
+#include "../platform/mmio_decode.h"
 #include "../platform/mmio_decode_a64.h"
+#endif
+/* POSIX hosts with a decoder for their own stores: arm64 (A64) and x86-64
+ * Linux (the Windows decoder over the signal's gregs). */
+#if !defined(_WIN32) && (defined(__aarch64__) || defined(MMIO_DECODE_X64))
+#define XBOX_MMIO_TRAP_POSIX 1
+#endif
+
+#if defined(XBOX_MMIO_TRAP_POSIX)
 #include <sys/mman.h>
 #include <unistd.h>
 static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
@@ -678,7 +696,7 @@ static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
     memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
 }
 
-/* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
+/* POSIX half of the AC'97 write trap: the page is PROT_READ, so a
  * write arrives as SIGBUS/SIGSEGV; the title's fault handler reaches this
  * through xbox_PosixMmioFault before reporting. The store is emulated onto
  * the page (open for the moment), the controller's reaction applied, and the
@@ -710,8 +728,13 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
         __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
         return 0;
     }
+#if defined(__aarch64__)
     ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#else
+    ok = mmio_emulate((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                      g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#endif
     if (ok)
         ac97_clear_reset_bits();
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
@@ -729,7 +752,7 @@ static void ac97_arm_write_trap(void)
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
-#if !defined(_WIN32) && !defined(__aarch64__)
+#if !defined(_WIN32) && !defined(XBOX_MMIO_TRAP_POSIX)
     /* No POSIX decoder for this host's stores: a trapped write would be a
      * fault nothing services. Leave the page writable. */
     (void)old;
@@ -738,7 +761,7 @@ static void ac97_arm_write_trap(void)
     return;
 #endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
+#if defined(XBOX_MMIO_TRAP_POSIX)
     (void)old;
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
@@ -876,7 +899,7 @@ int xbox_VehMmioFault(void *exception_pointers)
     return 0;
 }
 #else
-#if defined(__aarch64__)
+#if defined(XBOX_MMIO_TRAP_POSIX)
 extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
@@ -884,11 +907,11 @@ extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
 /* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
  * ucontext_t * and si_addr; on 1, return from the handler and the thread
  * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
- * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
- * 0. */
+ * arm64 hosts and x86-64 Linux have a decoder; elsewhere nothing is trapped
+ * and this returns 0. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
-#if defined(__aarch64__)
+#if defined(XBOX_MMIO_TRAP_POSIX)
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))
@@ -3273,8 +3296,19 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * GUEST_VMEM_TOP pushed the contiguous window onto the neighbour
          * instead. Each fixed window is carved out of the span as it is
          * mapped, and guest_vmem's range is handed over just before
-         * guest_vmem_init. Off by default; the stock span is unchanged. */
-        if (ext_vma_span(g_span_size)) {
+         * guest_vmem_init. Off by default; the stock span is unchanged.
+         *
+         * Linux always holds the whole window. Its top-down placement puts a
+         * fresh 2 GB span directly under other mappings, so the contiguous
+         * window right above it (guest 0x80000000) failed with EEXIST and the
+         * first touch of the kernel page faulted. The Mac places bottom-up and
+         * keeps the stock span. */
+#if defined(__linux__)
+        const int whole_window = 1;
+#else
+        const int whole_window = ext_vma_span(g_span_size) != 0;
+#endif
+        if (whole_window) {
             g_span_size = (size_t)1 << 32;
             g_span_whole_window = 1;
         }
@@ -4129,12 +4163,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 continue;
             }
             /* Inside the reservation this hands back the slice we are about
-             * to use; outside it (no reservation) this is a no-op on an
-             * address we never held. When the span holds the whole window
-             * (RECOMP_EXT_VMA), layout_map_view releases the slice itself:
-             * freeing it here too would unmap it twice, and the second
-             * munmap could take out another thread's mapping in the gap. */
-            if (g_span_base && !g_span_whole_window)
+             * to use. Outside it nothing is freed: at 128 MB the mirrors run
+             * past the span (capped at the contiguous window), and on Linux,
+             * which places top-down, the host range above the span is other
+             * mappings. Freeing it there unmapped a thread's stack. When the
+             * span holds the whole window, layout_map_view releases the slice
+             * itself: freeing it here too would unmap it twice, and the
+             * second munmap could take out another thread's mapping in the
+             * gap. */
+            if (!g_span_whole_window
+                    && span_holds((LPVOID)mirror_base, g_memory_size))
                 VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = layout_map_view(g_mapping_handle,
                                                 g_memory_size,

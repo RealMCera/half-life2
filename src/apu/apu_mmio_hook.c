@@ -2,9 +2,9 @@
  * MCPX APU MMIO Hook - trapped APU register access
  *
  * Decodes the faulting instruction with the shared trapped-MMIO decoders
- * (src/platform/mmio_decode.h on x86-64 under a VEH, mmio_decode_a64.h on
- * POSIX arm64 under SIGBUS/SIGSEGV) and routes reads/writes through the MCPX
- * APU register handlers.
+ * (src/platform/mmio_decode.h on x86-64 under a VEH or, on Linux, a SIGSEGV
+ * handler; mmio_decode_a64.h on POSIX arm64 under SIGBUS/SIGSEGV) and routes
+ * reads/writes through the MCPX APU register handlers.
  */
 
 #include "apu.h"
@@ -18,9 +18,9 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* Windows: a VEH hands over the CONTEXT. POSIX arm64: a SIGBUS/SIGSEGV
- * handler hands over the ucontext (apu_hook_handle_mmio_posix, at the end).
- * x86-64 Linux has no trap yet. */
+/* Windows: a VEH hands over the CONTEXT. POSIX arm64 and x86-64 Linux: a
+ * SIGBUS/SIGSEGV handler hands over the ucontext (apu_hook_handle_mmio_posix,
+ * at the end). Other POSIX hosts have no trap. */
 #if defined(_WIN32)
 #include <windows.h>
 #include "../platform/mmio_decode.h"
@@ -282,10 +282,14 @@ void apu_hook_direct_wr(uint32_t off, uint32_t v, int size)
 
 #endif /* _WIN32 */
 
-#if !defined(_WIN32) && defined(__aarch64__)
-/* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
- * (src/platform/mmio_decode_a64.h). The host's fault handler reaches it
- * through xbox_PosixMmioFault before it reports a crash. */
+#if !defined(_WIN32)
+#include "../platform/mmio_decode.h"
+#endif
+#if !defined(_WIN32) && (defined(__aarch64__) || defined(MMIO_DECODE_X64))
+/* POSIX: the same hook over sigaction + ucontext, with the A64 decoder
+ * (src/platform/mmio_decode_a64.h) on arm64 and the Windows x86-64 one
+ * (mmio_decode.h, over the ucontext gregs) on x86-64 Linux. The host's fault
+ * handler reaches it through xbox_PosixMmioFault before it reports a crash. */
 #include <pthread.h>
 #include <time.h>
 #include <string.h>
@@ -441,34 +445,53 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     trace = apu_trace_now();
     if (trace)
         a = s_now_ns();
+#if defined(__aarch64__)
     ok = mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
+#else
+    /* The page-fault error code says which way before the decoder runs. */
+    is_write = MMIO_FAULT_IS_WRITE(uc);
+    ok = mmio_emulate(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
+#endif
     if (!ok) {
         g_apu_mmio_decode_fail++;
         /* stdio in a signal handler is not async-signal-safe. The process is
          * about to die of this fault anyway, and the line is what says why;
          * capped at 20, as on Windows. */
+#if defined(__aarch64__)
         if (g_apu_mmio_decode_fail <= 20)
             fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
                     (void *)(uintptr_t)A64_CTX_PC(uc),
                     *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), off);
+#else
+        if (g_apu_mmio_decode_fail <= 20) {
+            const uint8_t *ip = (const uint8_t *)(uintptr_t)MMIO_RIP(uc);
+            fprintf(stderr, "[APU] MMIO decode fail at RIP=%p bytes=%02X %02X %02X"
+                            " %02X %02X %02X offset=0x%X\n", (const void *)ip,
+                    ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], off);
+        }
+#endif
         return false;
     }
     if (!trace)
         return true;
     s_handler_ns += s_now_ns() - a;
+#if defined(__aarch64__)
     {
         /* Direction from the opcode: bit 22 clear is a store for the
          * single-register forms; LDP/STP carry L in bit 22 as well. */
         uint32_t insn = *(const uint32_t *)(uintptr_t)(A64_CTX_PC(uc) - 4);
         apu_trace_tally(off, !((insn >> 22) & 1), NULL);
     }
+#else
+    apu_trace_tally(off, is_write, NULL);
+#endif
     return true;
 }
 #elif !defined(_WIN32)
-/* x86-64 POSIX: there is no fault decoder here, but with RECOMP_AC97_READY=1
- * the compat VirtualProtect (mprotect) still arms the trap, so
- * xbox_MmioRead/Write route constant-address movs to these untraced calls
- * into the model (a fault there would have no handler). */
+/* Other POSIX hosts (x86-64 macOS): there is no fault decoder here, but
+ * with RECOMP_AC97_READY=1 the compat VirtualProtect (mprotect) still arms
+ * the trap, so xbox_MmioRead/Write route constant-address movs to these
+ * untraced calls into the model (a fault there would have no handler). */
 void apu_hook_trace_start(void) {}
 
 uint32_t apu_hook_direct_rd(uint32_t off, int size)

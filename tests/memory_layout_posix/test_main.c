@@ -132,7 +132,7 @@ int main(int argc, char **argv)
      * of which check reached it. */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    /* Audio defaults on where the host traps MMIO (arm64 here), and then the
+    /* Audio defaults on where the host traps MMIO (arm64, x86-64 Linux), and the
      * MCPX aperture is left PROT_NONE for the trap. This test checks plain
      * mappings, so it runs without it. */
     recomp_env_set(RENV_AC97_READY, NULL);
@@ -345,6 +345,47 @@ int main(int argc, char **argv)
             }
         }
         free(big);
+    }
+
+    /*
+     * 7. A 128 MB map (devkit RAM) keeps the contiguous window and leaves
+     *    other mappings alone.
+     *
+     * At 128 MB the 28 mirrors reach guest 0xE8000000, past the span that
+     * stops at the contiguous window. The mirror loop used to free each slot
+     * before mapping it, inside the span or not. Linux places mappings
+     * top-down, so the range above a fresh span is whatever was mapped
+     * before it, and BLiNX 2 lost a thread's stack that way. The same
+     * placement put the span right under the neighbour that the contiguous
+     * window then collided with. The sentinel is mapped before init, so on
+     * Linux it sits in that range above the span.
+     */
+    {
+        unsigned char *sentinel = mmap(NULL, (size_t)host_page,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (sentinel != MAP_FAILED)
+            sentinel[0] = 0x5A;
+        xbox_SetMapSize((size_t)128 << 20);
+        BOOL ok7 = xbox_MemoryLayoutInit(xbe, n);
+        check(ok7, "init succeeds with a 128 MB map", NULL);
+        if (ok7) {
+            unsigned char *b7 = (unsigned char *)xbox_GetMemoryBase();
+            unsigned char got = 0;
+            check(read_byte_in_child(b7 + 0x80000000u, &got),
+                  "128 MB: the contiguous window at 0x80000000 is mapped",
+                  "the span left no room above it for the window");
+            if (sentinel != MAP_FAILED) {
+                got = 0;
+                check(read_byte_in_child(sentinel, &got) && got == 0x5A,
+                      "128 MB: a mapping made before init survives it",
+                      "the mirror loop freed a range outside the span");
+            }
+            xbox_MemoryLayoutShutdown();
+        }
+        xbox_SetMapSize(0);
+        if (sentinel != MAP_FAILED)
+            munmap(sentinel, (size_t)host_page);
     }
 
     printf("\n%d failure(s)\n", failures);

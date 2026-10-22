@@ -11,8 +11,10 @@ if(MODE STREQUAL "mingw")
         find_program(_cc x86_64-w64-mingw32-clang)
     endif()
     if(NOT _cc OR NOT EXISTS "${_cc}")
+        # The test's SKIP_REGULAR_EXPRESSION matches this line: cmake older
+        # than 3.29 (sniper has 3.25) has no cmake_language(EXIT).
         message("no llvm-mingw (set LLVM_MINGW_ROOT): skipped")
-        cmake_language(EXIT 77)
+        return()
     endif()
     set(_cfg -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=x86_64
              -DCMAKE_C_COMPILER=${_cc})
