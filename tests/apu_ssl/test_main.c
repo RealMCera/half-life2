@@ -6,13 +6,14 @@
  * hardware the DSP code keeps the limit from being reached; our DSPs are
  * stubs, so a limit re-armed by that restart fired every 2048 samples and the
  * restart ran 23 times a second (JSRF). This checks the stub's tick fires
- * once at the limit, not again after the title's restart or a running mode
- * written while running, again after the sequencer is switched off and on,
- * and never with no limit or the counter off. With an emulated GP it fires
- * only when the GP's lag reaches SSL samples: never while the GP keeps pace,
- * once at the limit for a GP that runs long, later when early frames pay
- * the lag back, and never from lag the GP built while the counter was off
- * or before a restart.
+ * once at the limit, not again after the title's restart (JSRF's, with no
+ * SECTL write, and B3's, which switches only the counter off and on) or a
+ * running mode written while running, again after the sequencer is stopped
+ * whole (SECTL 0) and started, and never with no limit or the counter
+ * off. With an emulated GP it fires only when the GP's lag reaches SSL
+ * samples: never while the GP keeps pace, once at the limit for a GP that
+ * runs long, later when early frames pay the lag back, and never from lag
+ * the GP built while the counter was off or before a restart.
  *
  * mcpx_apu_ssl_tick is the frame thread's per-frame step; an ISTS write of 0
  * (acks nothing) stands in for the frame thread turning set_irq into the
@@ -35,6 +36,10 @@ static int failures;
 /* What DirectSound writes: SSL 2048 samples, the counter running. */
 #define SSL_SAMPLES 0x800u
 #define SECTL_RUN   (1u << 3)
+/* The values B3's DirectSound writes: 0xF runs, 0x7 is the counter off with
+ * the rest of SECTL kept. */
+#define SECTL_ON      0xFu
+#define SECTL_CNT_OFF 0x7u
 
 static uint32_t reg(MCPXAPUState *d, uint32_t r) { return d->regs[r]; }
 static int ssl_status(MCPXAPUState *d) { return !!(reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_SSLINTSTS); }
@@ -81,8 +86,9 @@ int main(void)
           mcpx_apu_mmio_read(d, NV_PAPU_XGSCNT, 4) == SSL_SAMPLES);
 
     /* 2. The service routine acks and restarts the sequencer the way it
-     *    does after every SSL interrupt. The stub DSPs never hold the limit
-     *    off, so a re-armed tick would fire again here, 23 times a second. */
+     *    does after every SSL interrupt (JSRF's and Black's shape: no SECTL
+     *    write). The stub DSPs never hold the limit off, so a re-armed tick
+     *    would fire again here, 23 times a second. */
     ack(d);
     for (int restart = 0; restart < 4; restart++) {
         program(d);
@@ -98,13 +104,34 @@ int main(void)
     ticks(d, frames * 2);
     CHECK("running mode rewritten: no SSLINTSTS", !ssl_status(d));
 
-    /* 3. Switching the counter off and on is a new sequencer start. */
+    /* 2c. B3's, SSX 3's and BLiNX 2's restart switches only the counter
+     *     off and on again (SECTL 0xF, 0x7, program, 0xF). That is not a
+     *     sequencer reset: no second interrupt. */
+    for (int restart = 0; restart < 4; restart++) {
+        mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_ON, 4);
+        mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_CNT_OFF, 4);
+        program(d);
+        mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_ON, 4);
+        ticks(d, frames * 2);
+    }
+    CHECK("counter-only restarts: no SSLINTSTS", !ssl_status(d));
+    CHECK("counter-only restarts: line low", !line(d));
+
+    /* 3. DirectSound's init stops the sequencer whole before it programs
+     *    it (SECTL 0, program, 0x7, 0xF): a new start, and the limit fires
+     *    again. */
     mcpx_apu_mmio_write(d, NV_PAPU_SECTL, 0, 4);
-    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_RUN, 4);
     program(d);
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_CNT_OFF, 4);
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_ON, 4);
     ticks(d, frames);
     CHECK("new start: SSLINTSTS again", ssl_status(d));
     ack(d);
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_CNT_OFF, 4);
+    program(d);
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_ON, 4);
+    ticks(d, frames * 2);
+    CHECK("its recovery after: no SSLINTSTS", !ssl_status(d));
 
     /* 4. Counter off: no tick however long it runs. */
     mcpx_apu_mmio_write(d, NV_PAPU_SECTL, 0, 4);
@@ -191,8 +218,8 @@ int main(void)
     ticks(d, 1);
     CHECK("counter on after off-time lag: no SSLINTSTS", !ssl_status(d));
 
-    /* 7d. A restart (B3's and SSX 3's: counter off and on again, with no
-     *     tick between) starts the lag again: the late frames of the run
+    /* 7d. A restart (B3's and SSX 3's: SECTL 0x7 then 0xF, with no tick
+     *     between) starts the lag again: the late frames of the run
      *     before it do not fire the new one at once. */
     for (int i = 0; i < frames - 2; i++) {
         mcpx_apu_gp_frame_ran(d, 2 * frame);
@@ -201,9 +228,9 @@ int main(void)
     settle(d);
     CHECK("lag one frame short of SSL: no SSLINTSTS", !ssl_status(d));
     mcpx_apu_gp_frame_ran(d, 2 * frame);
-    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, 0, 4);
-    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_RUN, 4);
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_CNT_OFF, 4);
     program(d);
+    mcpx_apu_mmio_write(d, NV_PAPU_SECTL, SECTL_ON, 4);
     ticks(d, 1);
     CHECK("restart after a lag at SSL: no SSLINTSTS", !ssl_status(d));
     mcpx_apu_gp_frame_ran(d, 2 * frame);

@@ -455,14 +455,24 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
-        /* Only an explicit off write re-arms the sample limit: a running
-         * mode written while running is not a new start. DirectSound
-         * switches the counter off before each start in the titles this
-         * was checked on (Black, JSRF); one that changes mode without
-         * passing through off gets no second interrupt. */
+        /* Every counter-off write ends the sequencer's run, which is what
+         * the emulated GP's lag counts against. Only a SECTL of 0
+         * re-arms the stub's sample limit. Bits 0-2 have no public
+         * meaning, so 0 is not a hardware "stopped whole"; it is what
+         * DirectSound's init writes before it programs the sequencer in
+         * every title traced (JSRF, B3, SSX 3, BLiNX 2), and the reset
+         * state is armed, so the first interrupt comes either way (Black
+         * needs it, and was not traced). Its recovery does not write 0:
+         * JSRF's writes no SECTL at all, and B3's, SSX 3's and BLiNX 2's
+         * switch only the counter off (0xF, then 0x7, then 0xF again).
+         * Re-arming on that ran their recovery 23 times a second on the
+         * stub. */
         if (addr == NV_PAPU_SECTL
-                && (val & NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF)
+                && (val & NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF) {
             qatomic_inc(&d->ssl_starts);
+            if (val == 0)
+                qatomic_inc(&d->ssl_resets);
+        }
         /* Starting the APU has to start the frame thread.
          *
          * The thread idles on pause_requested, which init sets and only the
@@ -1122,16 +1132,16 @@ static void gp_lag_since(MCPXAPUState *d, uint32_t armed)
  *
  * With the stub GP nothing keeps pace, and a limit re-armed every 2048
  * samples ran the title's recovery 23 times a second. The stub fires once
- * per sequencer start instead, a concession, not emulation: the first
- * interrupt is the one Black needs to finish its DirectSound init, and a
- * SECTL off write re-arms it (see mcpx_apu_write). B3 and SSX 3 switch
- * the counter off in every restart, so on the stub they still run the
- * recovery 23 times a second. */
+ * per sequencer reset instead, a concession, not emulation: the first
+ * interrupt is the one Black needs to finish its DirectSound init, and
+ * only a SECTL write of 0 re-arms it (see mcpx_apu_write). The recovery
+ * that interrupt runs never writes 0, so each boot runs it once. */
 void mcpx_apu_ssl_tick(MCPXAPUState *d)
 {
     uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
     uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
     uint32_t armed = qatomic_read(&d->ssl_starts) + 1;
+    uint32_t reset = qatomic_read(&d->ssl_resets) + 1;
     bool counting = ssl && (sectl & NV_PAPU_SECTL_XCNTMODE)
                            != NV_PAPU_SECTL_XCNTMODE_OFF;
     d->sample_count += NUM_SAMPLES_PER_FRAME;
@@ -1149,9 +1159,9 @@ void mcpx_apu_ssl_tick(MCPXAPUState *d)
         if (fire)
             d->gp_lag_cycles = 0;
     } else {
-        fire = d->ssl_fired_at != armed && d->sample_count >= ssl;
+        fire = d->ssl_fired_at != reset && d->sample_count >= ssl;
         if (fire)
-            d->ssl_fired_at = armed;
+            d->ssl_fired_at = reset;
     }
     if (fire) {
         d->ssl_raised++;
@@ -1463,6 +1473,7 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     }
     d->set_irq = false;
     qatomic_set(&d->ssl_starts, 0);
+    qatomic_set(&d->ssl_resets, 0);
     d->ssl_fired_at = 0;
     d->gp_lag_cycles = 0;
     d->gp_lag_start = 0;

@@ -511,12 +511,18 @@ struct MCPXAPUState {
      * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
     uint64_t sample_count;
     /* Sequencer starts: bumped by every SECTL write that switches the
-     * counter off (the guest's MMIO thread). */
+     * counter off (the guest's MMIO thread). The emulated GP's lag counts
+     * from the last one. */
     uint32_t ssl_starts;
-    /* ssl_starts + 1 when the sample-limit interrupt last fired, so the
-     * zeroed state counts as not fired; the frame thread's alone. A SECTL
-     * off write re-arms it by moving ssl_starts on, with no lock and no
-     * re-arm lost to the frame thread's read-check-set. */
+    /* Sequencer resets: bumped by every SECTL write of 0, the sequencer
+     * stopped whole (the guest's MMIO thread). Only these re-arm the
+     * stub's sample limit; a recovery that switches only the counter off
+     * does not. */
+    uint32_t ssl_resets;
+    /* ssl_resets + 1 when the stub's sample-limit interrupt last fired, so
+     * the zeroed state counts as not fired; the frame thread's alone. A
+     * SECTL write of 0 re-arms it by moving ssl_resets on, with no lock
+     * and no re-arm lost to the frame thread's read-check-set. */
     uint32_t ssl_fired_at;
     /* Set by the code that runs an emulated GP, while it runs. The sample
      * limit then follows that GP's lag (gp_lag_cycles) instead of the stub's
