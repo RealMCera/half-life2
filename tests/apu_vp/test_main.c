@@ -1,13 +1,20 @@
 /* The voice processor against a small fake guest RAM.
  *
  * apu_vp.c is compiled into this file so its static helpers can be called
- * directly. Each check below fails on the code it was written for:
+ * directly. Each check below fails on the code it was written for, except
+ * resample_half_rate_lands_on_source_samples, which pins that positions off
+ * rate 1 did not move:
  *   - adpcm_*: the decode buffers held two 36-byte blocks' worth, so a
  *     wider samples-per-block value overran them on the stack (a mono
  *     voice already at two).
  *   - outbuf_sge_*: output buffer SGE entries were written into the voices'
  *     table (VPSGEADDR), so an output buffer at handle 1 overwrote the first
  *     page of a voice buffer at inbuf handle 1.
+ *   - resample_*: the resampler held one fetched sample back, so a voice at
+ *     rate 1 looping a 32-sample buffer rewritten each frame (Burnout 3's
+ *     effect returns from the GP) began each frame with the last frame's
+ *     sample 0; and at rate 0.3 its source count (floorf of the summed
+ *     steps) came out one short every few frames, dropping a sample.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -193,6 +200,121 @@ static void outbuf_sge_past_max_is_dropped(void)
           ram32(SGE_BASE + 16));
 }
 
+/* Voice 0: a looping mono s16 PCM buffer voice of `len` samples at
+ * DATA_BASE. */
+static void setup_pcm_loop_voice(MCPXAPUState *d, unsigned len)
+{
+    uint32_t fmt = (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                   (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
+                   NV_PAVS_VOICE_CFG_FMT_LOOP;
+    uint32_t sge[4] = { DATA_BASE, 0, DATA_BASE + 0x1000u, 0 };
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(d, 0, sizeof(*d));
+    d->regs[NV_PAPU_VPVADDR] = VOICE_BASE;
+    d->regs[NV_PAPU_VPSGEADDR] = SGE_BASE;
+    memcpy(s_ram + SGE_BASE, sge, sizeof(sge));
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT, fmt);
+    set_voice_reg(0, NV_PAVS_VOICE_PAR_NEXT, len - 1);        /* EBO */
+    set_voice_reg(0, NV_PAVS_VOICE_PAR_STATE,
+                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+}
+
+static void put_s16(unsigned i, int16_t x)
+{
+    memcpy(s_ram + DATA_BASE + 2 * i, &x, 2);
+}
+
+/* One frame of voice 0 at `rate`, the way voice_process asks for it. */
+static int resample_frame(MCPXAPUState *d, float rate,
+                          float out[NUM_SAMPLES_PER_FRAME][2])
+{
+    int n = 0, empty = 0;
+    while (n < NUM_SAMPLES_PER_FRAME) {
+        int c = voice_resample(d, 0, &out[n], NUM_SAMPLES_PER_FRAME - n, rate);
+        if (c < 0 || (c == 0 && ++empty > 4))
+            break;
+        n += c;
+    }
+    return n;
+}
+
+static void resample_rate_one_plays_this_frames_buffer(void)
+{
+    static MCPXAPUState d;
+    float out[NUM_SAMPLES_PER_FRAME][2];
+
+    setup_pcm_loop_voice(&d, NUM_SAMPLES_PER_FRAME);
+    for (int frame = 0; frame < 6; frame++) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            put_s16((unsigned)i, (int16_t)(frame * 1000 + i * 7 + 1));
+        int n = resample_frame(&d, 1.0f, out);
+        CHECK(n == NUM_SAMPLES_PER_FRAME, "frame %d: %d samples", frame, n);
+        for (int i = 0; i < n; i++) {
+            float want = int16_to_float((int16_t)(frame * 1000 + i * 7 + 1));
+            if (out[i][0] != want) {
+                CHECK(0, "frame %d: sample %d is %f, this frame's buffer has %f",
+                      frame, i, out[i][0], want);
+                break;
+            }
+        }
+    }
+}
+
+/* Not a regression check: pins that positions off rate 1 are unchanged. */
+static void resample_half_rate_lands_on_source_samples(void)
+{
+    static MCPXAPUState d;
+    float out[NUM_SAMPLES_PER_FRAME][2];
+    const unsigned len = 1024;
+
+    setup_pcm_loop_voice(&d, len);
+    for (unsigned i = 0; i < len; i++)
+        put_s16(i, (int16_t)(i * 13));
+    /* Rate 0.5: two source samples an output, each on a whole position. */
+    for (int frame = 0; frame < 4; frame++) {
+        int n = resample_frame(&d, 0.5f, out);
+        CHECK(n == NUM_SAMPLES_PER_FRAME, "frame %d: %d samples", frame, n);
+        for (int i = 0; i < n; i++) {
+            unsigned at = 2u * (unsigned)(frame * NUM_SAMPLES_PER_FRAME + i);
+            float want = int16_to_float((int16_t)(at * 13));
+            if (out[i][0] != want) {
+                CHECK(0, "frame %d: output %d is %f, source %u is %f",
+                      frame, i, out[i][0], at, want);
+                break;
+            }
+        }
+    }
+}
+
+/* Rate 0.3 over a ramp: output k sits at source position k / 0.3. A dropped
+ * source sample shifts every later output a whole position (13 ramp units),
+ * far outside the rounding tolerance. */
+static void resample_rate_0_3_drops_no_source_sample(void)
+{
+    static MCPXAPUState d;
+    float out[NUM_SAMPLES_PER_FRAME][2];
+    const unsigned len = 1024;
+    const float step = 1.0f / 0.3f;
+
+    setup_pcm_loop_voice(&d, len);
+    for (unsigned i = 0; i < len; i++)
+        put_s16(i, (int16_t)(i * 13));
+    for (int frame = 0; frame < 8; frame++) {
+        int n = resample_frame(&d, 0.3f, out);
+        CHECK(n == NUM_SAMPLES_PER_FRAME, "frame %d: %d samples", frame, n);
+        for (int i = 0; i < n; i++) {
+            double at = (double)(frame * NUM_SAMPLES_PER_FRAME + i) * step;
+            double got = out[i][0] * 32768.0 / 13.0;
+            if (fabs(got - at) > 0.05) {
+                CHECK(0, "frame %d: output %d sits at source %.3f, expected %.3f",
+                      frame, i, got, at);
+                break;
+            }
+        }
+    }
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -203,6 +325,9 @@ int main(void)
     outbuf_sge_goes_to_gp_fifo_table();
     outbuf_sge_without_table_is_dropped();
     outbuf_sge_past_max_is_dropped();
+    resample_rate_one_plays_this_frames_buffer();
+    resample_half_rate_lands_on_source_samples();
+    resample_rate_0_3_drops_no_source_sample();
 
     free(s_ram);
     if (s_failures) {
@@ -210,6 +335,7 @@ int main(void)
         return 1;
     }
     puts("PASS: ADPCM blocks up to the hardware limit decode, wider ones are "
-         "refused; output buffer SGE entries go to the GP FIFO table.");
+         "refused; output buffer SGE entries go to the GP FIFO table; the "
+         "resampler plays each frame's source, no sample held back.");
     return 0;
 }

@@ -79,7 +79,7 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
         src_reset(d->vp.filters[v].resampler);
     }
     d->vp.filters[v].rs_have = 0;
-    d->vp.filters[v].rs_pos = 0.0f;
+    d->vp.filters[v].rs_pos = 1.0f;
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -1456,12 +1456,19 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
      * half high, 8.8 % too fast -- and drained each stream buffer faster than
      * the title filled it, which is where the periodic dropouts came from.
      *
-     * State per voice: the two source samples the output sits between
-     * (rs_last at 0, rs_next at 1) and the output's position rs_pos in
-     * [0,1). Source samples arrive from voice_get_samples in the voice's own
-     * units; a shortfall (the voice ended or its stream ran dry) returns the
-     * outputs that could be made, and a fetch failure with nothing made is
-     * passed through as it was. */
+     * State per voice: the two newest source samples (rs_last, rs_next) and
+     * the next output's position rs_pos past rs_last, in (0,1] once the
+     * samples it lies past are consumed. An output on a whole position is
+     * rs_next itself, so a voice at rate 1 never holds a sample it fetched
+     * but has not played: its frame is exactly the 32 samples it fetched in
+     * it. Burnout 3's effect returns need that: the GP rewrites a 32-sample
+     * buffer each frame and two looping voices play it back. A position kept
+     * in [0,1) held one sample ahead, so each frame began with the previous
+     * frame's sample 0 -- a step every 32 samples, heard as fizz on the
+     * engines and nitro. Source samples arrive from voice_get_samples in the
+     * voice's own units; a shortfall (the voice ended or its stream ran dry)
+     * returns the outputs that could be made, and a fetch failure with
+     * nothing made is passed through as it was. */
     MCPXAPUVoiceFilter *f = &d->vp.filters[v];
     float src[NUM_SAMPLES_PER_FRAME * 4 + 2][2];
     const int max_src = (int)(sizeof(src) / sizeof(src[0]));
@@ -1472,29 +1479,26 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     step = 1.0f / rate;
 
     if (!f->rs_have) {
-        got = voice_get_samples(d, v, src, 2);
-        /* A first fetch that gets one sample returns no output and drops
-         * that sample: the next call fetches two afresh. A voice whose
-         * stream starts one sample at a time loses its first sample. */
-        if (got < 2) return got < 0 ? got : 0;
-        f->rs_last[0] = src[0][0]; f->rs_last[1] = src[0][1];
-        f->rs_next[0] = src[1][0]; f->rs_next[1] = src[1][1];
-        f->rs_pos = 0.0f;
+        got = voice_get_samples(d, v, src, 1);
+        if (got < 1) return got < 0 ? got : 0;
+        f->rs_last[0] = f->rs_next[0] = src[0][0];
+        f->rs_last[1] = f->rs_next[1] = src[0][1];
+        f->rs_pos = 1.0f;
         f->rs_have = 1;
     }
 
-    /* Source samples the next requested_num outputs will step past, exactly:
-     * output k sits at rs_pos + k * step, and every whole unit that position
-     * reaches before the last output is a source sample consumed. The last
-     * output's own step is left pending in rs_pos for the next call, so
-     * nothing fetched here goes unused -- fetching floor(rs_pos + n * step)
-     * instead over-read by up to one sample a frame, which was dropped: the
-     * music came out 3 % fast. A step above about 4.2 (rate below 0.24, a
-     * voice pitched more than two octaves up) wants more than the 130-frame
-     * buffer holds over 31 steps; make fewer outputs rather than lose
-     * source, so such a voice comes out short (and late) each frame. */
+    /* Source samples the next requested_num outputs need, exactly: output k
+     * sits at rs_pos + k * step and needs the sample at the next whole
+     * position, rs_next being the first. The last output's own step is left
+     * pending in rs_pos for the next call, so nothing fetched here goes
+     * unused -- over-reading by a sample a frame, as an earlier version did,
+     * dropped it: the music came out 3 % fast. A step above about 4.2 (rate
+     * below 0.24, a voice pitched more than two octaves up) wants more than
+     * the 130-frame buffer holds over 31 steps; make fewer outputs rather
+     * than lose source, so such a voice comes out short (and late) each
+     * frame. */
     for (;;) {
-        need = (int)floorf(f->rs_pos + (float)(requested_num - 1) * step);
+        need = (int)ceilf(f->rs_pos + (float)(requested_num - 1) * step) - 1;
         if (need <= max_src || requested_num <= 1) break;
         requested_num /= 2;
     }
@@ -1505,15 +1509,16 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     if (got < 0) got = 0;
 
     for (in = 0, out = 0; out < requested_num; out++) {
-        while (f->rs_pos >= 1.0f) {
+        while (f->rs_pos > 1.0f) {
             if (in >= got) goto done;
             f->rs_last[0] = f->rs_next[0]; f->rs_last[1] = f->rs_next[1];
             f->rs_next[0] = src[in][0];    f->rs_next[1] = src[in][1];
             in++;
             f->rs_pos -= 1.0f;
         }
-        samples[out][0] = f->rs_last[0] + f->rs_pos * (f->rs_next[0] - f->rs_last[0]);
-        samples[out][1] = f->rs_last[1] + f->rs_pos * (f->rs_next[1] - f->rs_last[1]);
+        /* At rs_pos 1 this is rs_next exactly. */
+        samples[out][0] = (1.0f - f->rs_pos) * f->rs_last[0] + f->rs_pos * f->rs_next[0];
+        samples[out][1] = (1.0f - f->rs_pos) * f->rs_last[1] + f->rs_pos * f->rs_next[1];
         f->rs_pos += step;
     }
 done:
