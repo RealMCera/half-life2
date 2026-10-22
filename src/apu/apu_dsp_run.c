@@ -36,12 +36,11 @@
 #include <stdio.h>
 #include <string.h>
 
-/* The GP and EP clock at about 160 MHz, so one APU frame (32 samples at
- * 48 kHz) is about 106,667 cycles. A program gets twice that before the
- * frame gives up on it: one that never halts (waiting on something this
- * model lacks) must not stall the frame thread. The EP's frame is an EP
- * period, eight APU frames. */
-#define GP_FRAME_CYCLES 106667u
+/* One APU frame is MCPX_APU_GP_FRAME_CYCLES of a DSP's clock (apu_state.h).
+ * A program gets twice that before the frame gives up on it: one that never
+ * halts (waiting on something this model lacks) must not stall the frame
+ * thread. The EP's frame is an EP period, eight APU frames. */
+#define GP_FRAME_CYCLES MCPX_APU_GP_FRAME_CYCLES
 #define GP_CAP          (2u * GP_FRAME_CYCLES)
 #define EP_CAP          (2u * 8u * GP_FRAME_CYCLES)
 
@@ -249,6 +248,15 @@ static void *worker_main(void *arg)
 
 static void count(int k, uint32_t cycles, uint64_t ns)
 {
+    /* Every GP frame that ran, inline or on its worker, is lag accounted on
+     * the frame thread. A skipped warm-up frame is the host's delay, not the
+     * GP's: it adds none. Nor does a frame stopped at the cap: a GP that
+     * never halts waits on something this model lacks, so its cycles say
+     * nothing of the program's pace, and counting them would raise the bit
+     * every 64 frames and run the title's GP restart for a gap of ours. The
+     * cap hit is already counted (capped=) and logged. */
+    if (k == GP && cycles < GP_CAP)
+        mcpx_apu_gp_frame_ran(s.d, cycles);
     RunWindow *w = &s.win[k];
     w->frames++;
     w->cycles += cycles;
@@ -395,6 +403,10 @@ static void report(void)
                     (unsigned long long)s.wk[k].warm.skipped,
                     (unsigned long long)s.wk[k].warm.late);
         }
+        fprintf(stderr, " ssl=%u lag=%llu", s.d->ssl_raised,
+                (unsigned long long)(s.d->gp_lag_cycles
+                                     * NUM_SAMPLES_PER_FRAME
+                                     / MCPX_APU_GP_FRAME_CYCLES));
         fputc('\n', stderr);
         memset(s.win, 0, sizeof(s.win));
     }
@@ -525,6 +537,7 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
      * when the core is not on its worker. A bootstrap starts the warm-up.
      * An EPRST write restarts the EP period, as xemu's ep_frame_div = 0. */
     if (idle(GP) && apu_dsp_emu_poll_rst(gp)) {
+        d->gp_lag_cycles = 0;
         if (apu_dsp_emu_running(gp))
             apu_dsp_warm_start(&s.wk[GP].warm, GP_WARM_FRAMES);
     }
@@ -535,8 +548,8 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
             apu_dsp_warm_start(&s.wk[EP].warm, EP_WARM_PERIODS);
     }
 
-    /* The GP's program answers DirectSound's doorbell and raises nothing
-     * the sequencer's stand-in tick would. */
+    /* A running GP program sets the sample limit's pace: its lag, not the
+     * stub's once-per-start tick (mcpx_apu_ssl_tick). */
     d->gp_emulated = apu_dsp_emu_running(gp);
 
     if (d->gp_emulated) {

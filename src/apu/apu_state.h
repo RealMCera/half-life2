@@ -518,11 +518,23 @@ struct MCPXAPUState {
      * off write re-arms it by moving ssl_starts on, with no lock and no
      * re-arm lost to the frame thread's read-check-set. */
     uint32_t ssl_fired_at;
-    /* Set by the code that runs an emulated GP, while it runs. That GP takes
-     * every sequencer frame as it comes, so it is taken to keep pace, and the
-     * sample-limit tick (a stand-in for the stub GP falling behind) stays
-     * off: see mcpx_apu_ssl_tick. The frame thread's alone. */
+    /* Set by the code that runs an emulated GP, while it runs. The sample
+     * limit then follows that GP's lag (gp_lag_cycles) instead of the stub's
+     * once-per-start tick: see mcpx_apu_ssl_tick. The frame thread's alone. */
     bool gp_emulated;
+    /* How far the emulated GP is behind the sequencer, in GP cycles: what
+     * its frames took beyond MCPX_APU_GP_FRAME_CYCLES, less the slack of
+     * frames that took less. Zero while it keeps pace; a GP reset, a
+     * sample-limit interrupt, a sequencer start and the counter off clear
+     * it. The frame thread's alone. */
+    uint64_t gp_lag_cycles;
+    /* The sequencer start (ssl_starts + 1) the lag counts from: the tick
+     * and a GP frame clear the lag when a new start shows. The frame
+     * thread's alone. */
+    uint32_t gp_lag_start;
+    /* Sample-limit interrupts raised, either path (the DSP stats line). The
+     * frame thread's alone. */
+    uint32_t ssl_raised;
 
     int ep_frame_div;
     int sleep_acc_us;
@@ -598,9 +610,16 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);
 
+/* The GP and EP clock at about 160 MHz: one APU frame (32 samples at
+ * 48 kHz) is about this many DSP cycles. */
+#define MCPX_APU_GP_FRAME_CYCLES 106667u
+
 /* The sequencer's sample-limit interrupt: advance the sample counter by one
- * frame and raise SSLINTSTS once per sequencer start. See apu_core.c. */
+ * frame and raise SSLINTSTS when the GP has fallen SSL samples behind, or
+ * with the stub GP once per sequencer start. See apu_core.c. */
 void mcpx_apu_ssl_tick(MCPXAPUState *d);
+/* An emulated GP frame ran for `cycles` DSP cycles: account its lag. */
+void mcpx_apu_gp_frame_ran(MCPXAPUState *d, uint32_t cycles);
 
 /* Host starvation accounting (RECOMP_AUDIO_HOST; see apu_core.c). The
  * deficit is the wall clock since the baseline, in samples, less what the

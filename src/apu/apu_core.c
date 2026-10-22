@@ -1077,51 +1077,101 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
     return 0;
 }
 
+/* Lag from before the current sequencer start is the last run's: drop it.
+ * Both the tick and a GP frame look, so a restart clears it whichever of
+ * the two the frame thread reaches first. */
+static void gp_lag_since(MCPXAPUState *d, uint32_t armed)
+{
+    if (d->gp_lag_start != armed) {
+        d->gp_lag_cycles = 0;
+        d->gp_lag_start = armed;
+    }
+}
+
 /* The SSL tick: the sequencer's sample-limit interrupt.
  *
- * DirectSound (Black, XDK 5849) resets XGSCNT to 0, programs SSL
- * (0x800 = 2048 samples) and enables ISTS bit 3 in IEN. Its service
- * routine -- dispatched on that bit, kicking the GP doorbell and
- * reposting front-end commands -- is what lets the rest of
- * DirectSound initialisation finish. Without the tick the title
- * re-runs the sequencer setup forever and never gets past audio.
+ * DirectSound (Black, XDK 5849; JSRF) programs XGSCNT to 0 and SSL to
+ * 0x800 (2048 samples) as one block with 0x2010..0x2028, and enables ISTS
+ * bit 3 in IEN. What the title's code shows about the bit:
+ * - its only response is recovery: the service routine restarts the GP
+ *   and EP, stalls 10 ms and programs the same block again (JSRF
+ *   sub_001A1F5D, Black alike);
+ * - SSL is a constant, written only there, and the title never reads
+ *   XGSCNT, so nothing on the CPU side moves the limit or the counter
+ *   while the sequencer runs.
+ * A driver does not recover a healthy device 23 times a second, so on
+ * hardware something keeps the count the limit is tested against below
+ * SSL, and the title leaves that to the DSPs. xemu never raises the bit
+ * and no public source names the compare, so which count it is cannot be
+ * known; the model takes the one thing the GP can lose: pace. The GP runs
+ * one sequencer frame per APU frame in about MCPX_APU_GP_FRAME_CYCLES; a
+ * GP program that needs longer falls behind by the excess, and makes it
+ * up in later frames' slack.
  *
- * What the hardware does here is inferred from that service routine,
- * not documented: xemu never raises ISTS bit 3. The bit is probably
- * the "delta panic" interrupt, which fires only when the GP falls
- * behind the sequencer; the routine restarts the GP and EP, stalls
- * 10 ms and programs XGSCNT and SSL again, which reads as recovery,
- * and on hardware the DSP code it loaded would keep the limit from
- * being reached. Our DSPs are stubs and never keep up, so a re-armed
- * limit fires every 2048 samples and the title runs that recovery
- * 23 times a second.
+ * So, with an emulated GP, the bit is raised when the GP's lag reaches
+ * SSL samples, and the lag clears. A GP that keeps pace never raises it
+ * (JSRF's takes about 42k cycles a frame, B3's 44k, SSX 3's 8k). It must
+ * not: the restart reloads the GP from a scratch image the effect commits
+ * have changed, which skips the effect init and stalls JSRF.
+ * The lag counts DSP cycles, not host time, so the JIT's warm-up on the
+ * host is no lag. It counts against the sequencer's current run only: it
+ * clears while the counter is off or SSL is 0, and at every sequencer
+ * start, since B3 and SSX 3 switch the counter off and on again in one
+ * restart and the lag of the frames before it must not fire the new run
+ * at once.
  *
- * Firing once per sequencer start is a concession to the stub DSPs,
- * not emulation: the first interrupt is the one Black needs, and a
- * SECTL off write re-arms it (see mcpx_apu_write).
- *
- * An emulated GP keeps the tick off (gp_emulated). The restart is lossy:
- * DirectSound (JSRF) reloads the GP from the scratch image with the
- * command block it saved at the first download. Its effect parameter
- * commit reads the effect state back from the live GP, sets its update
- * bit and writes it into that image with command 2, and that state
- * carries the bit the effect code sets once its init has run. A restart
- * after such a commit loads code that skips its init, leaves its DMA
- * descriptors zero and stalls the title. */
+ * With the stub GP nothing keeps pace, and a limit re-armed every 2048
+ * samples ran the title's recovery 23 times a second. The stub fires once
+ * per sequencer start instead, a concession, not emulation: the first
+ * interrupt is the one Black needs to finish its DirectSound init, and a
+ * SECTL off write re-arms it (see mcpx_apu_write). B3 and SSX 3 switch
+ * the counter off in every restart, so on the stub they still run the
+ * recovery 23 times a second. */
 void mcpx_apu_ssl_tick(MCPXAPUState *d)
 {
     uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
     uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
     uint32_t armed = qatomic_read(&d->ssl_starts) + 1;
+    bool counting = ssl && (sectl & NV_PAPU_SECTL_XCNTMODE)
+                           != NV_PAPU_SECTL_XCNTMODE_OFF;
     d->sample_count += NUM_SAMPLES_PER_FRAME;
-    if (ssl && !d->gp_emulated
-            && d->ssl_fired_at != armed
-            && d->sample_count >= ssl
-            && (sectl & NV_PAPU_SECTL_XCNTMODE)
-                   != NV_PAPU_SECTL_XCNTMODE_OFF) {
-        d->ssl_fired_at = armed;
+    gp_lag_since(d, armed);
+    if (!counting) {
+        d->gp_lag_cycles = 0;
+        return;
+    }
+
+    bool fire;
+    if (d->gp_emulated) {
+        /* lag in samples >= SSL, in whole numbers: cycles * 32 / frame */
+        fire = d->gp_lag_cycles * NUM_SAMPLES_PER_FRAME
+               >= (uint64_t)ssl * MCPX_APU_GP_FRAME_CYCLES;
+        if (fire)
+            d->gp_lag_cycles = 0;
+    } else {
+        fire = d->ssl_fired_at != armed && d->sample_count >= ssl;
+        if (fire)
+            d->ssl_fired_at = armed;
+    }
+    if (fire) {
+        d->ssl_raised++;
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
         d->set_irq = true;
+    }
+}
+
+/* A GP waits for the next frame when it finishes early, and starts the
+ * next one at once when it is late, so a late frame's excess carries over
+ * and an early frame's slack pays it back. */
+void mcpx_apu_gp_frame_ran(MCPXAPUState *d, uint32_t cycles)
+{
+    gp_lag_since(d, qatomic_read(&d->ssl_starts) + 1);
+    if (cycles > MCPX_APU_GP_FRAME_CYCLES) {
+        d->gp_lag_cycles += cycles - MCPX_APU_GP_FRAME_CYCLES;
+    } else {
+        uint64_t slack = MCPX_APU_GP_FRAME_CYCLES - cycles;
+        d->gp_lag_cycles = d->gp_lag_cycles > slack
+                           ? d->gp_lag_cycles - slack : 0;
     }
 }
 
@@ -1414,6 +1464,8 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     d->set_irq = false;
     qatomic_set(&d->ssl_starts, 0);
     d->ssl_fired_at = 0;
+    d->gp_lag_cycles = 0;
+    d->gp_lag_start = 0;
 }
 
 /* ============================================================
