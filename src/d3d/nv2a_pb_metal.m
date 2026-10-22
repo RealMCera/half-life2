@@ -210,8 +210,11 @@ static const char s_msl[] =
     "        if (pc.tex_mode.x == 1u && i.t0.w != 0.0 && i.t0.w != 1.0) uv /= i.t0.w;\n"
     "        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);\n"
     /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */
-    "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy + float2(pc.tex_scale[0].w, 0.0),"
-    " bias(pc.tex_bias.x));\n"
+    "        float4 t = tex0.sample(samp0, uv * pc.tex_scale[0].xy"
+    " + float2(pc.tex_scale[0].w, 0.0), bias(pc.tex_bias.x));\n"
+    /* alpha_only 2: a target read as a format without alpha (nv2a_rt_no_alpha) */
+    "        if (pc.alpha_only.x == 2u) t.a = 1.0;\n"
+    "        c *= t;\n"
     "    }\n"
     "    if (nv2a_clip_kills(pc.clip_mode.x, i.t0)) discard_fragment();\n"
     "    if (pc.atest.z != 0u) {\n"
@@ -300,6 +303,7 @@ typedef struct {
     uint64_t       last_use;
     DepthTarget   *dt;         /* the depth buffer its passes attach, or NULL */
     uint32_t       pitch;      /* the guest pitch it was made with */
+    uint32_t       fmt;        /* the SET_SURFACE_FORMAT word it was drawn with */
     int            dirty;      /* drawn since its last write-back */
     int            presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;    /* is the guest memory under it still its own */
@@ -831,6 +835,7 @@ static RenderTarget *surface(void)
             if (rt_drop_if_stale(rt, "reuse"))
                 break;
             rt->last_use = s_tick;
+            rt->fmt = g->format;
             return rt;
         }
     }
@@ -855,6 +860,7 @@ static RenderTarget *surface(void)
         if ((rt->w >= w && rt->h >= h)
                 || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
             rt->last_use = s_tick;
+            rt->fmt = g->format;
             return rt;
         }
         break;
@@ -915,6 +921,7 @@ static RenderTarget *surface(void)
     free_rt->pad = pad;
     free_rt->n = n;
     free_rt->pitch = g->pitch;
+    free_rt->fmt = g->format;
     free_rt->last_use = s_tick;
     rt_own_reset(free_rt);   /* the bytes the seed reads, or would */
     rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, pad, hw, hh);
@@ -1882,11 +1889,16 @@ static id<MTLDepthStencilState> depth_state(int depth, int stencil)
  * A stage whose texture is a surface this backend draws into samples the
  * render target itself, as the D3D11 backend's rt_texture: guest memory
  * under it only changes at a flip's write-back (and then only for the
- * present surface). 32-bit, non-compressed formats only; the low 27 bits of
- * the address compare, so either memory window matches. The target being
+ * present surface). nv2a_rt_tex_reads says which reads are the target's,
+ * 16-bit ones included: a write-back keeps only the stock columns, so under
+ * hor+ a 16-bit frame copy decoded from it was a centred 4:3 picture.
+ * The low 27 bits of the address compare, so either memory
+ * window matches. The target being
  * drawn into is sampled through a copy (s_self), made by a blit between
  * passes. RECOMP_METAL_NO_RTT=1 decodes guest memory instead (A/B). */
 static RenderTarget s_self;   /* tex, w, h: the copy; offset: whose */
+
+static int aspect_trace(void);
 
 static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 {
@@ -1896,13 +1908,23 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 
     if (off < 0)
         off = recomp_env(RENV_METAL_NO_RTT) != NULL;
-    if (off || !t->offset || d3d8_format_dxt_block_bytes(t->color)
-            || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
+    if (off || !t->offset)
         return NULL;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
             continue;
+        if (!nv2a_rt_tex_reads(t->color, t->pitch, rt->fmt, rt->pitch)) {
+            /* Decoded from guest memory instead: the write-back's stock
+             * columns, or what the title left there. The format
+             * word is the last draw's: reuse matches offset and size only. */
+            if (aspect_trace() && nv2a_rt_reject_new(rt->fmt, rt->pitch, t->color, t->pitch))
+                fprintf(stderr, "[aspect.rt-reject] flip %llu: target 0x%08X surface fmt %X"
+                        " pitch %u, texture fmt %X pitch %u\n",
+                        (unsigned long long)s_presents, rt->addr, rt->fmt, rt->pitch, t->color,
+                        t->pitch);
+            continue;
+        }
         if (rt_drop_if_stale(rt, "bind"))
             continue;   /* the texture decodes from the title's bytes */
         if (rt == cur) {
@@ -1988,10 +2010,11 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
     used++;
     src = !t0->mode || t0->mode == 4 ? NULL : rt_texture(t0, (RenderTarget *)rt);
     fprintf(stderr, "[aspect.program] %08X flip %llu: %u vertices %u tris x %g..%g on %ux%u"
-            " pad %u, stage 0 %s 0x%08X fmt %X %ux%u -> %s\n", hash,
+            " pad %u at 0x%08X pitch %u, stage 0 %s 0x%08X fmt %X %ux%u pitch %u -> %s\n", hash,
             (unsigned long long)s_presents, count, ntri, lo_x, hi_x, rt->w, rt->h, rt->pad,
+            rt->addr, rt->pitch,
             !t0->mode || t0->mode == 4 ? "none" : src ? "rt" : "tex", t0->offset,
-            t0->color, t0->width, t0->height, names[place]);
+            t0->color, t0->width, t0->height, t0->pitch, names[place]);
 }
 
 static void metal_on_draw(const struct nv2a_pb_draw *d)
@@ -2219,6 +2242,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 if ((src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
                     nv2a_ps_consts_rt(&mpc.b, k, t, src->w, src->h);
+                    if (nv2a_rt_no_alpha(nv2a_tex_linear_twin(t->color)))
+                        mpc.b.alpha_only[k] = 2;
                     srcs[k] = src;
                     if (!src->pad)
                         flat_rt = 1;

@@ -257,6 +257,83 @@ static inline int nv2a_rt_overlap(uint32_t a, uint32_t an, uint32_t b, uint32_t 
     return an && bn && a < b + bn && b < a + an;
 }
 
+/* Bytes per pixel of SET_SURFACE_FORMAT's colour field, 0 if unknown (the
+ * table nv2a_pb_exec.c's surf_fmt_bpp reads). */
+static inline uint32_t nv2a_surf_color_bytes(uint32_t format)
+{
+    switch (format & 0xFu) {
+    case 0x1: case 0x2: case 0x3: return 2;    /* X1R5G5B5 x2, R5G6B5 */
+    case 0x4: case 0x5: case 0x6: case 0x7:
+    case 0x8: case 0xC: return 4;              /* X8R8G8B8 x2, X1A7.., A8R8G8B8, A8B8G8R8 */
+    case 0x9: return 1;                        /* B8 */
+    case 0xA: case 0xB: return 2;              /* G8B8 */
+    default:  return 0;
+    }
+}
+
+/* R5G6B5, X1R5G5B5 and X8R8G8B8 have no alpha, so a target read as one
+ * reads alpha 1 as their decoders give it (nv2a_ps_consts' alpha_only 2);
+ * the target's alpha is whatever the draws into it left. */
+static inline int nv2a_rt_no_alpha(uint32_t lin)
+{
+    return lin == 0x11 || lin == 0x1C || lin == 0x1E;
+}
+
+/* Whether a texture stage at a render target's address (color: its format
+ * register's colour field, tex_pitch: its pitch) samples that target in
+ * place rather than decoding guest memory. rt_fmt is the SET_SURFACE_FORMAT
+ * word the target was drawn with. The read must see the bytes the surface
+ * holds: the same colour layout (R5G6B5 as R5G6B5, X1R5G5B5 as A1R5G5B5 or
+ * X1R5G5B5, any 32-bit texture of a 32-bit surface), the same memory order
+ * (swizzled as swizzled, linear as linear at the target's pitch), not DXT.
+ * Read another way the same address is not the target's picture on the
+ * console either. A4R4G4B4 matches no surface format.
+ *
+ * Hor+ depends on it: the target is padded and its guest bytes are not (a
+ * write-back keeps the stock columns), so a frame copy decoded from them is
+ * a 4:3 picture, centred, under a full-screen effect that should cover the
+ * padded frame. Burnout 3 runs its speed blur through 16-bit R5G6B5
+ * targets of 320x240 and 160x120. */
+static inline int nv2a_rt_tex_reads(uint32_t color, uint32_t tex_pitch, uint32_t rt_fmt,
+                                    uint32_t rt_pitch)
+{
+    uint32_t lin = nv2a_tex_linear_twin(color);
+    uint32_t surf = rt_fmt & 0xFu;
+    int rt_swizzled = ((rt_fmt >> 8) & 0xFu) == 2u;   /* SURFACE_FORMAT type */
+
+    if (d3d8_format_dxt_block_bytes(color) || d3d8_format_is_swizzled(color) != rt_swizzled
+        || (!rt_swizzled && tex_pitch != rt_pitch))
+        return 0;
+    switch (lin) {
+    case 0x11: return surf == 0x3;                     /* R5G6B5 */
+    case 0x10: case 0x1C: return surf == 0x1 || surf == 0x2;   /* X1R5G5B5 */
+    default:   return nv2a_tex_texel_bytes(lin) == 4 && nv2a_surf_color_bytes(rt_fmt) == 4;
+    }
+}
+
+/* Whether this (target format, target pitch, texture format, texture pitch)
+ * is new to the caller's trace of reads nv2a_rt_tex_reads rejects, so each
+ * distinct pair is said once. A small open-addressed set per translation
+ * unit; full, it says nothing more. */
+static inline int nv2a_rt_reject_new(uint32_t rt_fmt, uint32_t rt_pitch, uint32_t color,
+                                     uint32_t tex_pitch)
+{
+    enum { SET = 256 };
+    static uint64_t set[SET];
+    static unsigned used;
+    uint64_t key = (((uint64_t)rt_fmt << 32 | rt_pitch) * 0x9E3779B97F4A7C15ull
+                    ^ ((uint64_t)color << 32 | tex_pitch)) | 1u;
+    unsigned h = (unsigned)(key >> 56) & (SET - 1u);
+
+    while (set[h] && set[h] != key)
+        h = (h + 1u) & (SET - 1u);
+    if (set[h] || used >= SET / 2u)
+        return 0;
+    set[h] = key;
+    used++;
+    return 1;
+}
+
 /* A swizzled surface's side from its SURFACE_FORMAT log2 field, at most
  * 4096 (the NV2A limit): a garbage format would otherwise overflow the
  * w*h*bpp extent the CPU clear checks before writing. */

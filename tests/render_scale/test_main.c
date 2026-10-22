@@ -292,6 +292,37 @@ int main(void)
          * unpadded target (a blur step between padded squares) is stretched
          * over the square's pads like the frame's post passes. */
         CHECK(nv2a_aspect_place(1, 1, 0, 0, NV2A_MOVIE_BLACK) == NV2A_PLACE_STRETCH);
+        /* Which reads of a target's address sample the (padded) target:
+         * Burnout 3's speed blur copies its frame to a 320x240 R5G6B5
+         * surface (pitch 640) and reads it back as LIN_R5G6B5;
+         * decoded from guest memory it was a 4:3 picture, centred. */
+        CHECK(nv2a_surf_color_bytes(0x3) == 2 && nv2a_surf_color_bytes(0x8) == 4
+              && nv2a_surf_color_bytes(0x0) == 0);
+        /* Surface words: colour 3 R5G6B5, 1 X1R5G5B5, 8 A8R8G8B8; type 1
+         * linear (0x100), 2 swizzled (0x200). */
+        CHECK(nv2a_rt_tex_reads(0x11, 640, 0x103, 640));     /* LIN_R5G6B5 */
+        CHECK(nv2a_rt_tex_reads(0x05, 0, 0x203, 640));       /* R5G6B5, swizzled */
+        CHECK(nv2a_rt_tex_reads(0x1C, 640, 0x101, 640));     /* LIN_X1R5G5B5 */
+        CHECK(nv2a_rt_tex_reads(0x10, 640, 0x102, 640));     /* LIN_A1R5G5B5 */
+        CHECK(nv2a_rt_tex_reads(0x12, 2560, 0x108, 2560));   /* LIN_A8R8G8B8 */
+        CHECK(nv2a_rt_tex_reads(0x06, 0, 0x208, 2560));      /* A8R8G8B8, swizzled */
+        CHECK(!nv2a_rt_tex_reads(0x11, 640, 0x108, 2560));   /* a 32-bit target as 16-bit */
+        CHECK(!nv2a_rt_tex_reads(0x12, 1280, 0x103, 640));   /* a 16-bit one as 32-bit */
+        CHECK(!nv2a_rt_tex_reads(0x11, 640, 0x101, 640));    /* X1R5G5B5 read as R5G6B5 */
+        CHECK(!nv2a_rt_tex_reads(0x1C, 640, 0x103, 640));    /* R5G6B5 read as X1R5G5B5 */
+        CHECK(!nv2a_rt_tex_reads(0x1D, 640, 0x103, 640));    /* A4R4G4B4: no such surface */
+        CHECK(!nv2a_rt_tex_reads(0x1D, 640, 0x101, 640));
+        CHECK(!nv2a_rt_tex_reads(0x11, 640, 0x100, 640));    /* unknown colour field */
+        CHECK(!nv2a_rt_tex_reads(0x12, 2560, 0x100, 2560));
+        CHECK(!nv2a_rt_tex_reads(0x05, 0, 0x103, 640));      /* swizzled read, linear target */
+        CHECK(!nv2a_rt_tex_reads(0x11, 640, 0x203, 640));    /* linear read, swizzled target */
+        CHECK(!nv2a_rt_tex_reads(0x11, 1280, 0x103, 640));   /* another pitch */
+        CHECK(!nv2a_rt_tex_reads(0x0C, 0, 0x208, 2560));     /* DXT1 */
+        CHECK(!nv2a_rt_tex_reads(0x0B, 0, 0x209, 640));      /* P8 */
+        /* The reject trace says each distinct pair once. */
+        CHECK(nv2a_rt_reject_new(0x103, 640, 0x1C, 640) && !nv2a_rt_reject_new(0x103, 640, 0x1C, 640)
+              && nv2a_rt_reject_new(0x103, 640, 0x1C, 1280));
+        CHECK(nv2a_rt_no_alpha(0x11) && nv2a_rt_no_alpha(0x1E) && !nv2a_rt_no_alpha(0x12));
         /* The 16x16 fade texture is no picture; a 1024-wide movie frame and
          * a 256-wide backdrop are. */
         CHECK(!nv2a_aspect_picture(16, 640) && !nv2a_aspect_picture(160, 640));

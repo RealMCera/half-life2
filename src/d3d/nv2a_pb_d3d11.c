@@ -226,7 +226,7 @@ typedef struct {
     uint64_t                last_use;
     uint64_t                last_draw, last_clear;  /* s_seq at the last one */
     uint32_t                pitch;      /* the guest pitch it was made with */
-    uint32_t                bpp;        /* bytes per pixel of the surface format drawn */
+    uint32_t                fmt;        /* the SET_SURFACE_FORMAT word it was drawn with */
     struct nv2a_rt_own      own;        /* is the guest memory under it still its own */
 } RenderTarget;
 
@@ -754,20 +754,6 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
     return 1;
 }
 
-/* Bytes per pixel of SET_SURFACE_FORMAT's colour field, 0 if unknown (the
- * table nv2a_pb_exec.c's surf_fmt_bpp reads). */
-static uint32_t surf_color_bytes(uint32_t format)
-{
-    switch (format & 0xF) {
-    case 0x1: case 0x2: case 0x3: return 2;    /* X1R5G5B5 x2, R5G6B5 */
-    case 0x4: case 0x5: case 0x6: case 0x7:
-    case 0x8: case 0xC: return 4;              /* X8R8G8B8 x2, X1A7.., A8R8G8B8, A8B8G8R8 */
-    case 0x9: return 1;                        /* B8 */
-    case 0xA: case 0xB: return 2;              /* G8B8 */
-    default:  return 0;
-    }
-}
-
 static RenderTarget *surface(void)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -786,7 +772,7 @@ static RenderTarget *surface(void)
             if (rt_drop_if_stale(rt, "reuse"))
                 break;
             rt->last_use = s_tick;
-            rt->bpp = surf_color_bytes(g->format);
+            rt->fmt = g->format;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
@@ -812,7 +798,7 @@ static RenderTarget *surface(void)
         if ((rt->w >= w && rt->h >= h)
                 || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
             rt->last_use = s_tick;
-            rt->bpp = surf_color_bytes(g->format);
+            rt->fmt = g->format;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
@@ -877,7 +863,7 @@ static RenderTarget *surface(void)
     free_rt->w = w;
     free_rt->h = h;
     free_rt->pitch = g->pitch;
-    free_rt->bpp = surf_color_bytes(g->format);
+    free_rt->fmt = g->format;
     free_rt->last_use = s_tick;
     if (alias_check_on() && free_rt->pitch)
         nv2a_rt_own_reset(&free_rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
@@ -2167,47 +2153,36 @@ static RenderTarget *rt_self_copy(RenderTarget *rt)
     return &s_self;
 }
 
-/* The 16-bit colour formats a target binds as: this backend writes nothing
- * back, so a texture decoded from the guest bytes under a 16-bit surface
- * reads black. The target is BGRA8, so its texels keep 8 bits a channel
- * where the console's surface held 5 or 6. */
-static int rt_16bit(uint32_t lin)
-{
-    return lin == 0x10 || lin == 0x11 || lin == 0x1C || lin == 0x1D;
-}
-
-/* R5G6B5, X1R5G5B5 and X8R8G8B8 have no alpha, so it reads 1 as their
- * decoders give it; the target's alpha is whatever the draws into it left. */
-static int rt_no_alpha(uint32_t lin)
-{
-    return lin == 0x11 || lin == 0x1C || lin == 0x1E;
-}
+static int aspect_trace(void);
 
 static RenderTarget *rt_texture(const Stage *t)
 {
     static int off = -1;
     RenderTarget *self = NULL;
-    uint32_t lin = nv2a_tex_linear_twin(t->color);
     int i;
 
     if (off < 0)
         off = recomp_env(RENV_D3D11_NO_RTT) != NULL;   /* A/B: decode memory */
-    if (off)
-        return NULL;
-    if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
-            || (nv2a_tex_texel_bytes(lin) != 4 && !rt_16bit(lin)))
+    if (off || !t->offset)
         return NULL;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        /* Low 27 bits: the same memory through either window. */
+        /* Low 27 bits: the same memory through either window. A 16-bit
+         * texture binds too: this backend writes nothing back, so one
+         * decoded from the guest bytes under a 16-bit surface reads black. */
         if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
             continue;
-        /* The same address read another way (a 32-bit target as a 16-bit
-         * texture, or a linear one at another pitch) is not this target's
-         * picture: it decodes from guest memory. */
-        if (rt->bpp != nv2a_tex_texel_bytes(lin)
-                || (!d3d8_format_is_swizzled(t->color) && t->pitch != rt->pitch))
+        if (!nv2a_rt_tex_reads(t->color, t->pitch, rt->fmt, rt->pitch)) {
+            /* Decoded from guest memory instead, which this backend never
+             * writes a target back to: that reads black. The format
+             * word is the last draw's: reuse matches offset and size only. */
+            if (aspect_trace() && nv2a_rt_reject_new(rt->fmt, rt->pitch, t->color, t->pitch))
+                fprintf(stderr, "[aspect.rt-reject] flip %llu: target 0x%08X surface fmt %X"
+                        " pitch %u, texture fmt %X pitch %u\n",
+                        (unsigned long long)s_presents, rt->addr, rt->fmt, rt->pitch, t->color,
+                        t->pitch);
             continue;
+        }
         if (rt_drop_if_stale(rt, "bind"))
             continue;   /* the texture decodes from the title's bytes */
         if (rt == s_cur) {
@@ -2330,7 +2305,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             s_stage_src[n] = src == &s_self ? "render-target(self copy)"
                                             : "render-target";
             nv2a_ps_consts_rt(&pc, n, t, src->w, src->h);
-            if (rt_no_alpha(nv2a_tex_linear_twin(t->color)))
+            if (nv2a_rt_no_alpha(nv2a_tex_linear_twin(t->color)))
                 pc.alpha_only[n] = 2;
             srv[n] = src->srv;
             s_rtt_binds++;
@@ -3047,10 +3022,11 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
     set[h] = key;
     used++;
     fprintf(stderr, "[aspect.program] %08X flip %llu: %u vertices %u tris x %g..%g on %ux%u"
-            " pad %u, stage 0 %s 0x%08X fmt %X %ux%u -> %s\n", hash,
+            " pad %u at 0x%08X pitch %u, stage 0 %s 0x%08X fmt %X %ux%u pitch %u -> %s\n", hash,
             (unsigned long long)s_presents, count, ntri, lo_x, hi_x, rt->w, rt->h, rt->pad,
+            rt->addr, rt->pitch,
             !t0->mode || t0->mode == 4 ? "none" : s_stage_rt[0] ? "rt" : "tex", t0->offset,
-            t0->color, t0->width, t0->height, names[place]);
+            t0->color, t0->width, t0->height, t0->pitch, names[place]);
 }
 
 /* The pixels->NDC mapping at b2 and the scissor for one placement
