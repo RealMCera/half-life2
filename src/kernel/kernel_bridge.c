@@ -679,6 +679,7 @@ static uint32_t thobj_alloc(void)
     BRIDGE_MEM32(va + 8)  = va + 8;               /* WaitListHead, empty */
     BRIDGE_MEM32(va + 12) = va + 8;
     BRIDGE_MEM32(va + THOBJ_EXIT_STATUS) = 0x103; /* STILL_ACTIVE */
+    xbox_GuestSchedThreadNew(va);   /* a reused object starts at base 0 */
     return va;
 }
 
@@ -702,8 +703,10 @@ static void thobj_unref(uint32_t va)
     if (s >= 0 && s_thobj_refs[s] > 0 && --s_thobj_refs[s] == 0)
         freed = 1;
     thobj_unlock();
-    if (freed)
+    if (freed) {
         ke_shadow_remove(va);   /* closes the shadow's host thread handle */
+        xbox_GuestSchedThreadGone(va);
+    }
 }
 
 /* The thread has ended: publish ExitStatus, then SignalState, then drop the
@@ -772,6 +775,7 @@ static uint32_t thobj_current(void)
             if (self && self != (HANDLE)(LONG_PTR)-2)
                 ke_shadow_insert(g_thread_obj_va, self);
         }
+        xbox_GuestSchedBind(g_thread_obj_va);
     }
     return g_thread_obj_va;
 }
@@ -832,6 +836,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     }
     free(s);
 
+    /* Before the join: the guest CPU takes this thread at its priority,
+     * and not at all while a suspend (CreateSuspended) holds it. */
+    xbox_GuestSchedBind(g_thread_obj_va);
     guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
     guest_cpu_part();
@@ -879,11 +886,17 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
                                         uint32_t ctx2, uint32_t stack_top,
                                         uint32_t routine, uint32_t handle_va,
-                                        uint32_t tls_size)
+                                        uint32_t tls_size, int suspended)
 {
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
 
+    /* CreateSuspended: the host thread starts at once, as it always has;
+     * with guest_sched the guest CPU holds it at its join until the title
+     * resumes it (JSRF's ADX spinner sub_0013B180 must not run before its
+     * lock resumes it). Off, the flag stays ignored. */
+    if (suspended && obj)
+        xbox_GuestSchedSuspend(obj, 1, NULL);
     thobj_ref(obj);
     th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, routine, obj, tls_size);
     if (!th) {
@@ -1028,7 +1041,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, start_routine,
-                                              xbox_handle_ptr, tls_size);
+                                              xbox_handle_ptr, tls_size,
+                                              (STACK_ARG(7) & 0xFF) != 0);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -5706,7 +5720,9 @@ static void bridge_KeDisconnectInterrupt(void)
  * one guest core to its main thread and the music crackled.
  * Only where the host makes a time-critical thread run alone, though
  * (xbox_GuestPriorityOn): elsewhere a title that locks by priority loses
- * the lock and the value it reads back sends it round a loop. */
+ * the lock and the value it reads back sends it round a loop.
+ * With guest_sched the guest CPU is what makes it run alone: the value is
+ * kept there, by the object, and the host threads are left alone. */
 static HANDLE bridge_thread_host(uint32_t thread_va)
 {
     if (!thread_va || !xbox_GuestPriorityOn())
@@ -5718,14 +5734,25 @@ static HANDLE bridge_thread_host(uint32_t thread_va)
 
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    HANDLE host = bridge_thread_host(STACK_ARG(0));
+    HANDLE host;
 
+    if (xbox_GuestSchedOn()) {
+        g_eax = (uint32_t)xbox_GuestSchedQueryBase(STACK_ARG(0));
+        return;
+    }
+    host = bridge_thread_host(STACK_ARG(0));
     g_eax = host ? (uint32_t)xbox_KeQueryBasePriorityThread(host) : 0;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    HANDLE host = bridge_thread_host(STACK_ARG(0));
+    HANDLE host;
+
+    if (xbox_GuestSchedOn()) {
+        g_eax = (uint32_t)xbox_GuestSchedSetBase(STACK_ARG(0), (LONG)STACK_ARG(1));
+        return;
+    }
+    host = bridge_thread_host(STACK_ARG(0));
 
     g_eax = host ? (uint32_t)xbox_KeSetBasePriorityThread(
                        host, (LONG)STACK_ARG(1))
@@ -5818,10 +5845,72 @@ static void bridge_NtReleaseMutant(void)
  * does that on a worker, and the "suspended" thread spun through 289 million
  * kernel calls while the title thought it was idle.
  */
+/* With guest_sched, the guest thread object another guest thread's suspend
+ * or resume names (a handle, or the KTHREAD for the Ke forms): the guest
+ * CPU counts it (xbox_GuestSchedSuspend). 0 for the caller itself (*self
+ * set), which parks on the host as before, and for anything that is not a
+ * thread. */
+static uint32_t bridge_sched_target(uint32_t arg, int *self)
+{
+    uint32_t obj;
+
+    *self = 0;
+    if (!xbox_GuestSchedOn())
+        return 0;
+    if (arg == 0xFFFFFFFEu) {
+        *self = 1;
+        return 0;
+    }
+    obj = thobj_from_token(arg);
+    if (!obj) {
+        thobj_lock();
+        if (thobj_slot(arg) >= 0)
+            obj = arg;
+        thobj_unlock();
+    }
+    if (obj && obj == g_thread_obj_va) {
+        *self = 1;
+        return 0;
+    }
+    return obj;
+}
+
+/* A self-suspend parks on the host for as long as another thread wants: the
+ * guest CPU let go of at the call is free for any level meanwhile. */
+static void bridge_sched_self_suspend(int self)
+{
+    if (self)
+        xbox_GuestCpuBlocked();
+}
+
+/* A resume the guest CPU cannot tie to a guest thread goes to the host. If
+ * it was meant for a thread created suspended, that thread stays held at its
+ * join (and says so after 5 s); name the handle once so the hang has a
+ * cause in the log. */
+static void bridge_sched_resume_unknown(uint32_t arg, int self)
+{
+    static volatile LONG said;
+
+    if (!xbox_GuestSchedOn() || self || InterlockedExchange(&said, 1))
+        return;
+    fprintf(stderr, "[GUEST] resume of 0x%08x, which is not a guest thread"
+            " object or handle: the host resumes it (first only)\n", arg);
+}
+
 static void bridge_NtSuspendThread(void)
 {
     uint32_t count_va = STACK_ARG(1);
+    int self;
+    uint32_t obj = bridge_sched_target(STACK_ARG(0), &self);
+    ULONG prev = 0;
 
+    if (obj && xbox_GuestSchedSuspend(obj, 1, &prev)) {
+        if (count_va)
+            BRIDGE_MEM32(count_va) = prev;
+        g_eax = 0;
+        return;
+    }
+    bridge_sched_self_suspend(self);
     g_eax = (uint32_t)xbox_NtSuspendThread(
         bridge_resolve_handle(STACK_ARG(0)),
         count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
@@ -5830,6 +5919,18 @@ static void bridge_NtSuspendThread(void)
 /* ── NtResumeThread (ordinal 224, 2 args) */
 static void bridge_NtResumeThread(void)
 {
+    int self;
+    uint32_t obj = bridge_sched_target(STACK_ARG(0), &self);
+    ULONG prev = 0;
+
+    if (obj && xbox_GuestSchedSuspend(obj, -1, &prev)) {
+        if (STACK_ARG(1))
+            BRIDGE_MEM32(STACK_ARG(1)) = prev;
+        g_eax = 0;
+        return;
+    }
+    if (!obj)
+        bridge_sched_resume_unknown(STACK_ARG(0), self);
     g_eax = (uint32_t)xbox_NtResumeThread(
         bridge_resolve_handle(STACK_ARG(0)),
         (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
@@ -8726,7 +8827,18 @@ static void bridge_KeResetEvent(void)
 /* --- KeResumeThread (ordinal 140, 1 arg = 4 bytes) --- */
 static void bridge_KeResumeThread(void)
 {
-    HANDLE hThread = bridge_resolve_handle(STACK_ARG(0));
+    int self;
+    uint32_t obj = bridge_sched_target(STACK_ARG(0), &self);
+    ULONG prev = 0;
+    HANDLE hThread;
+
+    if (obj && xbox_GuestSchedSuspend(obj, -1, &prev)) {
+        g_eax = prev;
+        return;
+    }
+    if (!obj)
+        bridge_sched_resume_unknown(STACK_ARG(0), self);
+    hThread = bridge_resolve_handle(STACK_ARG(0));
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
@@ -8739,7 +8851,17 @@ static void bridge_KeResumeThread(void)
 /* --- KeSuspendThread (ordinal 152, 1 arg = 4 bytes) --- */
 static void bridge_KeSuspendThread(void)
 {
-    HANDLE hThread = bridge_resolve_handle(STACK_ARG(0));
+    int self;
+    uint32_t obj = bridge_sched_target(STACK_ARG(0), &self);
+    ULONG prev = 0;
+    HANDLE hThread;
+
+    if (obj && xbox_GuestSchedSuspend(obj, 1, &prev)) {
+        g_eax = prev;
+        return;
+    }
+    bridge_sched_self_suspend(self);
+    hThread = bridge_resolve_handle(STACK_ARG(0));
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
@@ -9452,7 +9574,7 @@ static void bridge_PsCreateSystemThread(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, start_routine,
-                                              xbox_handle_ptr, 0);
+                                              xbox_handle_ptr, 0, 0);
                 }
             }
         } else {

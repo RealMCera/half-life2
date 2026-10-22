@@ -200,6 +200,10 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
+    /* guest_sched: the call let go of the guest CPU as a short one; a
+     * real sleep blocks, so any level may run meanwhile. */
+    if (ms)
+        xbox_GuestCpuBlocked();
     if (Alertable) {
         DWORD result = SleepEx(ms, TRUE);
         if (result == WAIT_IO_COMPLETION)

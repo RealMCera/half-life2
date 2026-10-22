@@ -838,9 +838,35 @@ typedef struct {
     long max_turn_us, max_wait_us;
     int max_turn_kind;                  /* XBOX_GUEST_CPU_* */
     uint32_t max_turn_where;
+    long refused;       /* guest_sched: hand-offs a holder kept for its priority */
 } XboxGuestCpuStats;
 void     xbox_GuestCpuStatsGet(XboxGuestCpuStats *out, int reset);
 void     xbox_GuestCpuReport(void);             /* under the [PACING] summary */
+
+/* Guest priorities on the guest CPU (kernel_guest_cpu.c, guest_sched=1 with
+ * the lock on and guest_priority not 0): the console's scheduler ran the
+ * highest-priority ready thread, and titles lock by priority (CRI ADX). The
+ * guest CPU keeps each guest thread's base priority and suspend count by
+ * its thread object's VA, hands over to the highest-priority waiter, and
+ * a holder that outranks every waiter keeps the CPU. The bridges route
+ * KeSetBasePriorityThread, KeQueryBasePriorityThread and the suspend and
+ * resume of another guest thread here; off, every call is a no-op and the
+ * guest CPU is the FIFO above. */
+int      xbox_GuestSchedOn(void);
+void     xbox_GuestSchedThreadNew(uint32_t obj);    /* thobj_alloc: base 0, running */
+void     xbox_GuestSchedThreadGone(uint32_t obj);   /* the object is freed */
+void     xbox_GuestSchedBind(uint32_t obj);         /* the calling thread is obj */
+LONG     xbox_GuestSchedSetBase(uint32_t obj, LONG increment);   /* the previous increment */
+LONG     xbox_GuestSchedQueryBase(uint32_t obj);
+/* delta +1 suspends, -1 resumes; *prev gets the previous count. 0 when the
+ * guest CPU does not count it (off, or a resume of a thread whose count is
+ * 0, which goes to the host). A thread created suspended is counted here:
+ * the guest CPU holds it at its join until the resume. */
+int      xbox_GuestSchedSuspend(uint32_t obj, int delta, ULONG *prev);
+/* The ctests: widen the 2 ms soft window and the 4 s valve (0 = default),
+ * and read how often the valve fired in the run. */
+void     xbox_GuestSchedTestWindows(uint64_t soft_ns, uint64_t valve_ns);
+long     xbox_GuestSchedValves(void);
 
 /* ============================================================================
  * Synchronization (kernel_sync.c)
