@@ -219,29 +219,33 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
 /*
  * Map Xbox priority increment to Win32 priority level.
- * Xbox base priorities typically range from -2 to +2 for game threads.
+ * Xbox base priorities typically range from -2 to +2 for game threads. An
+ * increment of +-16 ((HIGH_PRIORITY + 1) / 2) is the kernel's saturation:
+ * XAPI's SetThreadPriority passes it for THREAD_PRIORITY_TIME_CRITICAL and
+ * _IDLE, and KeQueryBasePriorityThread reports it back. Anything short of
+ * it only raises or lowers the base, so it stops at HIGHEST or LOWEST.
  */
 static int xbox_priority_to_win32(LONG increment)
 {
-    if (increment <= -15)       return THREAD_PRIORITY_IDLE;
+    if (increment <= -16)       return THREAD_PRIORITY_IDLE;
     else if (increment <= -2)   return THREAD_PRIORITY_LOWEST;
     else if (increment == -1)   return THREAD_PRIORITY_BELOW_NORMAL;
     else if (increment == 0)    return THREAD_PRIORITY_NORMAL;
     else if (increment == 1)    return THREAD_PRIORITY_ABOVE_NORMAL;
-    else if (increment <= 2)    return THREAD_PRIORITY_HIGHEST;
+    else if (increment < 16)    return THREAD_PRIORITY_HIGHEST;
     else                        return THREAD_PRIORITY_TIME_CRITICAL;
 }
 
 static LONG win32_priority_to_xbox(int priority)
 {
     switch (priority) {
-        case THREAD_PRIORITY_IDLE:          return -15;
+        case THREAD_PRIORITY_IDLE:          return -16;
         case THREAD_PRIORITY_LOWEST:        return -2;
         case THREAD_PRIORITY_BELOW_NORMAL:  return -1;
         case THREAD_PRIORITY_NORMAL:        return 0;
         case THREAD_PRIORITY_ABOVE_NORMAL:  return 1;
         case THREAD_PRIORITY_HIGHEST:       return 2;
-        case THREAD_PRIORITY_TIME_CRITICAL: return 15;
+        case THREAD_PRIORITY_TIME_CRITICAL: return 16;
         default:                            return 0;
     }
 }

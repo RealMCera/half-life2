@@ -93,12 +93,14 @@ int main(void)
     }
     g_xbox_mem_offset = (ptrdiff_t)mem;
 
-    /* Three imports, in the form an XBE stores them: 0x80000000 | ordinal. */
+    /* The imports, in the form an XBE stores them: 0x80000000 | ordinal. */
     *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | 173u;
     *(uint32_t *)(mem + THUNK_VA + 4) = 0x80000000u | 197u;
     *(uint32_t *)(mem + THUNK_VA + 8) = 0x80000000u | 255u;
     *(uint32_t *)(mem + THUNK_VA + 12) = 0x80000000u | 254u;
-    xbox_kernel_set_thunk_address(THUNK_VA, 4);
+    *(uint32_t *)(mem + THUNK_VA + 16) = 0x80000000u | 143u;
+    *(uint32_t *)(mem + THUNK_VA + 20) = 0x80000000u | 124u;
+    xbox_kernel_set_thunk_address(THUNK_VA, 6);
     /* The lock on before init: its join makes this thread the guest main. */
     recomp_env_set(RENV_GUEST_LOCK, "1");
     xbox_GuestCpuReloadConfig();
@@ -203,6 +205,53 @@ int main(void)
         check(s_worker_ran, "ordinal 254 ran the inline worker", NULL);
         check(s_worker_held == 1, "the inline worker held the guest CPU", NULL);
         check(xbox_GuestCpuHeld() == 1, "the caller holds it again after the worker", NULL);
+    }
+
+    /* KeSetBasePriorityThread (143) and KeQueryBasePriorityThread (124) take
+     * a guest KTHREAD, the object ObReferenceObjectByHandle hands out (XAPI's
+     * SetThreadPriority does exactly that). The bridges used to pass that guest
+     * VA on as a host thread handle: Windows failed the call and left every
+     * guest thread at normal priority (SSX 3's music crackled). The
+     * object here is shaped like a POSIX shim thread (first word K_THREAD = 3,
+     * every other word a marker priority of 7), so the old bridge would have
+     * written its priority into these bytes and read the marker back. A VA no
+     * host thread stands behind must be left alone: the bytes stay as they
+     * were and the query reads 0. */
+    {
+        enum { OBJ_VA = 0x00050000u, OBJ_WORDS = 0x100 };
+        uint32_t *obj = (uint32_t *)(mem + OBJ_VA);
+        uint32_t before[OBJ_WORDS];
+        for (int i = 0; i < OBJ_WORDS; i++)
+            obj[i] = i ? 7u : 3u;
+        memcpy(before, obj, sizeof before);
+
+        fn = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + 16));
+        check(fn != NULL, "ordinal 143 resolves to a bridge entry point", NULL);
+        if (fn) {
+            uint32_t *sp = (uint32_t *)(mem + STACK_VA);
+            sp[0] = 0xBEEF0005u;          /* guest return address */
+            sp[1] = OBJ_VA;               /* a guest object, no host thread */
+            sp[2] = 2;                    /* Increment: highest */
+            g_esp = STACK_VA;
+            g_eax = 0xDEADBEEFu;
+            fn();
+            check(g_eax == 0, "KeSetBasePriorityThread without a host thread is a no-op", NULL);
+            check(g_esp == STACK_VA + 12, "ordinal 143 pops its two stdcall arguments", NULL);
+            check(memcmp(before, obj, sizeof before) == 0,
+                  "KeSetBasePriorityThread does not write the guest object as a host thread", NULL);
+        }
+        fn = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + 20));
+        check(fn != NULL, "ordinal 124 resolves to a bridge entry point", NULL);
+        if (fn) {
+            uint32_t *sp = (uint32_t *)(mem + STACK_VA);
+            sp[0] = 0xBEEF0006u;
+            sp[1] = OBJ_VA;
+            g_esp = STACK_VA;
+            g_eax = 0xDEADBEEFu;
+            fn();
+            check(g_eax == 0, "KeQueryBasePriorityThread does not read the guest object as a host thread", NULL);
+            check(g_esp == STACK_VA + 8, "ordinal 124 pops its stdcall argument", NULL);
+        }
     }
 
     VirtualFree(mem, 0, MEM_RELEASE);

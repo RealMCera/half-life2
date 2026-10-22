@@ -207,6 +207,7 @@ extern "C" {
     X(POKE,              DEBUG, "poke",            "RECOMP_POKE",              "=va:value,...: write guest words") \
     X(WORKERS,           DEBUG, "workers",         "RECOMP_WORKERS",           "=inline: run worker threads inline") \
     X(GUEST_CPUS,        DEBUG, "guest_cpus",      "RECOMP_GUEST_CPUS",        "=one (default, as on the console) | all: the title's threads on one host core or every core; =n: that core") \
+    X(GUEST_PRIORITY,    DEBUG, "guest_priority",  NULL,                       "=0: KeSetBasePriorityThread leaves host thread priorities alone (A/B; default 1: the title's priorities reach its host threads)") \
     X(GUEST_QUANTUM,     DEBUG, "guest_quantum",   NULL,                       "=ms: a guest thread that has held the guest CPU (RECOMP_GUEST_LOCK) this long with another waiting hands it over at its next kernel call (default 4; 0: at every kernel call)") \
     X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
     X(ASYNC_IO,          DEBUG, "async_io",        "RECOMP_ASYNC_IO",          "asynchronous file I/O") \

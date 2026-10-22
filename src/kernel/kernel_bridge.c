@@ -756,8 +756,23 @@ static void thobj_detach_token(uint32_t token)
  * keeps it (it never ends while the title runs). */
 static uint32_t thobj_current(void)
 {
-    if (!g_thread_obj_va)
+    if (!g_thread_obj_va) {
+        HANDLE self = NULL;
+
         g_thread_obj_va = thobj_alloc();
+        /* A worker's object gets a KE shadow at spawn; this thread's gets
+         * one here, so a priority set or a wait on it from another thread
+         * reaches this host thread. The POSIX shim duplicates a thread it
+         * did not create to the current-thread pseudo-handle, which would
+         * name whoever uses it, so that one is not kept. */
+        if (g_thread_obj_va
+                && DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                                   GetCurrentProcess(), &self, 0, FALSE,
+                                   DUPLICATE_SAME_ACCESS)) {
+            if (self && self != (HANDLE)(LONG_PTR)-2)
+                ke_shadow_insert(g_thread_obj_va, self);
+        }
+    }
     return g_thread_obj_va;
 }
 
@@ -5680,19 +5695,43 @@ static void bridge_KeDisconnectInterrupt(void)
 }
 
 /* ── KeSetBasePriorityThread (ordinal 143, 2 args) */
-/* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
- * existed in kernel_thread.c all along; only the bridge wrapper was
- * missing, so the thunk fell through to the fallback and returned 0. */
+/* KeQueryBasePriorityThread (ordinal 124, 1 arg).
+ *
+ * The thread argument is a guest KTHREAD (thobj_alloc's object, which XAPI's
+ * SetThreadPriority gets from ObReferenceObjectByHandle), not a host handle.
+ * Its host thread is the caller's own, or the handle the KE shadow keeps for
+ * the object (workers at spawn, the main thread in thobj_current). Passed on
+ * as a handle, as it used to be, the call failed on Windows and every guest
+ * thread ran at normal priority: SSX 3's raised sound threads then lost the
+ * one guest core to its main thread and the music crackled.
+ * guest_priority=0 leaves host priorities alone, for A/B. */
+static HANDLE bridge_thread_host(uint32_t thread_va)
+{
+    static int s_on = -1;
+
+    if (s_on < 0)
+        s_on = recomp_env_int(RENV_GUEST_PRIORITY, 1) != 0;
+    if (!s_on || !thread_va)
+        return NULL;
+    if (thread_va == g_thread_obj_va)
+        return GetCurrentThread();
+    return ke_shadow_lookup(thread_va);
+}
+
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    HANDLE host = bridge_thread_host(STACK_ARG(0));
+
+    g_eax = host ? (uint32_t)xbox_KeQueryBasePriorityThread(host) : 0;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+    HANDLE host = bridge_thread_host(STACK_ARG(0));
+
+    g_eax = host ? (uint32_t)xbox_KeSetBasePriorityThread(
+                       host, (LONG)STACK_ARG(1))
+                 : 0;
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
