@@ -47,7 +47,7 @@
  * next frame it shows, under that frame's own flip number. Only the
  * process's own pixels are read.
  *
- * RECOMP_WINDOW_QUIT_AFTER=<seconds>: post SDL_QUIT then, the event the
+ * RECOMP_WINDOW_QUIT_AFTER=<seconds>: post SDL_EVENT_QUIT then, the event the
  * window's close button produces, so a script can test the close path.
  *
  * Enhancements (nv2a_host_opts, set by the opt-in layer's
@@ -55,8 +55,8 @@
  * frame texture's scale mode on the same logical-size letterbox; integer
  * draws the frame at the largest whole multiple that fits, centred
  * (nv2a_present_rect; a frame larger than the window falls back to a
- * linear fit, never a crop, which is why SDL_RenderSetIntegerScale is not
- * used); present.fullscreen opens the window borderless fullscreen on the
+ * linear fit, never a crop, which is why SDL's integer-scale logical
+ * presentation is not used); present.fullscreen opens the window borderless fullscreen on the
  * desktop. The default (nearest, windowed) runs exactly the code it always
  * did.
  *
@@ -67,8 +67,9 @@
  */
 #if !defined(_WIN32)
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include "recomp_env.h"
+#include "platform/sdl_env.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -87,11 +88,11 @@
 #endif
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #include "mouse_sdl.h"        /* src/input: the mouse and its capture */
+#include "present_sdl_quit.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
-extern int  xbox_InputAnyOpen(void);
 extern void xbox_InputSdlPadSync(void);      /* src/input/xinput_device.c */
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
@@ -485,27 +486,37 @@ static void shot_path(char *path, size_t n, uint32_t flip)
     snprintf(path, n, "%swin_flip%05u.bmp", prefix, flip);
 }
 
-/* Between RenderCopy and RenderPresent: the back buffer is what is shown. */
+/* Between RenderTexture and RenderPresent: the back buffer is what is shown.
+ * The read is of the whole window, letterbox bars included: logical
+ * presentation is set aside for it (SDL3 reads only the logical viewport
+ * otherwise) and restored, which leaves the drawn pixels as they are.
+ * The read comes back 32-bit, which SDL_SaveBMP writes with a V5 header;
+ * BGR24 keeps the 24-bit file the layer's shots and the SDL2 build write. */
 static void shot_save(SDL_Renderer *ren, uint32_t flip)
 {
-    SDL_Surface *surf;
+    SDL_Surface *read, *surf = NULL;
+    SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;
     char path[512];
-    int w = 0, h = 0;
+    int lw = 0, lh = 0;
 
-    if (SDL_GetRendererOutputSize(ren, &w, &h) != 0 || w <= 0 || h <= 0)
-        return;
-    surf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 24, SDL_PIXELFORMAT_BGR24);
-    if (!surf)
-        return;
+    SDL_GetRenderLogicalPresentation(ren, &lw, &lh, &mode);
+    if (mode != SDL_LOGICAL_PRESENTATION_DISABLED)
+        SDL_SetRenderLogicalPresentation(ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+    read = SDL_RenderReadPixels(ren, NULL);
+    if (mode != SDL_LOGICAL_PRESENTATION_DISABLED)
+        SDL_SetRenderLogicalPresentation(ren, lw, lh, mode);
+    if (read) {
+        surf = SDL_ConvertSurface(read, SDL_PIXELFORMAT_BGR24);
+        SDL_DestroySurface(read);
+    }
     shot_path(path, sizeof path, flip);
-    if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_BGR24, surf->pixels,
-                             surf->pitch) == 0 && SDL_SaveBMP(surf, path) == 0)
+    if (surf && SDL_SaveBMP(surf, path))
         fprintf(stderr, "[PRESENT] window shot: %s (%dx%d, flip %u)\n",
-                path, w, h, flip);
+                path, surf->w, surf->h, flip);
     else
         fprintf(stderr, "[PRESENT] window shot at flip %u failed: %s\n",
                 flip, SDL_GetError());
-    SDL_FreeSurface(surf);
+    SDL_DestroySurface(surf);
 }
 
 /* The renderer, or the layer's resources; the window goes after. */
@@ -542,19 +553,19 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     uint32_t shown_flip = 0;
     const struct nv2a_host_opts *eo = nv2a_host_opts();
     int filter = eo->present_filter;
-    SDL_Rect dst;                /* integer: where the frame goes */
+    SDL_FRect dst;               /* integer: where the frame goes */
     int dst_ok = 0, out_w = 0, out_h = 0;
 
     /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
-     * SDL would turn them into SDL_QUIT. Set before the headless return:
-     * audio and input start SDL subsystems in headless runs too. */
+     * SDL would turn them into SDL_EVENT_QUIT. Set before the headless
+     * return: audio and input start SDL subsystems in headless runs too. */
+    xbox_sdl_env_compat();
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (recomp_env_on(RENV_HEADLESS))
         return guest_main();
     shot_parse();
 
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",
                 SDL_GetError());
         return guest_main();
@@ -562,8 +573,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     if (scale < 1 || scale > 8)
         scale = 2;
     {
-        Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
-                      | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        /* Fullscreen with a NULL display mode is SDL3's borderless desktop
+         * fullscreen; set after creation. */
+        SDL_WindowFlags wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
+                               | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
         /* display.aspect: the padded frame's shape (854x480 at 16:9). */
         int win_w = (int)nv2a_host_window_w(640, 480, (unsigned)scale);
 #if defined(__APPLE__)
@@ -574,9 +587,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         const char *mp = recomp_env(RENV_METAL_PRESENT);
         if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
             char why[256] = "";
-            win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, win_w, 480 * scale,
+            win = SDL_CreateWindow(window_name(), win_w, 480 * scale,
                                    wflags | SDL_WINDOW_METAL);
+            if (win && eo->fullscreen)
+                SDL_SetWindowFullscreenMode(win, NULL);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
             else if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why))
@@ -591,11 +605,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
 #endif
         if (!s_layer) {
-            win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, win_w, 480 * scale, wflags);
-            ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
-                                           | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
-                      : NULL;
+            win = SDL_CreateWindow(window_name(), win_w, 480 * scale, wflags);
+            if (win && eo->fullscreen)
+                SDL_SetWindowFullscreenMode(win, NULL);
+            ren = win ? SDL_CreateRenderer(win, NULL) : NULL;
+            if (ren && vsync && !SDL_SetRenderVSync(ren, 1))
+                fprintf(stderr, "[PRESENT] renderer vsync unavailable (%s)\n",
+                        SDL_GetError());
             if (!ren) {
                 fprintf(stderr, "[PRESENT] SDL window/renderer failed (%s); running headless\n",
                         SDL_GetError());
@@ -610,10 +626,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         fprintf(stderr, "[PRESENT] window up: CAMetalLayer (zero-copy), vsync %s;"
                 " guest runs on a pthread\n", vsync ? "on" : "off");
     } else {
-        SDL_RendererInfo ri;
-        if (SDL_GetRendererInfo(ren, &ri) == 0)
-            fprintf(stderr, "[PRESENT] window up: SDL %s renderer, vsync %s;"
-                    " guest runs on a pthread\n", ri.name, vsync ? "on" : "off");
+        const char *rn = SDL_GetRendererName(ren);
+        fprintf(stderr, "[PRESENT] window up: SDL %s renderer, vsync %s;"
+                " guest runs on a pthread\n", rn ? rn : "?", vsync ? "on" : "off");
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
         SDL_RenderPresent(ren);
@@ -624,7 +639,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
 
     s_guest_done_event = SDL_RegisterEvents(2);
-    if (s_guest_done_event == (Uint32)-1) {
+    if (s_guest_done_event == 0) {
         fprintf(stderr, "[PRESENT] SDL_RegisterEvents failed; running headless\n");
         close_present(ren);
         SDL_DestroyWindow(win);
@@ -634,7 +649,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     s_frame_event = s_guest_done_event + 1;
     s_guest_main = guest_main;
     xbox_InputSetMainPump(1);
-    xbox_InputSdlInit();
+    xbox_InputSdlInit(win);
     xbox_log_thread_role("sdl-main", 0);
     s_running = 1;
     if (!start_guest()) {
@@ -662,21 +677,21 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                  * that release them; both only read the event. */
                 xbox_InputSdlEvent(&ev);
                 xbox_InputSdlMouseEvent(&ev);
-                if (ev.type == SDL_QUIT)
+                if (ev.type == SDL_EVENT_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
                     guest_done = 1;
                 else if (ev.type == s_frame_event)
                     __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
-                else if (ev.type == SDL_WINDOWEVENT
-                         && (ev.window.event == SDL_WINDOWEVENT_EXPOSED
-                             || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED))
+                else if (ev.type == SDL_EVENT_WINDOW_EXPOSED
+                         || ev.type == SDL_EVENT_WINDOW_RESIZED
+                         || ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
                     dirty = 1;
             } while (SDL_PollEvent(&ev));
         }
         /* The capture can change on the poll thread (the release key, a
          * script); relative mode has to be set here, on the window's. */
-        xbox_InputSdlMouseSync();
+        xbox_InputSdlMouseSync(win);
         /* Pads come and go here, on the thread that pumps their events
          * (xinput_device.c says why it cannot be a poll thread). */
         xbox_InputSdlPadSync();
@@ -710,20 +725,23 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (!tex || f->w != tex_w || f->h != tex_h || f->bpp != tex_bpp) {
                 if (tex)
                     SDL_DestroyTexture(tex);
-                tex = SDL_CreateTexture(ren, f->bpp == 4 ? SDL_PIXELFORMAT_RGB888
+                tex = SDL_CreateTexture(ren, f->bpp == 4 ? SDL_PIXELFORMAT_XRGB8888
                                                          : SDL_PIXELFORMAT_RGB565,
                                         SDL_TEXTUREACCESS_STREAMING,
                                         (int)f->w, (int)f->h);
                 tex_w = f->w;
                 tex_h = f->h;
                 tex_bpp = f->bpp;
-                if (filter == NV2A_PRESENT_INTEGER) {
+                /* SDL3 textures start linear; the stock look is nearest. */
+                if (tex)
+                    SDL_SetTextureScaleMode(tex, filter == NV2A_PRESENT_LINEAR
+                                                 ? SDL_SCALEMODE_LINEAR
+                                                 : SDL_SCALEMODE_NEAREST);
+                if (filter == NV2A_PRESENT_INTEGER)
                     dst_ok = 0;          /* new frame size: place it again */
-                } else {
-                    SDL_RenderSetLogicalSize(ren, (int)f->w, (int)f->h);
-                    if (tex && filter == NV2A_PRESENT_LINEAR)
-                        SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
-                }
+                else
+                    SDL_SetRenderLogicalPresentation(ren, (int)f->w, (int)f->h,
+                                                     SDL_LOGICAL_PRESENTATION_LETTERBOX);
             }
             if (tex)
                 SDL_UpdateTexture(tex, NULL, f->px, (int)(f->w * f->bpp));
@@ -757,27 +775,27 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             SDL_RenderClear(ren);
             if (tex && filter == NV2A_PRESENT_INTEGER) {
                 int ow = 0, oh = 0;
-                if (SDL_GetRendererOutputSize(ren, &ow, &oh) == 0
+                if (SDL_GetCurrentRenderOutputSize(ren, &ow, &oh)
                         && (!dst_ok || ow != out_w || oh != out_h)) {
                     struct nv2a_rect r;
                     int whole = nv2a_present_rect(tex_w, tex_h, (uint32_t)ow, (uint32_t)oh,
                                                   NV2A_PRESENT_INTEGER, &r);
-                    dst.x = r.x;
-                    dst.y = r.y;
-                    dst.w = r.w;
-                    dst.h = r.h;
+                    dst.x = (float)r.x;
+                    dst.y = (float)r.y;
+                    dst.w = (float)r.w;
+                    dst.h = (float)r.h;
                     out_w = ow;
                     out_h = oh;
                     dst_ok = 1;
                     /* A frame that does not fit even at 1x is shrunk:
                      * linear there, nearest for whole multiples. Set on
                      * every placement: a new texture starts nearest. */
-                    SDL_SetTextureScaleMode(tex, whole ? SDL_ScaleModeNearest
-                                                       : SDL_ScaleModeLinear);
+                    SDL_SetTextureScaleMode(tex, whole ? SDL_SCALEMODE_NEAREST
+                                                       : SDL_SCALEMODE_LINEAR);
                 }
-                SDL_RenderCopy(ren, tex, NULL, &dst);
+                SDL_RenderTexture(ren, tex, NULL, &dst);
             } else if (tex)
-                SDL_RenderCopy(ren, tex, NULL, NULL);
+                SDL_RenderTexture(ren, tex, NULL, NULL);
             if (shoot) {
                 shoot = 0;
                 shot_save(ren, shown_flip);
@@ -804,7 +822,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                                   >= quit_after) {
             SDL_Event q;
             memset(&q, 0, sizeof q);
-            q.type = SDL_QUIT;
+            q.type = SDL_EVENT_QUIT;
             SDL_PushEvent(&q);
             quit_after = 0;
         }
@@ -855,20 +873,19 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * to stop lifted code mid-flight. exit() ends every thread; atexit
      * handlers (ICALL feedback, profiles) still run.
      *
-     * Window and renderer go first, on this thread as AppKit wants. SDL_Quit
-     * is only safe once nothing else uses SDL: the USB thread reads the
-     * game controllers, so with one open SDL stays up and exit() reclaims it. */
+     * Window and renderer go first, on this thread as AppKit wants, then the
+     * video subsystem and nothing else (present_sdl_quit.h): the audio
+     * stream and the game controllers are still in use on other threads.
+     * Cmd-Q with sound on crashed in SDL_GetAudioStreamQueued when this was
+     * SDL_Quit; the dummy driver's virtual clock never touches the stream. */
     if (tex)
         SDL_DestroyTexture(tex);
     close_present(ren);
     SDL_DestroyWindow(win);
     /* The main pump flag stays set: guest and OHCI threads keep running
-     * until exit(), and must not start calling SDL_GameControllerUpdate
+     * until exit(), and must not start calling SDL_UpdateGamepads
      * while SDL is torn down under them. */
-    if (!xbox_InputAnyOpen())
-        SDL_Quit();
-    else
-        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    SDL_QuitSubSystem(XBOX_PRESENT_SDL_QUIT);
     if (quit)
         exit(0);
     return s_guest_rc;

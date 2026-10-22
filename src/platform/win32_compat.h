@@ -561,7 +561,7 @@ BOOL FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st);
 
 /* ---- Multimedia (winmm) shim: waveOut stubs that always report failure.
  * The APU has a waveOut fallback path; on Linux it just stays inactive
- * and the (real) SDL2 audio path will replace it later. */
+ * and the (real) SDL audio path will replace it later. */
 typedef DWORD  MMRESULT;
 typedef void  *HWAVEOUT;
 #define MMSYSERR_NOERROR     0

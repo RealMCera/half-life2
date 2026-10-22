@@ -13,9 +13,9 @@
 #include "keyboard.h"
 #include "input_names.h"
 
-/* SDL2's keycodes are ABI-stable; the letter and digit arithmetic below
+/* SDL's keycodes are ABI-stable; the letter and digit arithmetic below
  * relies on these. */
-_Static_assert(SDLK_a == 'a' && SDLK_z == 'z' && SDLK_0 == '0' && SDLK_9 == '9',
+_Static_assert(SDLK_A == 'a' && SDLK_Z == 'z' && SDLK_0 == '0' && SDLK_9 == '9',
                "SDL letter and digit keycodes are their ASCII codes");
 _Static_assert(SDLK_RETURN == '\r' && SDLK_BACKSPACE == '\b',
                "SDL Return and Backspace keycodes are their ASCII codes");
@@ -25,12 +25,15 @@ _Static_assert(SDLK_RETURN == '\r' && SDLK_BACKSPACE == '\b',
  * Enter are left to the two callers below. */
 static int common_key(int key)
 {
-    if (key >= SDLK_a && key <= SDLK_z)
+    /* SDL3's keycodes are unsigned (SDL_Keycode is Uint32). */
+    SDL_Keycode k = (SDL_Keycode)key;
+
+    if (k >= SDLK_A && k <= SDLK_Z)
         return key - 'a' + 'A';
-    if (key >= SDLK_0 && key <= SDLK_9)
+    if (k >= SDLK_0 && k <= SDLK_9)
         return key;
-    if (key >= SDLK_F1 && key <= SDLK_F12)
-        return 0x70 + (key - SDLK_F1);
+    if (k >= SDLK_F1 && k <= SDLK_F12)
+        return 0x70 + (int)(k - SDLK_F1);
     switch (key) {
     case SDLK_RETURN:       return XBOX_VK_RETURN;
     case SDLK_BACKSPACE:    return XBOX_VK_BACK;
@@ -69,11 +72,11 @@ static int common_key(int key)
     case SDLK_MINUS:        return 0xBD;
     case SDLK_PERIOD:       return 0xBE;
     case SDLK_SLASH:        return 0xBF;
-    case SDLK_BACKQUOTE:    return 0xC0;
+    case SDLK_GRAVE:        return 0xC0;
     case SDLK_LEFTBRACKET:  return 0xDB;
     case SDLK_BACKSLASH:    return 0xDC;
     case SDLK_RIGHTBRACKET: return 0xDD;
-    case SDLK_QUOTE:        return 0xDE;
+    case SDLK_APOSTROPHE:   return 0xDE;
     }
     return 0;
 }
@@ -106,12 +109,14 @@ int xbox_InputSdlKeyToCode(int key)
     return common_key(key);
 }
 
-void xbox_InputSdlInit(void)
+void xbox_InputSdlInit(SDL_Window *win)
 {
-    /* SDL2 starts text input on desktop at init. The game takes no text,
-     * and on macOS text input lets the press-and-hold accent popover take a
-     * held letter (W held to walk would stop walking). */
-    SDL_StopTextInput();
+    /* The game takes no text, and on macOS text input lets the
+     * press-and-hold accent popover take a held letter (W held to walk would
+     * stop walking). SDL3 does not start it on desktop by itself; this keeps
+     * it off should a platform or hint start it. */
+    if (win && SDL_TextInputActive(win))
+        SDL_StopTextInput(win);
 }
 
 void xbox_InputSdlEvent(const SDL_Event *ev)
@@ -119,7 +124,7 @@ void xbox_InputSdlEvent(const SDL_Event *ev)
     int vk;
 
     switch (ev->type) {
-    case SDL_KEYDOWN:
+    case SDL_EVENT_KEY_DOWN:
         /* Auto-repeat would only re-set a held key; dropping it keeps the
          * trace to real edges. */
         if (ev->key.repeat)
@@ -127,31 +132,30 @@ void xbox_InputSdlEvent(const SDL_Event *ev)
         /* Cmd+key is an app shortcut (Cmd-Tab, Cmd-H, Cmd-Q), not a game
          * key. Cmd itself releases whatever is held, which is what the
          * shortcut that follows expects; key-ups still apply below. */
-        if (ev->key.keysym.sym == SDLK_LGUI || ev->key.keysym.sym == SDLK_RGUI) {
+        if (ev->key.key == SDLK_LGUI || ev->key.key == SDLK_RGUI) {
             xbox_InputKeysClear();
             return;
         }
-        if (ev->key.keysym.mod & KMOD_GUI)
+        if (ev->key.mod & SDL_KMOD_GUI)
             return;
         /* The sided code: xbox_InputKeyEvent keeps the either-side
          * entries and traces the edge by name. */
-        vk = xbox_InputSdlKeyToCode(ev->key.keysym.sym);
+        vk = xbox_InputSdlKeyToCode((int)ev->key.key);
         if (vk)
             xbox_InputKeyEvent(vk, 1);
         return;
-    case SDL_KEYUP:
-        vk = xbox_InputSdlKeyToCode(ev->key.keysym.sym);
+    case SDL_EVENT_KEY_UP:
+        vk = xbox_InputSdlKeyToCode((int)ev->key.key);
         if (vk)
             xbox_InputKeyEvent(vk, 0);
         return;
-    case SDL_WINDOWEVENT:
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case SDL_EVENT_WINDOW_HIDDEN:
+    case SDL_EVENT_WINDOW_MINIMIZED:
         /* SDL sends keys only to the focused window, so there is no focus
          * check on the way in; on the way out a held key would stay held
          * for ever (Cmd-Tab, Mission Control, Cmd-H, Cmd-M). */
-        if (ev->window.event == SDL_WINDOWEVENT_FOCUS_LOST
-            || ev->window.event == SDL_WINDOWEVENT_HIDDEN
-            || ev->window.event == SDL_WINDOWEVENT_MINIMIZED)
-            xbox_InputKeysClear();
+        xbox_InputKeysClear();
         return;
     }
 }

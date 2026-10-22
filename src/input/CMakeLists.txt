@@ -1,7 +1,7 @@
 # Xbox Input → XInput Compatibility Layer
 #   input_map.c     the host -> Duke mapping table and pure helpers
 #   input_core.c    public API, connection cache, probe backoff
-#   xinput_device.c host backends (XInput on Windows, SDL2 elsewhere)
+#   xinput_device.c host backends (XInput on Windows, SDL3 elsewhere)
 #   keyboard.c      the key table, the compiled-in key map, the runtime
 #                   bindings and the keyboard-and-mouse composer (every host)
 #   mouse.c         the mouse: motion as a stick, buttons, capture (every
@@ -33,9 +33,9 @@ if(WIN32)
     target_link_libraries(xbox_input PUBLIC platform
         $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
 else()
-    find_package(SDL2 REQUIRED)
+    find_package(SDL3 3.2 CONFIG REQUIRED)
     target_sources(xbox_input PRIVATE keyboard_sdl.c mouse_sdl.c)
-    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2 m)
+    target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3 m)
 endif()
 
 if(MSVC)

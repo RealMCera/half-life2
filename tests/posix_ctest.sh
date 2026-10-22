@@ -27,8 +27,11 @@ mkdir -p "$B"
 B=$(cd "$B" && pwd)
 gen=()
 command -v ninja >/dev/null && gen=(-G Ninja)
-# Audio tests must never open a real device on a developer's machine.
-export SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-dummy}
+# Audio tests must never open a real device on a developer's machine. Both
+# spellings: SDL3 reads SDL_AUDIO_DRIVER, and a tree still on SDL2 (or
+# sdl2-compat) reads SDL_AUDIODRIVER.
+export SDL_AUDIO_DRIVER=${SDL_AUDIO_DRIVER:-${SDL_AUDIODRIVER:-dummy}}
+export SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-$SDL_AUDIO_DRIVER}
 
 is_project() {
     grep -qiE '^[[:space:]]*project[[:space:]]*\(' "$1/CMakeLists.txt"

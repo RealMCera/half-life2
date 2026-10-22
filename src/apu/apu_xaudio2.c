@@ -14,8 +14,8 @@
 #include "recomp_env.h"
 #include "host_time.h"
 
-/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
- * the same xa2_* functions over SDL2. */
+/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl.c provides
+ * the same xa2_* functions over SDL3. */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -277,7 +277,7 @@ uint64_t xa2_samples_played(void)
     return state.SamplesPlayed;
 }
 
-#else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
+#else /* !_WIN32: apu_sdl.c implements the same contract over SDL3 */
 
 /* ISO C wants at least one declaration in a translation unit. */
 typedef int apu_xaudio2_posix_unused;

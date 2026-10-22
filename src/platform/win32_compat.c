@@ -1798,7 +1798,7 @@ BOOL FlushFileBuffers(HANDLE h)
 
 /* ===================================================================== */
 /* Keyboard + window helpers -- stubs. Real keyboard polling will come   */
-/* via SDL_GetKeyboardState when main.c gets its SDL2 port.              */
+/* via SDL_GetKeyboardState when main.c gets its SDL port.              */
 /* ===================================================================== */
 
 SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
@@ -1823,7 +1823,7 @@ BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
 LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
-/* XInput stub: real gamepad is wired through input_compat (SDL2). */
+/* XInput stub: real gamepad is wired through input_compat (SDL). */
 DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
 { (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
 

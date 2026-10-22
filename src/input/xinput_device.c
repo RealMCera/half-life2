@@ -6,7 +6,7 @@
  * input_map.c, so both hosts map controls the same way.
  *
  *   _WIN32 -> Windows XInput (also Proton/Wine)
- *   POSIX  -> SDL2 GameController
+ *   POSIX  -> SDL3 gamepad
  */
 
 #include "input_backend.h"
@@ -66,11 +66,12 @@ const xbox_input_backend xbox_input_host_backend = {
 
 /* ======================================================================== */
 #else /* !_WIN32 */
-/* ====================  SDL2 GameController backend  ===================== */
+/* ====================  SDL3 gamepad backend  ============================ */
 /* ======================================================================== */
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <errno.h>
+#include "platform/sdl_env.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
@@ -78,7 +79,7 @@ const xbox_input_backend xbox_input_host_backend = {
 /* Hot-plug. A port holds one open controller for as long as SDL reports it
  * attached; ports never shift, so player 1 keeps port 0 while pads come and
  * go on other ports. A removed pad frees its port. A new pad takes, in
- * order: the port the same model (joystick GUID) last held, if it is free
+ * order: the port the same model (gamepad GUID) last held, if it is free
  * and another pad is still connected; else the lowest free port. So a pad
  * pulled and replugged comes back as the same player, and a pad that
  * connects while no other is connected is player 1. A pad left alone on a
@@ -86,24 +87,23 @@ const xbox_input_backend xbox_input_host_backend = {
  * XBOX_MAX_CONTROLLERS wait for a free port.
  *
  * Threads: the game's poll threads read the table (get_state, set_state)
- * while the window thread pumps SDL (fb_present_sdl.c). Every call that
- * takes a device index (SDL_NumJoysticks, SDL_GameControllerOpen, ...) runs
- * on the thread that pumps SDL events, because sdl2-compat keeps the index
- * list in an unlocked global that its event conversion rebuilds when it
- * pops or posts a device event: a poll thread enumerating beside the
- * window's pump double-frees that list. So with a window the window thread
- * opens the subsystem and rescans (xbox_InputSdlPadSync, once per loop),
- * and the poll threads only use open pads by pointer; headless, the poll
- * thread is the pump and rescans itself, with SDL_GameControllerUpdate
- * posting the events. Both run under g_slot_lock, which is taken before
+ * while the window thread pumps SDL (fb_present_sdl.c). Enumerating and
+ * opening (SDL_GetGamepads, SDL_OpenGamepad) run on the thread that pumps
+ * SDL events. SDL3 locks its device list, so this is no longer needed for
+ * safety (sdl2-compat's unlocked index list was why it began), but it keeps
+ * one owner for every open and close, and the boot wait below depends on
+ * that owner. So with a window the window thread opens the subsystem and
+ * rescans (xbox_InputSdlPadSync, once per loop), and the poll threads only
+ * use open pads by pointer; headless, the poll thread is the pump and
+ * rescans itself, with SDL_UpdateGamepads posting the events. Both run under g_slot_lock, which is taken before
  * SDL's joystick lock (inside every SDL call), never after: SDL runs event
  * watches with its lock held, so the watch only raises g_rescan. A rescan
  * runs on that flag, or at most once a second without it. */
 struct sdl_slot {
-    SDL_GameController *pad;
-    SDL_JoystickID      id;     /* instance id while open */
-    SDL_JoystickGUID    guid;   /* the last pad held; kept after removal */
-    int                 had;    /* guid is set */
+    SDL_Gamepad    *pad;
+    SDL_JoystickID  id;     /* instance id while open */
+    SDL_GUID        guid;   /* the last pad held; kept after removal */
+    int             had;    /* guid is set */
 };
 static struct sdl_slot  g_slot[XBOX_MAX_CONTROLLERS];
 static pthread_mutex_t  g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -127,28 +127,17 @@ static pthread_cond_t   g_ready_cv = PTHREAD_COND_INITIALIZER;
 static volatile int g_main_pump;
 void xbox_InputSetMainPump(int on) { g_main_pump = on; }
 
-/* Whether a controller is open, i.e. whether SDL may still be in use here.
- * Pads open only on the window thread, which is the one that asks. */
-int xbox_InputAnyOpen(void)
-{
-    int any = 0;
-    pthread_mutex_lock(&g_slot_lock);
-    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
-        any |= g_slot[i].pad != NULL;
-    pthread_mutex_unlock(&g_slot_lock);
-    return any;
-}
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
-_Static_assert(SDL_CONTROLLER_BUTTON_A == XBOX_SDL_BUTTON_A
-               && SDL_CONTROLLER_BUTTON_START == XBOX_SDL_BUTTON_START
-               && SDL_CONTROLLER_BUTTON_LEFTSHOULDER == XBOX_SDL_BUTTON_LEFTSHOULDER
-               && SDL_CONTROLLER_BUTTON_DPAD_RIGHT == XBOX_SDL_BUTTON_DPAD_RIGHT,
-               "XBOX_SDL_BUTTON_* must match SDL_GameControllerButton");
-_Static_assert(SDL_CONTROLLER_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
-               && SDL_CONTROLLER_AXIS_RIGHTY == XBOX_SDL_AXIS_RIGHTY
-               && SDL_CONTROLLER_AXIS_TRIGGERRIGHT == XBOX_SDL_AXIS_TRIGGERRIGHT,
-               "XBOX_SDL_AXIS_* must match SDL_GameControllerAxis");
+_Static_assert(SDL_GAMEPAD_BUTTON_SOUTH == XBOX_SDL_BUTTON_A
+               && SDL_GAMEPAD_BUTTON_START == XBOX_SDL_BUTTON_START
+               && SDL_GAMEPAD_BUTTON_LEFT_SHOULDER == XBOX_SDL_BUTTON_LEFTSHOULDER
+               && SDL_GAMEPAD_BUTTON_DPAD_RIGHT == XBOX_SDL_BUTTON_DPAD_RIGHT,
+               "XBOX_SDL_BUTTON_* must match SDL_GamepadButton");
+_Static_assert(SDL_GAMEPAD_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
+               && SDL_GAMEPAD_AXIS_RIGHTY == XBOX_SDL_AXIS_RIGHTY
+               && SDL_GAMEPAD_AXIS_RIGHT_TRIGGER == XBOX_SDL_AXIS_TRIGGERRIGHT,
+               "XBOX_SDL_AXIS_* must match SDL_GamepadAxis");
 
 static uint64_t sdl_now_ms(void)
 {
@@ -159,26 +148,26 @@ static uint64_t sdl_now_ms(void)
 
 /* Runs on whichever thread posts the event, with SDL's locks held: raise the
  * flag and nothing else (see above). */
-static int SDLCALL device_watch(void *ud, SDL_Event *ev)
+static bool SDLCALL device_watch(void *ud, SDL_Event *ev)
 {
     (void)ud;
     switch (ev->type) {
-    case SDL_JOYDEVICEADDED:
-    case SDL_JOYDEVICEREMOVED:
-    case SDL_CONTROLLERDEVICEADDED:
-    case SDL_CONTROLLERDEVICEREMOVED:
+    case SDL_EVENT_JOYSTICK_ADDED:
+    case SDL_EVENT_JOYSTICK_REMOVED:
+    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_REMOVED:
         __atomic_store_n(&g_rescan, 1, __ATOMIC_RELEASE);
         break;
     default:
         break;
     }
-    return 1;
+    return true;
 }
 
 /* g_slot_lock held; any thread, as closing goes by pointer. */
 static void close_slot(int port)
 {
-    SDL_GameControllerClose(g_slot[port].pad);
+    SDL_CloseGamepad(g_slot[port].pad);
     g_slot[port].pad = NULL;
     fprintf(stderr, "[INPUT] host pad removed port=%d\n", port);
     fflush(stderr);
@@ -186,12 +175,12 @@ static void close_slot(int port)
     __atomic_store_n(&g_rescan, 1, __ATOMIC_RELEASE);
 }
 
-/* g_slot_lock held, on the pumping thread. Open device index i into the
- * port it should have. */
-static void open_device(int i)
+/* g_slot_lock held, on the pumping thread. Open gamepad instance id into
+ * the port it should have. */
+static void open_device(SDL_JoystickID id)
 {
-    SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
-    SDL_GameController *c;
+    SDL_GUID g = SDL_GetGamepadGUIDForID(id);
+    SDL_Gamepad *c;
     const char *name;
     int port = -1, others = 0;
 
@@ -205,13 +194,13 @@ static void open_device(int i)
     for (int p = 0; p < XBOX_MAX_CONTROLLERS && port < 0; p++)
         if (!g_slot[p].pad)
             port = p;
-    if (port < 0 || !(c = SDL_GameControllerOpen(i)))
+    if (port < 0 || !(c = SDL_OpenGamepad(id)))
         return;
     g_slot[port].pad  = c;
-    g_slot[port].id   = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(c));
+    g_slot[port].id   = id;
     g_slot[port].guid = g;
     g_slot[port].had  = 1;
-    name = SDL_GameControllerName(c);
+    name = SDL_GetGamepadName(c);
     fprintf(stderr, "[INPUT] host pad added port=%d \"%s\"\n", port, name ? name : "?");
     fflush(stderr);
 }
@@ -220,23 +209,25 @@ static void open_device(int i)
  * it gained. */
 static void rescan(void)
 {
-    int n;
+    SDL_JoystickID *ids;
+    int n = 0;
 
     /* With nothing pumping, device detection runs here. */
     if (!g_main_pump)
-        SDL_GameControllerUpdate();
+        SDL_UpdateGamepads();
     for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
-        if (g_slot[p].pad && !SDL_GameControllerGetAttached(g_slot[p].pad))
+        if (g_slot[p].pad && !SDL_GamepadConnected(g_slot[p].pad))
             close_slot(p);
-    n = SDL_NumJoysticks();
+    if (!(ids = SDL_GetGamepads(&n)))
+        return;
     for (int i = 0; i < n; i++) {
-        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
         int open = 0;
         for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
-            open |= g_slot[p].pad && g_slot[p].id == id;
-        if (!open && SDL_IsGameController(i))
-            open_device(i);
+            open |= g_slot[p].pad && g_slot[p].id == ids[i];
+        if (!open)
+            open_device(ids[i]);
     }
+    SDL_free(ids);
 }
 
 /* g_slot_lock held, on the pumping thread. On a device event, else at most
@@ -258,8 +249,8 @@ static void start_sdl(void)
 {
     /* Game controllers pull in SDL events; keep SIGINT/SIGTERM default. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
-        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    if (!SDL_WasInit(SDL_INIT_GAMEPAD))
+        SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     SDL_AddEventWatch(device_watch, NULL);
     g_ready = 1;
     g_last_scan = sdl_now_ms();
@@ -284,6 +275,8 @@ void xbox_InputSdlPadSync(void)
 
 static void sdl_init(void)
 {
+    /* Before the first SDL call: the old driver names still work. */
+    xbox_sdl_env_compat();
     __atomic_store_n(&g_wanted, 1, __ATOMIC_RELEASE);
     pthread_mutex_lock(&g_slot_lock);
     if (!g_main_pump) {
@@ -308,7 +301,7 @@ static void sdl_init(void)
 
 static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
 {
-    SDL_GameController *c;
+    SDL_Gamepad *c;
     XBOX_HOST_SDL_GAMEPAD pad;
 
     pthread_mutex_lock(&g_slot_lock);
@@ -316,8 +309,8 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
         maybe_rescan();
     c = g_slot[port].pad;
     if (c && !g_main_pump)
-        SDL_GameControllerUpdate();
-    if (c && !SDL_GameControllerGetAttached(c)) {
+        SDL_UpdateGamepads();
+    if (c && !SDL_GamepadConnected(c)) {
         close_slot((int)port);
         c = NULL;
     }
@@ -326,9 +319,9 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
         return ERROR_DEVICE_NOT_CONNECTED;
     }
     for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
-        pad.button[b] = SDL_GameControllerGetButton(c, (SDL_GameControllerButton)b) ? 1 : 0;
+        pad.button[b] = SDL_GetGamepadButton(c, (SDL_GamepadButton)b) ? 1 : 0;
     for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
-        pad.axis[a] = SDL_GameControllerGetAxis(c, (SDL_GameControllerAxis)a);
+        pad.axis[a] = SDL_GetGamepadAxis(c, (SDL_GamepadAxis)a);
     pthread_mutex_unlock(&g_slot_lock);
     out->dwPacketNumber = ++g_packet[port];
     xbox_InputMapSdl(&pad, &out->Gamepad);
@@ -337,15 +330,15 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
 
 static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 {
-    SDL_GameController *c;
+    SDL_Gamepad *c;
 
     pthread_mutex_lock(&g_slot_lock);
     c = g_slot[port].pad;
     /* SDL rumble needs a duration; refresh for ~1s on each call (the game
      * polls vibration continuously). 0 stops it. */
     if (c)
-        SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
-                                 (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 1000 : 0);
+        SDL_RumbleGamepad(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
+                          (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 1000 : 0);
     pthread_mutex_unlock(&g_slot_lock);
     return c ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }

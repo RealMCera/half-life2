@@ -801,7 +801,7 @@ static int hs_poll(void)
  * backend returned and q the queue hs_poll read just before. A refused
  * submit is in the WAV and counts in the sample index all the same, so the
  * index stays the WAV's; what was lost ends at the index on the refused
- * line (on XAudio2 the whole device buffer the period completed, on SDL2
+ * line (on XAudio2 the whole device buffer the period completed, on SDL3
  * the period). */
 static void hs_submit(int n, int ok, int q)
 {

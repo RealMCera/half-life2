@@ -9,6 +9,11 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+### Changed
+- POSIX hosts link SDL3 (3.2 or newer) instead of SDL2 or sdl2-compat:
+  window, input, gamepad hot-plug and audio. SDL2's `SDL_AUDIODRIVER` and
+  `SDL_VIDEODRIVER` are still accepted.
+
 ## [blinx2-v0.6.0] - 2026-10-21
 
 ### Added

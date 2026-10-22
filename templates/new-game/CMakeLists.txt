@@ -114,7 +114,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
 )
 
-# Windows SDK libraries needed at link time. Other hosts get graphics (SDL2,
+# Windows SDK libraries needed at link time. Other hosts get graphics (SDL3,
 # Metal), input and crypto through the xboxrecomp targets and need nothing
 # extra here.
 #

@@ -322,7 +322,7 @@ presenters read them at start.
   goes through a scaling blit. The Win32 GDI window of the CPU backend does
   not follow these keys yet.
 - **`present.fullscreen`.** A borderless window covering the display at
-  start, with no mode change (SDL `FULLSCREEN_DESKTOP`; D3D11 a `WS_POPUP`
+  start, with no mode change (SDL `SDL_WINDOW_FULLSCREEN` at the desktop mode; D3D11 a `WS_POPUP`
   the primary monitor's size). There is no hotkey yet.
 - **`present.surface`.** Who scales the frame to the screen. `window` is
   the stock behaviour: the swap chain follows the window, and the game

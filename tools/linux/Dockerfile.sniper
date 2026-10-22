@@ -11,7 +11,7 @@ RUN mkdir -p /out && date +%s > /out/t0 \
  && { cmake -S . -B /b -G Ninja -DCMAKE_BUILD_TYPE=Release -DXBOXRECOMP_ENHANCE=ON > /out/root.cfg.log 2>&1; echo "cfg=$?" >> /out/status.txt; } \
  && { cmake --build /b -j "$JOBS" -- -k 0 > /out/root.build.log 2>&1; echo "build=$?" >> /out/status.txt; } \
  && date +%s > /out/t1 \
- && { [ "$CTEST" != 1 ] || { SDL_AUDIODRIVER=dummy SDL_VIDEODRIVER=dummy JOBS="$JOBS" bash tests/posix_ctest.sh /out/ctest > /out/ctest.txt 2>&1; echo "ctest=$?" >> /out/status.txt; }; } \
+ && { [ "$CTEST" != 1 ] || { SDL_AUDIO_DRIVER=dummy SDL_VIDEO_DRIVER=dummy SDL_AUDIODRIVER=dummy SDL_VIDEODRIVER=dummy JOBS="$JOBS" bash tests/posix_ctest.sh /out/ctest > /out/ctest.txt 2>&1; echo "ctest=$?" >> /out/status.txt; }; } \
  && date +%s > /out/t2; true
 FROM scratch
 COPY --from=build /out /

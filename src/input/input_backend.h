@@ -1,6 +1,6 @@
 /**
  * xbox_input -- the seam between the public API (input_core.c) and a host
- * backend (xinput_device.c: XInput on Windows, SDL2 GameController
+ * backend (xinput_device.c: XInput on Windows, the SDL3 gamepad API
  * elsewhere). Internal to src/input and its tests.
  *
  * input_core.c owns the per-port connection cache and the probe backoff;

@@ -38,8 +38,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
-#include <SDL.h>
-#include <SDL_metal.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_metal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -172,7 +172,7 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             w = (int)nv2a_host_window_w(640, 480, nv2a_host_render_scale());
             h = 480 * (int)nv2a_host_render_scale();
         } else {
-            SDL_Metal_GetDrawableSize(win, &w, &h);
+            SDL_GetWindowSizeInPixels(win, &w, &h);
         }
         if (w > 0 && h > 0)
             s_layer.drawableSize = CGSizeMake(w, h);
@@ -304,8 +304,7 @@ int fbm_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pitch
 static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *path,
                       uint32_t flip)
 {
-    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, (int)w, (int)h, 24,
-                                                       SDL_PIXELFORMAT_BGR24);
+    SDL_Surface *surf = SDL_CreateSurface((int)w, (int)h, SDL_PIXELFORMAT_BGR24);
     const uint8_t *px = (const uint8_t *)[buf contents];
     uint32_t x, y;
 
@@ -321,11 +320,11 @@ static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *pat
             o[x * 3 + 2] = in[x * 4 + 2];
         }
     }
-    if (SDL_SaveBMP(surf, path) == 0)
+    if (SDL_SaveBMP(surf, path))
         fprintf(stderr, "[PRESENT] window shot: %s (%ux%u, flip %u)\n", path, w, h, flip);
     else
         fprintf(stderr, "[PRESENT] window shot at flip %u failed: %s\n", flip, SDL_GetError());
-    SDL_FreeSurface(surf);
+    SDL_DestroySurface(surf);
 }
 
 /* Slot k (fw x fh, drawn at render scale n with hor+ pad pad) into the
@@ -361,7 +360,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 dh = (int)cur.height;
             }
         } else {
-            SDL_Metal_GetDrawableSize(win, &dw, &dh);
+            SDL_GetWindowSizeInPixels(win, &dw, &dh);
         }
         if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
             s_layer.drawableSize = CGSizeMake(dw, dh);

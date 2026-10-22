@@ -84,7 +84,7 @@ typedef struct XBOX_INPUT_CAPABILITIES {
 
 /**
  * Initialize the input system (idempotent; the other calls do it lazily).
- * Port N is XInput user index N, or SDL GameController slot N. Registers
+ * Port N is XInput user index N, or SDL gamepad slot N. Registers
  * xbox_InputShutdown() with atexit().
  */
 void xbox_InputInit(void);

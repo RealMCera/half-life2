@@ -10,7 +10,7 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | `input_map.h`, `input_map.c` | The host → Xbox mapping table, the pure map and deadzone helpers |
 | `input_core.c` | The public API: connection cache, probe backoff, keyboard merge, shutdown |
 | `input_backend.h` | The seam between `input_core.c` and a host backend (tests swap it) |
-| `xinput_device.c` | Host backends: XInput (Windows, Proton) and SDL2 GameController |
+| `xinput_device.c` | Host backends: XInput (Windows, Proton) and the SDL3 gamepad API |
 | `keyboard.c` | The key table, the compiled-in key map, the runtime bindings and the keyboard-and-mouse composer, every host |
 | `mouse.h`, `mouse.c` | The mouse: motion as a stick, buttons, the wheel, the capture state machine; its `_WIN32` half is the Win32 windows' mouse |
 | `input_names.h`, `input_names.c` | The binding vocabulary: key, mouse and control names |
@@ -131,7 +131,7 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 ### Host controller → Xbox mapping
 
 One table in `input_map.c` drives both backends (XInput on Windows and
-Proton, SDL2 GameController elsewhere); `tests/input_map` checks every row
+Proton, the SDL3 gamepad API elsewhere); `tests/input_map` checks every row
 and fails if the table below and the code disagree. Regenerate it with
 `INPUT_MAP_README_OUT=<file>` set when running the test.
 
@@ -146,26 +146,29 @@ and fails if the table below and the code disagree. Regenerate it with
   that drift.
 - SDL's stick Y points down and is inverted as `-1 - v`, so -32768 and
   32767 swap exactly (an SDL stick at rest reads -1 on Y).
+- SDL3 names the face buttons by position: `SOUTH`, `EAST`, `WEST` and
+  `NORTH` are where A, B, X and Y sit on an Xbox pad, so a pad with other
+  labels (Nintendo's swapped A/B, say) maps by place, not by letter.
 
 <!-- input_map:begin (generated from src/input/input_map.c; tests/input_map checks it) -->
-| Host control | Guest field | Guest value | XInput | SDL2 |
+| Host control | Guest field | Guest value | XInput | SDL3 |
 |---|---|---|---|---|
-| A | `bAnalogButtons[A]` | 255 held, 0 released | `A` | `A` |
-| B | `bAnalogButtons[B]` | 255 held, 0 released | `B` | `B` |
-| X | `bAnalogButtons[X]` | 255 held, 0 released | `X` | `X` |
-| Y | `bAnalogButtons[Y]` | 255 held, 0 released | `Y` | `Y` |
-| Left shoulder (LB) | `bAnalogButtons[WHITE]` | 255 held, 0 released | `LEFT_SHOULDER` | `LEFTSHOULDER` |
-| Right shoulder (RB) | `bAnalogButtons[BLACK]` | 255 held, 0 released | `RIGHT_SHOULDER` | `RIGHTSHOULDER` |
+| A | `bAnalogButtons[A]` | 255 held, 0 released | `A` | `SOUTH` |
+| B | `bAnalogButtons[B]` | 255 held, 0 released | `B` | `EAST` |
+| X | `bAnalogButtons[X]` | 255 held, 0 released | `X` | `WEST` |
+| Y | `bAnalogButtons[Y]` | 255 held, 0 released | `Y` | `NORTH` |
+| Left shoulder (LB) | `bAnalogButtons[WHITE]` | 255 held, 0 released | `LEFT_SHOULDER` | `LEFT_SHOULDER` |
+| Right shoulder (RB) | `bAnalogButtons[BLACK]` | 255 held, 0 released | `RIGHT_SHOULDER` | `RIGHT_SHOULDER` |
 | Start / Menu | `wButtons START` | bit set while held | `START` | `START` |
 | Back / View | `wButtons BACK` | bit set while held | `BACK` | `BACK` |
-| Left stick click | `wButtons LEFT_THUMB` | bit set while held | `LEFT_THUMB` | `LEFTSTICK` |
-| Right stick click | `wButtons RIGHT_THUMB` | bit set while held | `RIGHT_THUMB` | `RIGHTSTICK` |
+| Left stick click | `wButtons LEFT_THUMB` | bit set while held | `LEFT_THUMB` | `LEFT_STICK` |
+| Right stick click | `wButtons RIGHT_THUMB` | bit set while held | `RIGHT_THUMB` | `RIGHT_STICK` |
 | D-pad up | `wButtons DPAD_UP` | bit set while held | `DPAD_UP` | `DPAD_UP` |
 | D-pad down | `wButtons DPAD_DOWN` | bit set while held | `DPAD_DOWN` | `DPAD_DOWN` |
 | D-pad left | `wButtons DPAD_LEFT` | bit set while held | `DPAD_LEFT` | `DPAD_LEFT` |
 | D-pad right | `wButtons DPAD_RIGHT` | bit set while held | `DPAD_RIGHT` | `DPAD_RIGHT` |
-| Left trigger | `bAnalogButtons[LTRIGGER]` | 0..255 | `bLeftTrigger` | `TRIGGERLEFT` |
-| Right trigger | `bAnalogButtons[RTRIGGER]` | 0..255 | `bRightTrigger` | `TRIGGERRIGHT` |
+| Left trigger | `bAnalogButtons[LTRIGGER]` | 0..255 | `bLeftTrigger` | `LEFT_TRIGGER` |
+| Right trigger | `bAnalogButtons[RTRIGGER]` | 0..255 | `bRightTrigger` | `RIGHT_TRIGGER` |
 | Left stick X | `sThumbLX` | -32768..32767, right positive | `sThumbLX` | `LEFTX` |
 | Left stick Y | `sThumbLY` | -32768..32767, up positive | `sThumbLY` | `LEFTY` as `-1 - v` |
 | Right stick X | `sThumbRX` | -32768..32767, right positive | `sThumbRX` | `RIGHTX` |
@@ -294,13 +297,12 @@ probe (XInput's guidance); `xbox_InputIsConnected` answers from the same
 cache and refreshes it under the same rule, so a pad plugged in later
 appears within a second. Port N is XInput user index N. On SDL hosts a pad
 keeps its port while it stays attached, and ports never shift: a removed pad
-frees its port, and a new one takes the port the same model (joystick GUID)
+frees its port, and a new one takes the port the same model (gamepad GUID)
 last held when that is free and another pad is still connected, else the
 lowest free port, so a pad that connects while no other pad is connected
 takes port 0. Device events and a once-a-second rescan both feed this, run
 by the thread that pumps SDL: the window's loop (`xbox_InputSdlPadSync`), or
-the poll when headless, since sdl2-compat's device-index calls are not safe
-beside another thread's pump; each change logs `[INPUT] host pad added
+the poll when headless, so one thread owns every open and close; each change logs `[INPUT] host pad added
 port=N "name"` or `[INPUT] host pad removed port=N`. With a window, the
 first poll waits up to 250 ms for the window's loop to open the pads, so a
 pad connected before launch is connected at the first read.

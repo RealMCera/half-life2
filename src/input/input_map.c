@@ -186,11 +186,12 @@ static const char *xinput_name(const xbox_input_map_row *r)
 
 static const char *sdl_name(const xbox_input_map_row *r)
 {
-    static const char *const btn[XBOX_SDL_BUTTON_COUNT] = { "A", "B", "X", "Y",
-        "BACK", "GUIDE", "START", "LEFTSTICK", "RIGHTSTICK", "LEFTSHOULDER",
-        "RIGHTSHOULDER", "DPAD_UP", "DPAD_DOWN", "DPAD_LEFT", "DPAD_RIGHT" };
+    static const char *const btn[XBOX_SDL_BUTTON_COUNT] = { "SOUTH", "EAST",
+        "WEST", "NORTH", "BACK", "GUIDE", "START", "LEFT_STICK", "RIGHT_STICK",
+        "LEFT_SHOULDER", "RIGHT_SHOULDER", "DPAD_UP", "DPAD_DOWN", "DPAD_LEFT",
+        "DPAD_RIGHT" };
     static const char *const ax[XBOX_SDL_AXIS_COUNT] = { "LEFTX", "LEFTY",
-        "RIGHTX", "RIGHTY", "TRIGGERLEFT", "TRIGGERRIGHT" };
+        "RIGHTX", "RIGHTY", "LEFT_TRIGGER", "RIGHT_TRIGGER" };
     if (r->sdl < 0) return "?";
     if (r->kind == XBOX_MAP_TRIGGER || r->kind == XBOX_MAP_STICK)
         return r->sdl < XBOX_SDL_AXIS_COUNT ? ax[r->sdl] : "?";
@@ -201,7 +202,7 @@ size_t xbox_InputMapReadmeRow(size_t i, char *buf, size_t size)
 {
     int n;
     if (i == 0)
-        n = snprintf(buf, size, "| Host control | Guest field | Guest value | XInput | SDL2 |");
+        n = snprintf(buf, size, "| Host control | Guest field | Guest value | XInput | SDL3 |");
     else if (i == 1)
         n = snprintf(buf, size, "|---|---|---|---|---|");
     else if (i - 2 < xbox_input_map_count) {

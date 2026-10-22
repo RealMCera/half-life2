@@ -4,7 +4,7 @@
  * The real SDL backend behind the public API, with a fake clock in the core
  * only (the core's once-a-second probe of an empty port is input_map's
  * test; here each step moves the clock a second on so every port is asked).
- * Pads are SDL virtual joysticks of the game controller type; which port a
+ * Pads are SDL virtual joysticks of the gamepad type; which port a
  * pad landed on is found by pressing its START and seeing which port reads
  * it, so the check covers the whole path from the device to the port.
  *
@@ -12,28 +12,17 @@
  * bounded time for the window's loop to open a pad plugged in before launch.
  * The other cases run twice: headless, where the poll rescans, then as under
  * a window, where this thread plays the window's and calls the pad sync each
- * step. The thread case runs only the second way, as the game does: with
- * sdl2-compat every device-index call has to stay on one thread, and here
- * that is the one attaching the virtual pads.
+ * step. The thread case runs only the second way, as the game does: every
+ * open and close stays on one thread, and here that is the one attaching
+ * the virtual pads.
  */
 #include "input_backend.h"
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if !SDL_VERSION_ATLEAST(2, 24, 0)
-/* Virtual joysticks of a given type and product (SDL_JoystickAttachVirtualEx)
- * came in SDL 2.24. */
-int main(void)
-{
-    printf("SKIP SDL %d.%d.%d has no SDL_JoystickAttachVirtualEx (2.24+)\n",
-           SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL);
-    return 77;
-}
-#else
 
 static int g_fail, g_checks;
 
@@ -64,70 +53,60 @@ static int g_attached;
 static SDL_JoystickID attach(Uint16 product)
 {
     SDL_VirtualJoystickDesc d;
-    int idx;
+    SDL_JoystickID id;
 
-    memset(&d, 0, sizeof d);
-    d.version  = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
-    d.type     = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
-    d.naxes    = SDL_CONTROLLER_AXIS_MAX;
-    d.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
+    SDL_INIT_INTERFACE(&d);
+    d.type     = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes    = 6;
+    d.nbuttons = 15;
     d.vendor_id  = 0x1234;
     d.product_id = product;
     d.name     = "hotplug test pad";
-    idx = SDL_JoystickAttachVirtualEx(&d);
-    if (idx < 0) {
+    id = SDL_AttachVirtualJoystick(&d);
+    if (!id) {
         /* The first one failing means no virtual joystick driver here. */
         printf("%s attach: %s\n", g_attached ? "FAIL" : "SKIP", SDL_GetError());
         exit(g_attached ? 1 : 77);
     }
     g_attached = 1;
-    if (!SDL_IsGameController(idx)) {
+    if (!SDL_IsGamepad(id)) {
         /* SDL builds without an automatic mapping for virtual pads. */
         char guid[64], map[512];
-        SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(idx), guid, sizeof guid);
+        SDL_GUIDToString(SDL_GetJoystickGUIDForID(id), guid, sizeof guid);
         snprintf(map, sizeof map, "%s,hotplug test pad,a:b0,b:b1,x:b2,y:b3,back:b4,"
                  "guide:b5,start:b6,leftstick:b7,rightstick:b8,leftshoulder:b9,"
                  "rightshoulder:b10,dpup:b11,dpdown:b12,dpleft:b13,dpright:b14,"
                  "leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a4,righttrigger:a5", guid);
-        SDL_GameControllerAddMapping(map);
+        SDL_AddGamepadMapping(map);
     }
-    return SDL_JoystickGetDeviceInstanceID(idx);
-}
-
-static int index_of(SDL_JoystickID id)
-{
-    for (int i = 0; i < SDL_NumJoysticks(); i++)
-        if (SDL_JoystickGetDeviceInstanceID(i) == id)
-            return i;
-    return -1;
+    return id;
 }
 
 static void detach(SDL_JoystickID id)
 {
-    int i = index_of(id);
-    if (i < 0 || SDL_JoystickDetachVirtual(i) < 0)
+    if (!SDL_DetachVirtualJoystick(id))
         printf("FAIL detach %d: %s\n", (int)id, SDL_GetError()), exit(1);
 }
 
 /* The port pad id drives, or -1: press its START, see which port reads it. */
 static int port_of(SDL_JoystickID id)
 {
-    SDL_Joystick *j = SDL_JoystickFromInstanceID(id);
+    SDL_Joystick *j = SDL_GetJoystickFromID(id);
     XBOX_INPUT_STATE st;
     int port = -1, hits = 0;
 
     if (!j)
         return -1;      /* the backend has not opened it */
-    SDL_JoystickSetVirtualButton(j, SDL_CONTROLLER_BUTTON_START, 1);
+    SDL_SetJoystickVirtualButton(j, SDL_GAMEPAD_BUTTON_START, true);
     if (g_window)
-        SDL_GameControllerUpdate();     /* the window's pump would */
+        SDL_UpdateGamepads();           /* the window's pump would */
     for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
         if (xbox_InputGetState(p, &st) == ERROR_SUCCESS
             && (st.Gamepad.wButtons & XBOX_GAMEPAD_START))
             port = (int)p, hits++;
-    SDL_JoystickSetVirtualButton(j, SDL_CONTROLLER_BUTTON_START, 0);
+    SDL_SetJoystickVirtualButton(j, SDL_GAMEPAD_BUTTON_START, false);
     if (g_window)
-        SDL_GameControllerUpdate();
+        SDL_UpdateGamepads();
     for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
         xbox_InputGetState(p, &st);
     return hits == 1 ? port : -1;
@@ -191,7 +170,7 @@ static void test_boot(void)
 {
     SDL_JoystickID a;
     pthread_t t;
-    Uint32 t0;
+    Uint64 t0;
 
     /* No window loop running: the first poll waits its bound, then reads
      * empty ports (here the caller is the would-be window thread itself,
@@ -200,7 +179,7 @@ static void test_boot(void)
     t0 = SDL_GetTicks();
     xbox_InputInit();
     {
-        Uint32 ms = SDL_GetTicks() - t0;
+        Uint64 ms = SDL_GetTicks() - t0;
         CHECK(ms >= 200 && ms < 1000, "unsynced boot wait took %u ms, want ~250", (unsigned)ms);
     }
     CHECK(connected_now() == 0, "ports=0x%X with no window loop, want 0", connected_now());
@@ -369,18 +348,21 @@ static void test_threads(void)
 
 int main(void)
 {
-    SDL_version v;
+    int v = SDL_GetVersion(), n = 0;
+    SDL_JoystickID *host;
 
-    SDL_GetVersion(&v);
-    if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
+    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
         printf("FAIL SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    if (SDL_NumJoysticks() > 0) {
+    host = SDL_GetJoysticks(&n);
+    if (n > 0) {
         printf("SKIP a host joystick is attached (%s); unplug it to run this test\n",
-               SDL_JoystickNameForIndex(0));
+               SDL_GetJoystickNameForID(host[0]));
+        SDL_free(host);
         return 77;
     }
+    SDL_free(host);
     g_be = xbox_input_host_backend;
     g_be.now_ms = f_clock;
     xbox_InputSetBackend(&g_be);
@@ -400,8 +382,7 @@ int main(void)
     test_memory();
     test_threads();
     printf("input_hotplug_sdl (SDL %d.%d.%d): %d checks, %d failed\n",
-           v.major, v.minor, v.patch, g_checks, g_fail);
+           SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v),
+           g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
-
-#endif /* SDL 2.24 */

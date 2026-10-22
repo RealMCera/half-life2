@@ -5,7 +5,7 @@
 #ifndef XBOX_INPUT_KEYBOARD_SDL_H
 #define XBOX_INPUT_KEYBOARD_SDL_H
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,8 +17,8 @@ int  xbox_InputSdlKeyToVk(int sdl_keycode);
 /* The same with the sides kept: LShift/RShift, LCtrl/RCtrl, LAlt/RAlt and
  * keypad Enter get input_names.h's own codes. The event path uses this. */
 int  xbox_InputSdlKeyToCode(int sdl_keycode);
-/* Once the window exists: stop SDL's text input. */
-void xbox_InputSdlInit(void);
+/* Once the window exists: stop SDL's text input on it. */
+void xbox_InputSdlInit(SDL_Window *win);
 /* Every event of the main loop: keys, and the window events that release
  * them. Others are ignored. */
 void xbox_InputSdlEvent(const SDL_Event *ev);

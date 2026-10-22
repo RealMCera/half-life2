@@ -3,8 +3,8 @@
  *
  * One table (xbox_input_map[]) says which host control drives which field of
  * the guest's XBOX_GAMEPAD, and both host backends go through it: the XInput
- * backend (Windows, Proton) via xbox_InputMapXInput() and the SDL2
- * GameController backend via xbox_InputMapSdl(). The helpers are pure (no
+ * backend (Windows, Proton) via xbox_InputMapXInput() and the SDL3
+ * gamepad backend via xbox_InputMapSdl(). The helpers are pure (no
  * platform calls, no SDL or XInput headers), so tests/input_map checks every
  * row on every host, and checks the table in src/input/README.md against
  * xbox_InputMapReadmeRow() so the documentation cannot drift from the code.
@@ -60,8 +60,11 @@ typedef struct XBOX_HOST_XINPUT_GAMEPAD {
 #define XBOX_XI_X              0x4000
 #define XBOX_XI_Y              0x8000
 
-/* SDL2's SDL_GameControllerButton and SDL_GameControllerAxis values (stable
- * ABI since SDL 2.0.2); the SDL backend checks them with static asserts. */
+/* SDL3's SDL_GamepadButton and SDL_GamepadAxis values, the same numbers
+ * SDL2's controller enums had; the SDL backend checks them with static
+ * asserts. SDL3 names the face buttons by position (SOUTH, EAST, WEST,
+ * NORTH), which are the Xbox A, B, X and Y places the Duke mapping wants, so
+ * the names here keep the Xbox letters. */
 enum {
     XBOX_SDL_BUTTON_A = 0, XBOX_SDL_BUTTON_B, XBOX_SDL_BUTTON_X,
     XBOX_SDL_BUTTON_Y, XBOX_SDL_BUTTON_BACK, XBOX_SDL_BUTTON_GUIDE,
@@ -79,8 +82,8 @@ enum {
     XBOX_SDL_AXIS_COUNT
 };
 
-/* A snapshot of an SDL GameController: button[i] = SDL_GameControllerGetButton
- * (i), axis[i] = SDL_GameControllerGetAxis(i), indexed by the enums above. */
+/* A snapshot of an SDL gamepad: button[i] = SDL_GetGamepadButton(i),
+ * axis[i] = SDL_GetGamepadAxis(i), indexed by the enums above. */
 typedef struct XBOX_HOST_SDL_GAMEPAD {
     uint8_t button[XBOX_SDL_BUTTON_COUNT];
     int16_t axis[XBOX_SDL_AXIS_COUNT];

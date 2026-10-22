@@ -5,7 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <SDL.h>
+#include <SDL3/SDL.h>
 
 /* Device, queue, pipeline and the window's layer; 0 with a reason in err. */
 int   fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn);

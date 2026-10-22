@@ -5,12 +5,12 @@
 # ERROR_DEVICE_NOT_CONNECTED after a removal, and polls racing hot-plug on
 # another thread. POSIX only; no window, no sound, no real pad (the host
 # joystick drivers SDL has hints for are turned off; Linux evdev has none, so
-# the test skips if a host joystick still shows, or when SDL is older than
-# 2.24 or has no virtual joystick driver):
+# the test skips if a host joystick still shows, or when SDL has no virtual
+# joystick driver):
 #   cmake --build <build> --target input_hotplug_sdl_test && ctest -R input_hotplug_sdl
 
 set(INPUT_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src/input)
-find_package(SDL2 REQUIRED)
+find_package(SDL3 3.2 CONFIG REQUIRED)
 add_executable(input_hotplug_sdl_test
     test_main.c
     ${INPUT_SRC}/xinput_device.c
@@ -20,10 +20,10 @@ add_executable(input_hotplug_sdl_test
     ${INPUT_SRC}/mouse.c
     ${INPUT_SRC}/input_names.c
     ${INPUT_SRC}/kbm_script.c)
-target_include_directories(input_hotplug_sdl_test PRIVATE ${INPUT_SRC})
-target_link_libraries(input_hotplug_sdl_test PRIVATE platform SDL2::SDL2 m)
+target_include_directories(input_hotplug_sdl_test PRIVATE ${INPUT_SRC} ${INPUT_SRC}/..)
+target_link_libraries(input_hotplug_sdl_test PRIVATE platform SDL3::SDL3 m)
 enable_testing()
 add_test(NAME input_hotplug_sdl COMMAND input_hotplug_sdl_test)
 set_tests_properties(input_hotplug_sdl PROPERTIES
     SKIP_RETURN_CODE 77
-    ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy;SDL_JOYSTICK_HIDAPI=0;SDL_JOYSTICK_IOKIT=0;SDL_JOYSTICK_MFI=0")
+    ENVIRONMENT "SDL_VIDEO_DRIVER=dummy;SDL_AUDIO_DRIVER=dummy;SDL_JOYSTICK_HIDAPI=0;SDL_JOYSTICK_IOKIT=0;SDL_JOYSTICK_MFI=0")

@@ -12,7 +12,7 @@ add_library(xbox_apu STATIC
     apu_mmio_hook.c
     apu_fault_bench.c
     apu_xaudio2.c
-    apu_sdl2.c
+    apu_sdl.c
     apu_wav.c
     apu_vclock.c
     apu_lockstat.c
@@ -60,7 +60,7 @@ if(WIN32)
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
     # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX),
-    # SDL2 for the audio device (apu_sdl2.c) and libm
-    find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+    # SDL3 for the audio device (apu_sdl.c) and libm
+    find_package(SDL3 3.2 CONFIG REQUIRED)
+    target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
 endif()

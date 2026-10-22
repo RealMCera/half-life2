@@ -15,20 +15,47 @@
 #include "input_names.h"
 
 static int s_relative = -1;     /* the mode last applied; -1 none yet */
+/* SDL3 reports motion and the wheel in fractions (high-resolution mice,
+ * trackpads); mouse.c counts whole steps. The part
+ * left over carries into the next event, so slow motion still adds up. */
+static float s_rem_x, s_rem_y, s_rem_wheel;
+
+/* SDL3 event timestamps are nanoseconds; mouse.c's clock is milliseconds
+ * and wraps. */
+static uint32_t ms_of(Uint64 ns)
+{
+    return (uint32_t)(ns / 1000000u);
+}
+
+/* The whole steps in *acc + d, with the rest left in *acc. */
+static int whole(float *acc, float d)
+{
+    int n;
+
+    *acc += d;
+    n = (int)*acc;              /* toward zero, so the rest keeps its sign */
+    *acc -= (float)n;
+    return n;
+}
 
 void xbox_InputSdlMouseEvent(const SDL_Event *ev)
 {
     int n;
 
     switch (ev->type) {
-    case SDL_MOUSEMOTION:
+    case SDL_EVENT_MOUSE_MOTION: {
+        int dx, dy;
         /* A touch screen reports as a mouse too; it is not one. */
         if (ev->motion.which == SDL_TOUCH_MOUSEID)
             return;
-        xbox_InputMouseMotion(ev->motion.xrel, ev->motion.yrel);
+        dx = whole(&s_rem_x, ev->motion.xrel);
+        dy = whole(&s_rem_y, ev->motion.yrel);
+        if (dx || dy)
+            xbox_InputMouseMotion(dx, dy);
         return;
-    case SDL_MOUSEBUTTONDOWN:
-    case SDL_MOUSEBUTTONUP:
+    }
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
         if (ev->button.which == SDL_TOUCH_MOUSEID)
             return;
         switch (ev->button.button) {
@@ -44,42 +71,35 @@ void xbox_InputSdlMouseEvent(const SDL_Event *ev)
          * the focus event, so mouse.c judges it by the two timestamps. On
          * macOS SDL drops that click itself (SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH
          * is off by default). */
-        xbox_InputMouseButtonAt(n, ev->type == SDL_MOUSEBUTTONDOWN, ev->button.timestamp);
+        xbox_InputMouseButtonAt(n, ev->button.down, ms_of(ev->button.timestamp));
         return;
-    case SDL_MOUSEWHEEL:
+    case SDL_EVENT_MOUSE_WHEEL:
         if (ev->wheel.which == SDL_TOUCH_MOUSEID)
             return;
         /* "Natural" scrolling flips the sign SDL reports; the direction
          * field says so, and WheelUp means the wheel turned away from the
          * player on every host. */
-        n = ev->wheel.y;
-        if (ev->wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
-            n = -n;
+        n = whole(&s_rem_wheel, ev->wheel.direction == SDL_MOUSEWHEEL_FLIPPED
+                                ? -ev->wheel.y : ev->wheel.y);
         if (n)
             xbox_InputMouseWheel(n);
         return;
-    case SDL_WINDOWEVENT:
-        switch (ev->window.event) {
-        case SDL_WINDOWEVENT_FOCUS_GAINED:
-            xbox_InputMouseFocusGainedAt(ev->window.timestamp);
-            break;
-        case SDL_WINDOWEVENT_FOCUS_LOST:
-        case SDL_WINDOWEVENT_HIDDEN:
-        case SDL_WINDOWEVENT_MINIMIZED:
-            xbox_InputMouseFocus(1);
-            break;
-        case SDL_WINDOWEVENT_CLOSE:
-            xbox_InputMouseClose();
-            break;
-        }
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        xbox_InputMouseFocusGainedAt(ms_of(ev->window.timestamp));
         return;
-    case SDL_QUIT:
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case SDL_EVENT_WINDOW_HIDDEN:
+    case SDL_EVENT_WINDOW_MINIMIZED:
+        xbox_InputMouseFocus(1);
+        return;
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+    case SDL_EVENT_QUIT:
         xbox_InputMouseClose();
         return;
     }
 }
 
-int xbox_InputSdlMouseSync(void)
+int xbox_InputSdlMouseSync(SDL_Window *win)
 {
     int want = xbox_InputMouseCaptured();
 
@@ -89,7 +109,8 @@ int xbox_InputSdlMouseSync(void)
      * the screen edge: the capture in one call. A failure (no mouse, the
      * dummy driver) leaves motion as absolute deltas, which still work
      * until the cursor reaches an edge. */
-    SDL_SetRelativeMouseMode(want ? SDL_TRUE : SDL_FALSE);
+    if (win)
+        SDL_SetWindowRelativeMouseMode(win, want != 0);
     s_relative = want;
     return 1;
 }
