@@ -5268,6 +5268,11 @@ const volatile uint8_t *xbox_PhysRamNameMap(void)
     return g_phys_ram_named;
 }
 
+void *xbox_McpxHost(void)
+{
+    return g_mcpx_memory;
+}
+
 
 /* Who ate the heap? Printed once, at the first failure.
  *

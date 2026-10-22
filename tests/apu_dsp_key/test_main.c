@@ -144,7 +144,7 @@ static void test_dsp_on(void)
 #else
 static void test_stub_kept(void)
 {
-    /* A build without the DSP, or without its device yet, keeps the stub,
+    /* A build without the DSP, or with it but not its device, keeps the stub,
      * ack and fold included: with the ack off and nothing to answer the
      * doorbell, audio init would wait for ever. */
     load_env("1", "apu_mixdown_all=2", "0x80A20810");
@@ -152,7 +152,8 @@ static void test_stub_kept(void)
     CHECK(streq(recomp_env(RENV_APU_DSP_ACK), "0x80A20810"));
     CHECK(streq(recomp_env(RENV_APU_MIXDOWN_ALL), "2"));
 #ifdef XBOXRECOMP_APU_DSP
-    CHECK(noted("RECOMP_APU_DSP=1: the APU DSP device is not wired yet; the stub"));
+    CHECK(noted("RECOMP_APU_DSP=1: this build has the dsp56300 JIT but not"
+                " the APU DSP device (XBOXRECOMP_APU_DSP_DEVICE); the stub"));
 #else
     CHECK(noted("RECOMP_APU_DSP=1: this build has no APU DSP"));
 #endif

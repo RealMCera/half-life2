@@ -99,13 +99,16 @@
 #define DMA_MAX_CHAIN 0x800u
 
 /* Program-side DMA register writes and descriptors, kept for the log when a
- * descriptor is refused: the program that set next_block is the question. */
+ * descriptor is refused: the program that set next_block is the question.
+ * An entry that repeats the one before it only counts, so a chain that loops
+ * on one descriptor does not push the register writes out of the ring. */
 #define TRACE_LEN 32
 
 typedef struct DmaTrace {
     uint64_t frame;
     uint32_t what;   /* peripheral address, or 0 for a descriptor */
     uint32_t a, b, c;
+    uint32_t repeats;
 } DmaTrace;
 
 typedef struct DspDma {
@@ -153,12 +156,22 @@ struct ApuDspEmu {
 static void trace(ApuDspEmu *e, uint32_t what, uint32_t a, uint32_t b,
                   uint32_t c)
 {
+    if (e->trace_n) {
+        DmaTrace *last = &e->trace[(e->trace_n - 1) % TRACE_LEN];
+        if (last->frame == e->st.frames && last->what == what &&
+            last->a == a && last->b == b && last->c == c) {
+            last->repeats++;
+            e->st.trace_repeats++;
+            return;
+        }
+    }
     DmaTrace *t = &e->trace[e->trace_n++ % TRACE_LEN];
     t->frame = e->st.frames;
     t->what = what;
     t->a = a;
     t->b = b;
     t->c = c;
+    t->repeats = 0;
 }
 
 static void trace_dump(ApuDspEmu *e)
@@ -167,12 +180,15 @@ static void trace_dump(ApuDspEmu *e)
     for (unsigned i = e->trace_n - n; i != e->trace_n; i++) {
         const DmaTrace *t = &e->trace[i % TRACE_LEN];
         if (t->what)
-            fprintf(stderr, "[DSP]   %s f%llu write x:$%06x = %06x\n", e->name,
+            fprintf(stderr, "[DSP]   %s f%llu write x:$%06x = %06x", e->name,
                     (unsigned long long)t->frame, t->what, t->a);
         else
             fprintf(stderr, "[DSP]   %s f%llu block %04x control %06x"
-                    " count %06x\n", e->name, (unsigned long long)t->frame,
+                    " count %06x", e->name, (unsigned long long)t->frame,
                     t->a, t->b, t->c);
+        if (t->repeats)
+            fprintf(stderr, " (x%u more)", t->repeats);
+        fputc('\n', stderr);
     }
 }
 
@@ -540,7 +556,8 @@ ApuDspEmu *apu_dsp_emu_create(const ApuDspEmuConfig *cfg)
      * core also reads and writes at X:0x1400-0x17FF: the VP's mixbins land
      * there, and the GP program reads them, and leaves its output, at
      * either address. The window's GPMIXBUF page (+0x5000) is not this
-     * memory; the APU writes the mixbuf by DSP address. */
+     * memory: the APU writes the mixbuf by DSP address, and each GP frame
+     * copies it to that page for whoever reads it through the window. */
     Dsp56300MemoryRegion xr[3], yr[1], pr[1];
     xr[0] = buffer_region(0, X_WORDS, e->x, 0);
     xr[1] = buffer_region(APU_DSP_MIXBUF_BASE, APU_DSP_MIXBUF_WORDS, e->x,
@@ -692,6 +709,9 @@ uint32_t apu_dsp_emu_run_frame(ApuDspEmu *e, uint32_t cycle_cap)
                     " halting, pc=%06x\n", e->name,
                     (unsigned long long)e->st.frames, cycles, ss.pc);
     }
+    if (e->is_gp)
+        memcpy(e->window + APU_DSP_WIN_MIXBUF, e->x + MIXBUF_X_ALIAS,
+               APU_DSP_MIXBUF_WORDS * 4);
     e->st.frames++;
     e->st.cycles += cycles;
     if (cycles > e->st.cycles_max)

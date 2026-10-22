@@ -62,8 +62,8 @@ endif()
 # RECOMP_APU_DSP=1. ON defines XBOXRECOMP_APU_DSP on recomp_env (PUBLIC, so
 # the APU and the key table agree) and links dsp56300 into xbox_apu.
 # A target without an archive (iPadOS, MSVC, universal macOS) builds as OFF,
-# with a warning; a failed download is an error. Until the device model
-# defines XBOXRECOMP_APU_DSP_DEVICE, RECOMP_APU_DSP=1 keeps the stub.
+# with a warning; a failed download is an error. src/apu adds the device
+# model and defines XBOXRECOMP_APU_DSP_DEVICE with it.
 option(XBOXRECOMP_APU_DSP "Build the opt-in MCPX APU DSP emulation (dsp56300 JIT)" OFF)
 set(XBOXRECOMP_APU_DSP_TARGET "")
 if(XBOXRECOMP_APU_DSP)

@@ -23,10 +23,14 @@ target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # XBOXRECOMP_APU_DSP (top-level CMakeLists.txt): the dsp56300 JIT. PRIVATE,
 # so its header stays inside the APU; a static xbox_apu still carries the
 # archive and its system libraries to the game's link. apu_dsp_emu.c is the
-# GP/EP device on it.
+# GP/EP device on it and apu_dsp_run.c runs it each APU frame. With them in,
+# XBOXRECOMP_APU_DSP_DEVICE (PUBLIC on recomp_env, like XBOXRECOMP_APU_DSP)
+# lets RECOMP_APU_DSP=1 through the key table; RECOMP_APU_DSP stays 0 by
+# default, so a build with the device plays as the stub until it is set.
 if(XBOXRECOMP_APU_DSP_TARGET)
-    target_sources(xbox_apu PRIVATE apu_dsp_emu.c)
+    target_sources(xbox_apu PRIVATE apu_dsp_emu.c apu_dsp_run.c)
     target_link_libraries(xbox_apu PRIVATE ${XBOXRECOMP_APU_DSP_TARGET})
+    target_compile_definitions(recomp_env PUBLIC XBOXRECOMP_APU_DSP_DEVICE)
 endif()
 
 # qemu_shim.h lives in nv2a/ - shared QEMU type abstraction

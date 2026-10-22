@@ -235,16 +235,19 @@ static void default_on(const char **values, int id, int supported)
  * GP, not the stub's fold that apu_mixdown_all picks. Both are forced off,
  * with one line when the user had set either.
  *
- * Until the device model is built in (XBOXRECOMP_APU_DSP_DEVICE, defined
- * next to it), nothing would answer the doorbell once the host ack is off
- * and audio init would wait for ever; so 1 keeps the stub, with a line, as
- * it does in a build without the DSP (XBOXRECOMP_APU_DSP=OFF). The stub's
- * ack and fold then keep working. */
+ * A build without the device model (XBOXRECOMP_APU_DSP_DEVICE, which
+ * src/apu defines when it builds apu_dsp_run.c) has nothing to answer the
+ * doorbell once the host ack is off, and audio init would wait for ever;
+ * so there 1 keeps the stub, with a line, as it does in a build without the
+ * DSP (XBOXRECOMP_APU_DSP=OFF). The stub's ack and fold then keep working.
+ * A build with the device that finds no MCPX window at run time keeps the
+ * stub too (mcpx_apu_dsp_device_on), and apu_dsp.c's ack takes its default
+ * over the 0 forced here. */
 static void apu_dsp_resolve(const char **values, const char *set)
 {
     const char *v = values[RENV_APU_DSP];
 
-    (void)set;                    /* read only once the device is in */
+    (void)set;                    /* read only in a build with the device */
     values[RENV_APU_DSP] = NULL;
     if (!v || !*v || !strcmp(v, "0"))
         return;
@@ -257,8 +260,8 @@ static void apu_dsp_resolve(const char **values, const char *set)
          " (XBOXRECOMP_APU_DSP=OFF); the stub\n");
     return;
 #elif !defined(XBOXRECOMP_APU_DSP_DEVICE)
-    note("[ENV] RECOMP_APU_DSP=1: the APU DSP device is not wired yet;"
-         " the stub\n");
+    note("[ENV] RECOMP_APU_DSP=1: this build has the dsp56300 JIT but not"
+         " the APU DSP device (XBOXRECOMP_APU_DSP_DEVICE); the stub\n");
     return;
 #else
     values[RENV_APU_DSP] = "1";

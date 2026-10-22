@@ -576,6 +576,16 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
 void mcpx_apu_dsp_gprst_write(uint32_t val);
 
+#ifdef XBOXRECOMP_APU_DSP_DEVICE
+/* The GP and EP on the dsp56300 JIT (apu_dsp_run.c), with RECOMP_APU_DSP=1:
+ * device_on says whether the key is set; run_frame stands in for the stub's
+ * frame; run_finalize joins its worker and frees the cores. */
+bool mcpx_apu_dsp_device_on(void);
+void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
+                            float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+void mcpx_apu_dsp_run_finalize(void);
+#endif
+
 /* Monitor (host output): call after each 32-sample frame; on the last frame
  * of an EP period it adds the software mixer and test tone to frame_buf and
  * hands those 256 samples to the device. */

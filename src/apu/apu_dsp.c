@@ -76,6 +76,12 @@ static void dsp_ack_init(void)
     char buf[256], *p, *end;
 
     s_dsp_ack_count = 0;
+#ifdef XBOXRECOMP_APU_DSP_DEVICE
+    /* RECOMP_APU_DSP=1 forced the ack to 0 for the GP, but the device kept
+     * the stub (no MCPX window): the default ack, or audio init hangs. */
+    if (recomp_env(RENV_APU_DSP))
+        spec = NULL;
+#endif
     if (!spec || !*spec)
         spec = "auto";                    /* default: derive it */
     if (!strcmp(spec, "0") || !strcmp(spec, "off"))
@@ -211,6 +217,11 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
 
+#ifdef XBOXRECOMP_APU_DSP_DEVICE
+    /* The GP's own program clears the doorbell (apu_dsp_run.c). */
+    if (mcpx_apu_dsp_device_on())
+        return;
+#endif
     if (s_dsp_ack_count < 0)
         dsp_ack_init();
     if (!d->ram_ptr)
@@ -260,6 +271,10 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
     d->gp.realtime = false;
     d->ep.realtime = false;
 
+#ifdef XBOXRECOMP_APU_DSP_DEVICE
+    if (mcpx_apu_dsp_device_on())
+        return;                  /* apu_dsp_run.c says so at the first frame */
+#endif
     fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
 }
 
@@ -268,6 +283,9 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
  * Safe to call twice. */
 void mcpx_apu_dsp_finalize(MCPXAPUState *d)
 {
+#ifdef XBOXRECOMP_APU_DSP_DEVICE
+    mcpx_apu_dsp_run_finalize();
+#endif
     free(d->gp.dsp);
     free(d->ep.dsp);
     d->gp.dsp = NULL;
@@ -341,6 +359,12 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
     dsp_bin_stats(d, mixbins);
+#ifdef XBOXRECOMP_APU_DSP_DEVICE
+    if (mcpx_apu_dsp_device_on()) {
+        mcpx_apu_dsp_run_frame(d, mixbins);
+        return;
+    }
+#endif
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         const int mode = mcpx_apu_mixdown_mode();

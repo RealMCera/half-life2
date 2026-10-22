@@ -146,6 +146,11 @@ int main(void)
           "mixbuf alias %06x %06x", x[0xC00], x[0xC21]);
     CHECK(apu_dsp_emu_read(e, APU_DSP_SPACE_X, APU_DSP_MIXBUF_BASE + 0x21) ==
               0x123456, "mixbuf read through X:$1421");
+    /* And the window's GPMIXBUF page has the frame's copy. */
+    uint32_t *mixwin = (uint32_t *)(win + APU_DSP_WIN_MIXBUF);
+    CHECK(mixwin[0] == 0x123456 && mixwin[0x21] == 0x123456 &&
+              mixwin[0x3FF] == x[0xFFF],
+          "GPMIXBUF page %06x %06x", mixwin[0], mixwin[0x21]);
 
     /* Frame 2: the host changes the program through the window, the ring
      * moves on to its second half. */
@@ -157,6 +162,8 @@ int main(void)
     CHECK(st.p_host_words == 1, "host P words %llu",
           (unsigned long long)st.p_host_words);
     CHECK(x[0xC00] == 0x654321, "patched program not run: %06x", x[0xC00]);
+    CHECK(mixwin[0] == 0x654321, "GPMIXBUF page not refreshed: %06x",
+          mixwin[0]);
     for (uint32_t i = 0; i < 4; i++)
         CHECK(x[0x100 + i] == (data[4 + i] & 0xFFFFFF), "ring X:%x = %06x",
               0x100 + i, x[0x100 + i]);
@@ -191,6 +198,7 @@ int main(void)
     x[0x10] = 0x10;
     x[0x11] = 0x9D0;
     uint64_t blocks = st.dma_blocks;
+    uint64_t repeats = st.trace_repeats;
     apu_dsp_emu_run_frame(e, CAP);
     apu_dsp_emu_get_stats(e, &st);
     CHECK(st.capped == 0, "frame 5 capped at pc %06x", st.pc);
@@ -199,6 +207,11 @@ int main(void)
     CHECK(st.dma_blocks - blocks == 0x800, "chain loop walked %llu",
           (unsigned long long)(st.dma_blocks - blocks));
     CHECK(x[0x203] == 0x80, "EOL after chain loop: %06x", x[0x203]);
+    /* The 0x800 walks of one descriptor, and the refused walk after them,
+     * take one trace entry, so the register writes before them stay in the
+     * ring for the reject log. */
+    CHECK(st.trace_repeats - repeats == 0x800, "trace folded %llu repeats",
+          (unsigned long long)(st.trace_repeats - repeats));
 
     /* GPRST cleared: held in reset, frames do nothing. */
     *(uint32_t *)(win + APU_DSP_WIN_RST) = 0;

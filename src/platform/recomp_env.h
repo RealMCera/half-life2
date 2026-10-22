@@ -117,7 +117,7 @@ extern "C" {
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
     X(AUDIO_BUF_COUNT,   CONFIG, "RECOMP_AUDIO_BUF_COUNT",   NULL, "audio output buffer count (default 4; XA2_NUM_BUFS_WINE under Wine)") \
     X(AUDIO_THREAD_PRIORITY, CONFIG, "RECOMP_AUDIO_THREAD_PRIORITY", NULL, "audio: APU frame thread priority (normal, highest; Windows only)") \
-    X(APU_DSP,           CONFIG, "RECOMP_APU_DSP",           NULL, "audio: 1 runs the APU's GP and EP on the DSP56300 JIT (builds with XBOXRECOMP_APU_DSP and its device), forcing apu_dsp_ack off and ignoring apu_mixdown_all; until the device is built in, 1 keeps the stub with a line; 0 (default): the stub") \
+    X(APU_DSP,           CONFIG, "RECOMP_APU_DSP",           NULL, "audio: 1 runs the APU's GP and EP on the DSP56300 JIT (builds with XBOXRECOMP_APU_DSP and its device), forcing apu_dsp_ack off and ignoring apu_mixdown_all; the stereo output is the GP's mixbuf bins 0/1; in a build without the device, 1 keeps the stub with a line; 0 (default): the stub") \
     X(CMDLINE,           CONFIG, "RECOMP_CMDLINE",           NULL, "launch-data command line handed to the title") \
     X(FMV_HOST,          CONFIG, "RECOMP_FMV_HOST",          NULL, "play the title's movies through the host player") \
     X(RASTER_THREADS,    CONFIG, "RECOMP_RASTER_THREADS",    NULL, "CPU raster threads, 1..16 (default: cores - 4)") \
@@ -199,6 +199,7 @@ extern "C" {
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \
     X(DSP_ACK,           DEBUG, "dsp_ack",         "RECOMP_DSP_ACK",           "=va,...: zero these words (no APU)") \
     X(APU_DSP_ACK,       DEBUG, "apu_dsp_ack",     "RECOMP_APU_DSP_ACK",       "=auto (default) | va,... | 0: APU DSP acks the GP doorbell (from GPSADDR), these words, or nothing") \
+    X(APU_DSP_STATS,     DEBUG, "apu_dsp_stats",   NULL,                       "one [APU DSP] line every 1500 APU frames: GP/EP frames, cycles, time, cap hits; warm-up skipped and late frames as totals (RECOMP_APU_DSP=1)") \
     X(APU_SOLO,          DEBUG, "apu_solo",        "RECOMP_APU_SOLO",          "=voice: mix only this APU voice") \
     X(APU_VOICE_DUMP,    DEBUG, "apu_voice_dump",  "RECOMP_APU_VOICE_DUMP",    "=voice|all: raw samples of one APU voice (all: every voice) to a file") \
     X(APU_VOICE_DUMP_FILE, DEBUG, "apu_voice_dump_file", "RECOMP_APU_VOICE_DUMP_FILE", "=path: apu_voice_dump output, default voice_dump.raw") \

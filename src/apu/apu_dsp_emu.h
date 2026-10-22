@@ -42,7 +42,7 @@ extern "C" {
  * a title's writes through the untrapped window are what the program sees. */
 #define APU_DSP_WINDOW_BYTES 0x10000u
 #define APU_DSP_WIN_X        0x0000u   /* X:0x000-0xFFF */
-#define APU_DSP_WIN_MIXBUF   0x5000u   /* GPMIXBUF, see apu_dsp_emu.c */
+#define APU_DSP_WIN_MIXBUF   0x5000u   /* GPMIXBUF: a GP frame's mixbuf copy */
 #define APU_DSP_WIN_Y        0x6000u   /* Y:0x000-0x7FF */
 #define APU_DSP_WIN_P        0xA000u   /* P:0x000-0xFFF */
 #define APU_DSP_WIN_RST      0xFFFCu   /* GPRST / EPRST */
@@ -89,6 +89,7 @@ typedef struct ApuDspEmuStats {
     uint64_t p_host_words;      /* P words the host changed in the window */
     uint64_t masked;            /* window words cut back to 24 bits */
     uint64_t bootstraps;
+    uint64_t trace_repeats;     /* DMA trace entries folded into the last */
     uint32_t pc;                /* PC after the last frame */
     uint32_t dma_control;       /* DMA control/status (bits 3-5) */
     uint32_t dma_next_block;

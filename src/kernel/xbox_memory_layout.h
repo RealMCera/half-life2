@@ -233,6 +233,10 @@ void xbox_PhysNoteRamName(uint32_t va);
  * no live heap block covers the page any more. Read without a lock; a device
  * model's view. */
 const volatile uint8_t *xbox_PhysRamNameMap(void);
+/* Host address of the MCPX window (guest 0xFE800000, the APU at +0), or NULL
+ * before the layout is up. The APU's DSP device runs its GP and EP on their
+ * pages of it (+0x30000, +0x50000), which the title writes untrapped. */
+void *xbox_McpxHost(void);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
