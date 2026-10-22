@@ -157,14 +157,11 @@ static int case_stale(void)
     nv2a_occ_flip(&s_o);
     CHECK(count_at(A) == 500 && status_at(A) == 0);
     CHECK(s_o.settled == 1 && s_o.stale == 1 && s_o.first == 0);
-    /* The late result: the report words stay as settled... */
+    /* The late result amends the settled report... */
     s_clock += 6000;
     nv2a_occ_poll(&s_o, 0);
-    CHECK(count_at(A) == 500 && status_at(A) == 0);
-    /* ...and a slot the title has reset stays reset. */
-    s_mem[A / 4 + 3] = 0xFFFFFFFFu;
-    nv2a_occ_poll(&s_o, 1);
-    CHECK(status_at(A) == 0xFFFFFFFFu);
+    CHECK(count_at(A) == 700 && status_at(A) == 0);
+    CHECK(s_o.amended == 1);
     CHECK(last_of(A, &c) && c == 700);
     CHECK(s_o.nret == 0);
     /* The next pending test at A reads the late count: one frame stale. */
@@ -172,6 +169,168 @@ static int case_stale(void)
     nv2a_occ_flip(&s_o);
     CHECK(count_at(A) == 700 && status_at(A) == 0);
     CHECK(s_o.stale == 2);
+    CHECK(drained());
+    return 0;
+}
+
+/* A slot the title has reset before the late result stays reset, and a
+ * slot a later GET_REPORT named keeps that test's count even when the
+ * words match what the settle wrote. */
+static int case_amend_guard(void)
+{
+    uint32_t c;
+    fresh();
+    vtest(A, 0, 500);
+    nv2a_occ_flip(&s_o);
+    vtest(A, 5000, 700);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(A) == 500 && status_at(A) == 0);
+    s_mem[A / 4 + 3] = 0xFFFFFFFFu;
+    s_clock += 6000;
+    nv2a_occ_poll(&s_o, 0);
+    CHECK(status_at(A) == 0xFFFFFFFFu && count_at(A) == 500);
+    CHECK(last_of(A, &c) && c == 700 && s_o.amended == 0);
+    CHECK(drained());
+
+    fresh();
+    vtest(B, 5000, 300);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(B) == NV2A_OCC_VISIBLE && s_o.first == 1);
+    /* The next test at B is in before the old result, with the visible
+     * count again: the old 300 must not land over it. */
+    vtest(B, 0, NV2A_OCC_VISIBLE);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(B) == NV2A_OCC_VISIBLE && status_at(B) == 0);
+    s_clock += 6000;
+    nv2a_occ_poll(&s_o, 0);
+    CHECK(count_at(B) == NV2A_OCC_VISIBLE && s_o.amended == 0);
+    CHECK(drained());
+    return 0;
+}
+
+/* Burnout 3's sun test: ten report slots in rotation, one a
+ * frame, each read nine frames after its GET_REPORT, results 12 ms late.
+ * Every report settles, the first ten as visible, but each read sees the
+ * true count. */
+static int case_rotation(void)
+{
+    enum { SLOTS = 10, SLOT0 = 0x800 };
+    int f;
+    fresh();
+    nv2a_occ_set_delay(&s_o, 12000);
+    for (f = 0; f < 40; f++) {
+        uint32_t va = SLOT0 + 16 * (uint32_t)(f % SLOTS);
+        if (f >= SLOTS) {
+            CHECK(status_at(va) == 0);
+            CHECK(count_at(va) == 200 + (uint32_t)(f - SLOTS));
+        }
+        vtest(va, 0, 200 + (uint64_t)f);
+        s_clock += 100;
+        nv2a_occ_flip(&s_o);
+        s_clock += 16600;
+        nv2a_occ_poll(&s_o, 0);
+    }
+    /* Only slot 0 has no count beside it; the rest settle beside. */
+    CHECK(s_o.settled == 40 && s_o.first == 1 && s_o.beside == SLOTS - 1);
+    CHECK(s_o.amended == 40);
+    CHECK(drained());
+    return 0;
+}
+
+/* A slot with no count of its own reads the youngest count beside it
+ * before its result is in, never visible; a slot far away still does. */
+static int case_near(void)
+{
+    enum { S0 = 0x800 };
+    fresh();
+    vtest(S0, 0, 300);
+    nv2a_occ_flip(&s_o);
+    s_clock += 16600;
+    vtest(S0 + 16, 0, 310);
+    nv2a_occ_flip(&s_o);
+    s_clock += 16600;
+    vtest(S0 + 32, 5000, 320);
+    vtest(S0 + 0x400, 5000, 330);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(S0 + 32) == 310 && status_at(S0 + 32) == 0);
+    CHECK(count_at(S0 + 0x400) == NV2A_OCC_VISIBLE);
+    CHECK(s_o.beside == 1 && s_o.first == 1 && s_o.stale == 0);
+    s_clock += 5000;
+    nv2a_occ_poll(&s_o, 0);
+    CHECK(count_at(S0 + 32) == 320 && count_at(S0 + 0x400) == 330);
+    CHECK(drained());
+    return 0;
+}
+
+/* A borrowed 0 is a count like any other: the sun hidden last flip stays
+ * hidden, and the late result still amends it. */
+static int case_near_zero(void)
+{
+    enum { S0 = 0x800 };
+    fresh();
+    vtest(S0, 0, 0);
+    nv2a_occ_flip(&s_o);
+    s_clock += 16600;
+    vtest(S0 + 16, 5000, 40);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(S0 + 16) == 0 && status_at(S0 + 16) == 0);
+    CHECK(s_o.beside == 1 && s_o.first == 0);
+    s_clock += 5000;
+    nv2a_occ_poll(&s_o, 0);
+    CHECK(count_at(S0 + 16) == 40 && s_o.amended == 1);
+    CHECK(drained());
+    return 0;
+}
+
+/* Several objects tested beside each other every flip (JSRF's lights,
+ * SSX 3's flares): a new slot among them borrows from none, whether their
+ * counts are in or still pending, and settles to visible. */
+static int case_crowd(void)
+{
+    enum { S0 = 0x800 };
+    int f;
+    fresh();
+    for (f = 0; f < 4; f++) {
+        vtest(S0, 0, 400);
+        vtest(S0 + 16, 0, 0);           /* hidden */
+        nv2a_occ_flip(&s_o);
+        s_clock += 16600;
+    }
+    vtest(S0, 0, 400);
+    vtest(S0 + 16, 0, 0);
+    vtest(S0 + 32, 5000, 50);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(S0 + 32) == NV2A_OCC_VISIBLE && s_o.beside == 0);
+    s_clock += 16600;
+    /* The same with the neighbours' results still out. */
+    vtest(S0, 5000, 400);
+    vtest(S0 + 16, 5000, 0);
+    vtest(S0 + 48, 5000, 60);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(S0 + 48) == NV2A_OCC_VISIBLE && s_o.beside == 0);
+    CHECK(count_at(S0 + 16) == 0 && s_o.stale == 2);
+    CHECK(drained());
+    return 0;
+}
+
+/* retired[] full: the oldest settled report goes, and its late result
+ * never amends the slot. */
+static int case_retired_full(void)
+{
+    enum { S0 = 0x100 };
+    int k;
+    fresh();
+    for (k = 0; k <= NV2A_OCC_PENDING; k++) {
+        vtest(S0 + 16 * (uint32_t)k, 5000, 70);
+        nv2a_occ_flip(&s_o);
+    }
+    CHECK(s_o.ret_drop == 1 && s_o.nret == NV2A_OCC_PENDING);
+    CHECK(count_at(S0) == NV2A_OCC_VISIBLE);
+    s_clock += 5000;
+    nv2a_occ_poll(&s_o, 0);
+    CHECK(count_at(S0) == NV2A_OCC_VISIBLE);
+    CHECK(count_at(S0 + 16) == 70 && count_at(S0 + 16 * NV2A_OCC_PENDING) == 70);
+    CHECK(s_o.amended == NV2A_OCC_PENDING);
     CHECK(drained());
     return 0;
 }
@@ -368,6 +527,8 @@ static int case_scale(void)
     s_clock += 10000;
     nv2a_occ_poll(&s_o, 1);
     CHECK(last_of(A, &c) && c == 500);
+    /* The armed report went with its queries: no amend over the settle. */
+    CHECK(count_at(A) == 500 && s_o.amended == 0);
     CHECK(drained());
     return 0;
 }
@@ -400,6 +561,12 @@ int main(void)
         { "ready at the flip", case_ready },
         { "pending at the flip, with history", case_stale },
         { "pending, no history", case_first },
+        { "the amend keeps a reset or reused slot", case_amend_guard },
+        { "rotating slots read late", case_rotation },
+        { "a count from the slot beside", case_near },
+        { "a borrowed count of 0", case_near_zero },
+        { "no borrow among tests beside each other", case_crowd },
+        { "retired full drops an armed report", case_retired_full },
         { "settled after a walk", case_walk },
         { "superseded within a frame", case_supersede },
         { "overflow and late", case_overflow_late },

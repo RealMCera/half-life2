@@ -1128,9 +1128,29 @@ void nv2a_report_set_pending(uint8_t *mem, uint32_t va);
  * gives exact counts and one far behind pays at most that per frame. 8 ms,
  * as Metal's stage1 results often land 2-8 ms after the walk and D3D11's
  * within 2 ms; the wait ends when they do. The address's last count is what
- * a lagging GPU can give: at most one frame stale. A settled report keeps its queries on retired[]; a late result
- * there only updates the address's last count and is never written, so a
- * slot the title has since reset for its next test stays reset.
+ * a lagging GPU can give: at most one frame stale when the title reuses one
+ * address a frame. A settled report keeps its queries on retired[]; when the
+ * late result comes in it updates the address's last count and amends the
+ * report: the true count replaces the settled one, but only while the slot
+ * still holds what the settle wrote (status 0, the same count) and no later
+ * GET_REPORT has named the address. A slot the title has reset for its next
+ * test stays reset. Burnout 3 needs the amend: it rotates its sun
+ * test over ten report slots and reads each one frames after its GET_REPORT,
+ * as the console allows, so with no amend it read the settle's value, and at
+ * the start of every sun shot (no count for those slots within
+ * NV2A_OCC_LATE_US) that was NV2A_OCC_VISIBLE, hundreds of times the sun's
+ * true count: the lens-flare rings drew at full strength. A slot with no
+ * count of its own within NV2A_OCC_LATE_US settles to the youngest count of
+ * a slot beside it (within NV2A_OCC_NEAR) before falling back to visible, so
+ * a read that comes before the amend sees the previous flip's sun, not
+ * NV2A_OCC_VISIBLE. B3 reads some slots before the late result lands, so
+ * the amend alone still left 148 flare frames in the delayed A/B where the
+ * borrow brings it to 3 (one with no delay): the borrow carries most of the
+ * fix. It applies only to one test rotating: when another report within
+ * NV2A_OCC_NEAR is pending in the same settle or was issued in the same
+ * flip, the slots hold different objects at once (JSRF's lights, SSX 3's
+ * flares), a neighbour's count says nothing about this one, and the
+ * report settles to visible as before.
  * One window is accepted: a title that reset the slot for frame N+1 before
  * frame N's report settles reads frame N's count where the console would
  * read incomplete; the next GET_REPORT makes it pending again.
@@ -1144,6 +1164,7 @@ void nv2a_report_set_pending(uint8_t *mem, uint32_t va);
 #define NV2A_OCC_LAST     64        /* report addresses with a last count */
 #define NV2A_OCC_AGES     8         /* result-age histogram buckets */
 #define NV2A_OCC_SETTLE_US 8000u    /* settle wait budget a frame, default */
+#define NV2A_OCC_NEAR     0x100u    /* "beside": report slots this close */
 
 struct nv2a_occ_ops {
     void *(*get)(void *ctx);                        /* NULL if none */
@@ -1160,15 +1181,20 @@ struct nv2a_occ_report {
     uint32_t va;
     int      n, overflow;
     uint64_t t0;
+    uint64_t flip;                      /* o->flips at GET_REPORT */
+    /* Retired: the count the settle wrote, and whether a late result may
+     * still amend the report (no GET_REPORT at va since). */
+    uint32_t settled;
+    int      amend;
     void    *q[NV2A_OCC_SEG];
 };
 
 /* The last completed count at a report address, guest size (after the
- * render-scale division), and the push time of the report it came from, so
- * a late result never replaces a newer one. */
+ * render-scale division), and the push time and flip of the report it came
+ * from, so a late result never replaces a newer one. */
 struct nv2a_occ_last {
     uint32_t va, count;
-    uint64_t t0;
+    uint64_t t0, flip;
 };
 
 struct nv2a_occ {
@@ -1178,8 +1204,8 @@ struct nv2a_occ {
     int      nseg, open, en, ovf;
     struct nv2a_occ_report pend[NV2A_OCC_PENDING];
     int      npend;
-    /* Settled, their queries still out: a result updates last[] only. The
-     * oldest is dropped unread when full. */
+    /* Settled, their queries still out: a result updates last[] and amends
+     * the report (see above). The oldest is dropped unread when full. */
     struct nv2a_occ_report retired[NV2A_OCC_PENDING];
     int      nret;
     struct nv2a_occ_last last[NV2A_OCC_LAST];
@@ -1188,10 +1214,13 @@ struct nv2a_occ {
      * and settles included), late fallbacks, superseded, and microseconds
      * waited in sync mode. */
     uint64_t reports, vis, late, super, sync_us;
-    /* Settled (stale: with the address's last count; first: no count yet,
-     * visible), retired results dropped unread, and microseconds waited
+    /* Settled (stale: with the address's last count; beside: with the
+     * youngest count of a slot beside it; first: no count yet, visible),
+     * retired results dropped unread, and microseconds waited
      * before settling (settle_us), in all and in the current frame. */
     uint64_t settled, stale, first, ret_drop, settle_wait_us, frame_wait_us;
+    /* Settled reports a late result amended. */
+    uint64_t amended, beside;
     /* nv2a_occ_flip calls, and the age (GET_REPORT to the poll that found
      * it) of every result taken: <1, <2, <4, <8, <16, <33, <66, >=66 ms. */
     uint64_t flips, age[NV2A_OCC_AGES];
