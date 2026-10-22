@@ -58,6 +58,43 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
     return 1;
 }
 
+int nv2a_aspect_screen_quad(const uint32_t prog[][4], uint32_t start, float c[][4],
+                            const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                            float (*xy)[2], float *lo, float *hi)
+{
+    float in[NV2A_VSH_INPUTS][4], w0 = 0.0f;
+    Nv2aVshOut out;
+    uint32_t j;
+    unsigned k;
+
+    if (!count || count > NV2A_ASPECT_QUAD_MAX)
+        return 0;
+    for (j = 0; j < count; j++) {
+        const float *p;
+        memset(in, 0, sizeof in);
+        for (k = 0; k < nf4; k++)
+            if (slot[k] >= 0 && slot[k] < NV2A_VSH_INPUTS)
+                memcpy(in[slot[k]], vf + ((size_t)j * nf4 + k) * 4u, 16);
+        nv2a_vsh_run((const uint32_t (*)[4])prog, start, (float (*)[4])c, 0,
+                     (const float (*)[4])in, &out);
+        if (!out.ok)
+            return 0;
+        p = out.o[NV2A_VSH_O_POS];
+        if (j == 0 ? !(p[3] > 0.0f && isfinite(p[3])) : p[3] != w0)
+            return 0;
+        xy[j][0] = p[0];
+        xy[j][1] = p[1];
+        if (j == 0) {
+            w0 = p[3];
+            *lo = *hi = p[0];
+        } else {
+            if (p[0] < *lo) *lo = p[0];
+            if (p[0] > *hi) *hi = p[0];
+        }
+    }
+    return 1;
+}
+
 int nv2a_aspect_full_tris(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
                           uint32_t w)
 {

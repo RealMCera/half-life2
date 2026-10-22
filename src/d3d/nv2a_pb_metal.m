@@ -2250,12 +2250,24 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     s_rtt_binds++;
                 } else {
                     stex[k] = tex_bind(t);
-                    if (nv2a_aspect_picture(t->width, rt->w))
+                    if (nv2a_aspect_picture(t->width, rt->w, bump_src >> k & 1))
                         guest_tex = 1;
                 }
             }
             if (textured)
                 s_draws_tex++;
+        }
+        /* Hor+: a perspective screen quad over padded targets is a
+         * full-width pass too (nv2a_aspect_screen_quad). */
+        if (rt->pad && d->program && ve && topo == NV2A_TOPO_TRIANGLES && !two_d
+            && nv2a_aspect_quad_ok(srcs[0] || srcs[1] || srcs[2] || srcs[3], flat_rt, guest_tex)) {
+            float qxy[NV2A_ASPECT_QUAD_MAX][2];
+            if (nv2a_aspect_screen_quad((const uint32_t (*)[4])v->prog, v->start,
+                                        (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, count,
+                                        qxy, &lo_x, &hi_x)
+                && nv2a_aspect_quad_span(lo_x, hi_x, rt->w)
+                && nv2a_aspect_full_tris((const float (*)[2])qxy, idx, nidx / 3u, rt->w))
+                two_d = full_w = 1;
         }
         /* A square target is a reflection, glow or shadow map, never a
          * movie: display.movie applies to the frame only. */

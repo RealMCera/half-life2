@@ -325,8 +325,11 @@ int main(void)
         CHECK(nv2a_rt_no_alpha(0x11) && nv2a_rt_no_alpha(0x1E) && !nv2a_rt_no_alpha(0x12));
         /* The 16x16 fade texture is no picture; a 1024-wide movie frame and
          * a 256-wide backdrop are. */
-        CHECK(!nv2a_aspect_picture(16, 640) && !nv2a_aspect_picture(160, 640));
-        CHECK(nv2a_aspect_picture(1024, 640) && nv2a_aspect_picture(256, 640));
+        CHECK(!nv2a_aspect_picture(16, 640, 0) && !nv2a_aspect_picture(160, 640, 0));
+        CHECK(nv2a_aspect_picture(1024, 640, 0) && nv2a_aspect_picture(256, 640, 0));
+        /* A bump stage's offset map is none, whatever its size (JSRF's
+         * Can boost tint warps through a 256-wide one). */
+        CHECK(!nv2a_aspect_picture(256, 640, 1) && !nv2a_aspect_picture(1024, 640, 1));
         /* Screen layers: w 1, the stage HUD's fixed depths 2 and 3 and the
          * title movie's 100; a world sprite's depth is no exact whole
          * number. */
@@ -397,6 +400,95 @@ int main(void)
         CHECK(nv2a_aspect_scan(&g, (const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot, 4,
                                NULL, &lo, &hi) == 1);                    /* the 256th */
         CHECK(g.two_d == 1);
+    }
+
+    /* ---- hor+ screen quad: a perspective program's quad at one w ---- */
+    {
+        /* JSRF's Can boost lays its 512 square over the frame with four
+         * vertices at w 0.836 from a program that also draws the world. */
+        static uint32_t prog[NV2A_VSH_SLOTS][4];
+        static float cst[NV2A_VSH_CONSTANTS][4];
+        float vf[7][4] = { { 0.53f, 0.53f, 5e6f, 0.83617f }, { 640.53f, 0.53f, 5e6f, 0.83617f },
+                           { 0.53f, 480.53f, 5e6f, 0.83617f }, { 640.53f, 480.53f, 5e6f, 0.83617f },
+                           { 0, 0, 0, 0.83617f }, { 0, 0, 0, 0.83617f }, { 0, 0, 0, 0.83617f } };
+        float xy[NV2A_ASPECT_QUAD_MAX][2], lo = 0, hi = 0;
+        uint32_t idx[6] = { 0, 1, 2, 1, 3, 2 };
+        int slot[1] = { 0 };
+        struct nv2a_aspect_gate g = { 0, 300 };   /* a 3D program, gate not due */
+        unsigned i;
+
+        prog[0][1] = (1u << 21) | 0x1Bu;
+        prog[0][2] = 2u << 26;
+        prog[0][3] = (0xFu << 12) | (1u << 11) | 1u;
+        CHECK(!nv2a_aspect_due(&g));
+        CHECK(nv2a_aspect_scan(&g, (const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot, 4,
+                               NULL, &lo, &hi) == 0);
+        CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot,
+                                      4, xy, &lo, &hi) == 1);
+        CHECK(lo == 0.53f && hi == 640.53f && xy[3][1] == 480.53f);
+        CHECK(nv2a_aspect_quad_span(lo, hi, 640)
+              && nv2a_aspect_full_tris((const float (*)[2])xy, idx, 2, 640));
+        /* so, sampling only padded targets, it is stretched */
+        CHECK(nv2a_aspect_quad_ok(1, 0, 0));
+        CHECK(nv2a_aspect_place(1, 1, 0, 0, NV2A_MOVIE_BLACK) == NV2A_PLACE_STRETCH);
+        /* Stages that rule it out: nothing padded sampled, an unpadded
+         * target, a guest picture. */
+        CHECK(!nv2a_aspect_quad_ok(0, 0, 0) && !nv2a_aspect_quad_ok(1, 1, 0)
+              && !nv2a_aspect_quad_ok(1, 0, 1));
+        /* A camera-facing world quad overhanging both edges (a haze plane)
+         * spans the width but is no frame-sized pass. */
+        CHECK(nv2a_aspect_full_width(-40.0f, 700.0f, 640) && !nv2a_aspect_quad_span(-40.0f, 700.0f, 640));
+        CHECK(!nv2a_aspect_quad_span(-3.0f, 640.0f, 640) && !nv2a_aspect_quad_span(0.0f, 643.0f, 640));
+        CHECK(nv2a_aspect_quad_span(-2.0f, 642.0f, 640));
+        {
+            /* The same quad from vertices, overhanging. */
+            float ov[4][4] = { { -40, 0, 0, 0.83617f }, { 700, 0, 0, 0.83617f },
+                               { -40, 480, 0, 0.83617f }, { 700, 480, 0, 0.83617f } };
+            CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &ov[0][0], 1, slot,
+                                          4, xy, &lo, &hi) == 1);
+            CHECK(!nv2a_aspect_quad_span(lo, hi, 640));
+        }
+        {
+            /* A lens-flare sprite: a small quad at one fractional w, a
+             * screen quad by w alone, but not full width. */
+            float fl[4][4] = { { 300, 200, 0, 0.71f }, { 340, 200, 0, 0.71f },
+                               { 300, 240, 0, 0.71f }, { 340, 240, 0, 0.71f } };
+            CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &fl[0][0], 1, slot,
+                                          4, xy, &lo, &hi) == 1);
+            CHECK(!nv2a_aspect_quad_span(lo, hi, 640));
+        }
+        {
+            /* Two corner triangles at one w: their union spans the frame,
+             * neither triangle does. */
+            float ct[6][4] = { { 0, 0, 0, 0.9f }, { 120, 0, 0, 0.9f }, { 0, 90, 0, 0.9f },
+                               { 640, 480, 0, 0.9f }, { 520, 480, 0, 0.9f }, { 640, 390, 0, 0.9f } };
+            uint32_t cidx[6] = { 0, 1, 2, 3, 4, 5 };
+            CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &ct[0][0], 1, slot,
+                                          6, xy, &lo, &hi) == 1);
+            CHECK(nv2a_aspect_quad_span(lo, hi, 640)
+                  && !nv2a_aspect_full_tris((const float (*)[2])xy, cidx, 2, 640));
+        }
+        /* More than NV2A_ASPECT_QUAD_MAX vertices: not a quad. */
+        CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot,
+                                      7, xy, &lo, &hi) == 0);
+        /* A depth per vertex: 3D. */
+        vf[2][3] = 0.9f;
+        CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot,
+                                      4, xy, &lo, &hi) == 0);
+        /* Behind the eye (w <= 0): not a screen quad. */
+        for (i = 0; i < 4; i++)
+            vf[i][3] = -1.0f;
+        CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot,
+                                      4, xy, &lo, &hi) == 0);
+        /* A w of NaN or infinity: not a screen quad. */
+        for (i = 0; i < 4; i++)
+            vf[i][3] = NAN;
+        CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot,
+                                      4, xy, &lo, &hi) == 0);
+        for (i = 0; i < 4; i++)
+            vf[i][3] = INFINITY;
+        CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot,
+                                      4, xy, &lo, &hi) == 0);
     }
 
     /* ---- present rectangle ---- */

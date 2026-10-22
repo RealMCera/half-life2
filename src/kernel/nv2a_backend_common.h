@@ -1478,10 +1478,13 @@ static inline int nv2a_aspect_full_width(float lo_x, float hi_x, uint32_t w)
  * One at most a quarter of the frame's width is magnified 4x or more over
  * it: a flat colour or a gradient, which is a fade (BLiNX 2 fades through
  * a 16x16 white texture, every frame of a stage), and a fade is stretched
- * like an untextured one so the pads fade too. */
-static inline int nv2a_aspect_picture(uint32_t tex_w, uint32_t w)
+ * like an untextured one so the pads fade too. Nor is a bump stage's
+ * offset map (bump_src: the stage is in nv2a_bump_sources), whatever its
+ * size: JSRF's Can boost warps its blurred square over the frame through a
+ * 256 wide one. */
+static inline int nv2a_aspect_picture(uint32_t tex_w, uint32_t w, int bump_src)
 {
-    return tex_w * 4u > w;
+    return !bump_src && tex_w * 4u > w;
 }
 
 /* Whether a program vertex's oPos.w puts it on a screen layer. oPos.xy
@@ -1581,6 +1584,41 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
                      const uint32_t prog[][4], uint32_t start, float c[][4],
                      const float *vf, unsigned nf4, const int *slot, uint32_t count,
                      float (*xy)[2], float *lo, float *hi);
+
+/* A screen quad through a perspective program: count (at most
+ * NV2A_ASPECT_QUAD_MAX) vertices that all share one positive oPos.w, run
+ * without the gate, their x, y in xy and x range in *lo, *hi. JSRF's Can
+ * boost renders the world into 512 and 128 squares and lays them over the
+ * frame with a quad of four vertices at one w that is not a whole number
+ * (0.836, 1.413), from a program that also draws the world, so neither
+ * nv2a_aspect_layer_w nor the gate catches it. The caller takes it as 2D
+ * only when its stages pass nv2a_aspect_quad_ok, its x range
+ * nv2a_aspect_quad_span and one triangle nv2a_aspect_full_tris: a sprite
+ * in the world shares one w too, but it does not read the frame or a
+ * square across exactly the frame's width. Returns 1 for a quad of one
+ * positive finite w, its positions in xy and x range in lo..hi. */
+#define NV2A_ASPECT_QUAD_MAX 6u
+
+/* Whether a batch's stages let it be a screen quad: it samples a padded
+ * render target (padded_rt) and nothing nv2a_aspect_place would centre for
+ * (flat_rt, guest_tex). */
+static inline int nv2a_aspect_quad_ok(int padded_rt, int flat_rt, int guest_tex)
+{
+    return padded_rt && !flat_rt && !guest_tex;
+}
+
+/* Whether a screen quad's x range lo..hi covers the w-wide frame and no
+ * more (2 pixels of slack each side). A pass laid over the frame is
+ * exactly frame-sized (JSRF's spans 0.53..640.53); a camera-facing quad in
+ * the world (a haze plane, a near sprite) that overhangs both edges is not
+ * one and keeps its place. */
+static inline int nv2a_aspect_quad_span(float lo_x, float hi_x, uint32_t w)
+{
+    return nv2a_aspect_full_width(lo_x, hi_x, w) && lo_x >= -2.0f && hi_x <= (float)w + 2.0f;
+}
+int nv2a_aspect_screen_quad(const uint32_t prog[][4], uint32_t start, float c[][4],
+                            const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                            float (*xy)[2], float *lo, float *hi);
 
 /* Whether one triangle of a 2D triangle list (ntri triangles, idx into xy)
  * spans the w-wide frame (nv2a_aspect_full_width). A batch's bounds are not

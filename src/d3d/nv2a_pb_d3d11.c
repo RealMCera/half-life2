@@ -2271,7 +2271,37 @@ struct aspect_batch {
     int two_d, full_w;
     int place;          /* nv2a_aspect_place */
     int guest_tex;      /* a stage samples a guest picture (nv2a_aspect_picture) */
+    /* A small 3D program triangle batch on a padded target, which
+     * setup_pixel checks for a screen quad (nv2a_aspect_screen_quad) once
+     * it knows the stages sample padded targets; NULL d for any other. */
+    const struct nv2a_pb_draw *d;
+    const VsEntry *vs;
+    const uint32_t *idx;
+    uint32_t lo, count, nidx;
+    float lo_x, hi_x;
 };
+
+/* Whether hp's batch is a full-width screen quad (nv2a_aspect_screen_quad),
+ * its x range then in hp->lo_x, hi_x. */
+static int aspect_quad(struct aspect_batch *hp, const struct nv2a_pb_vsh *v, uint32_t w)
+{
+    float vf[NV2A_ASPECT_QUAD_MAX * NV2A_VS_MAX_INPUTS * 4], xy[NV2A_ASPECT_QUAD_MAX][2];
+    int slot[NV2A_VS_MAX_INPUTS];
+    unsigned nf4 = 0, i;
+    uint32_t k;
+
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+        if (hp->vs->inputs & (1u << i))
+            slot[nf4++] = (int)i;
+    for (k = 0; k < hp->count; k++)
+        for (i = 0; i < nf4; i++)
+            vtx_input(hp->d, v, (unsigned)slot[i], hp->lo + k, vf + ((size_t)k * nf4 + i) * 4u);
+    return nv2a_aspect_screen_quad((const uint32_t (*)[4])v->prog, v->start,
+                                   (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, hp->count,
+                                   xy, &hp->lo_x, &hp->hi_x)
+           && nv2a_aspect_quad_span(hp->lo_x, hp->hi_x, w)
+           && nv2a_aspect_full_tris((const float (*)[2])xy, hp->idx, hp->nidx / 3u, w);
+}
 
 static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
 {
@@ -2322,15 +2352,22 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
     }
     hp->place = NV2A_PLACE_CENTRE;
     if (s_cur && s_cur->pad) {
-        int guest_tex = 0, flat_rt = 0;
+        int guest_tex = 0, flat_rt = 0, padded_rt = 0;
         for (n = 0; n < 4; n++) {
             if (s_stage[n].mode && s_stage[n].mode != 4 && !s_stage_rt[n]
-                && nv2a_aspect_picture(s_stage[n].width, s_cur->w))
+                && nv2a_aspect_picture(s_stage[n].width, s_cur->w, bump_src >> n & 1))
                 guest_tex = 1;
             if (s_stage_rt[n] && !s_stage_rt[n]->pad)
                 flat_rt = 1;
+            if (s_stage_rt[n] && s_stage_rt[n]->pad)
+                padded_rt = 1;
         }
         hp->guest_tex = guest_tex;
+        /* A perspective screen quad over padded targets is a full-width
+         * pass too (nv2a_aspect_screen_quad), as in metal_on_draw. */
+        if (hp->d && !hp->two_d && nv2a_aspect_quad_ok(padded_rt, flat_rt, guest_tex)
+            && aspect_quad(hp, v, s_cur->w))
+            hp->two_d = hp->full_w = 1;
         /* A square target is a reflection, glow or shadow map, never a
          * movie: display.movie applies to the frame only. */
         hp->place = nv2a_aspect_place(hp->two_d, hp->full_w, guest_tex, flat_rt,
@@ -3079,7 +3116,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     static size_t hvf_cap;
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
-    struct aspect_batch hp = {0, 0, NV2A_PLACE_CENTRE, 0};
+    struct aspect_batch hp = {0, 0, NV2A_PLACE_CENTRE, 0, NULL};
     int have_x = 0, tris = 0;
     float lo_x = 0, hi_x = 0;      /* hor+: a 2D batch's x range, surface pixels */
     D3D11_PRIMITIVE_TOPOLOGY topo;
@@ -3299,6 +3336,15 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         hp.full_w = nv2a_aspect_full_width(lo_x, hi_x, rt->w)
                     && (!tris || nv2a_aspect_full_tris((const float (*)[2])hxy, idx,
                                                        nidx / 3u, rt->w));
+    else if (rt->pad && d->program && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+             && count <= NV2A_ASPECT_QUAD_MAX) {
+        hp.d = d;
+        hp.vs = vs;
+        hp.idx = idx;
+        hp.lo = lo;
+        hp.count = count;
+        hp.nidx = nidx;
+    }
 
     /* Constants: the program's c[192] at b1. The pixels->NDC mapping at b2
      * waits for the placement (setup_pixel, below). */
@@ -3408,6 +3454,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         }
         if (hp.place != NV2A_PLACE_CENTRE)
             s_draws_stretch++;
+        if (hp.two_d && !have_x) {
+            lo_x = hp.lo_x;     /* a screen quad (aspect_quad) */
+            hi_x = hp.hi_x;
+        }
         if (hp.two_d && rt->pad && aspect_trace())
             aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place);
         set_vp(v, g, rt, hp.place, hp.two_d, cb);
