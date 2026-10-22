@@ -1620,6 +1620,53 @@ int nv2a_aspect_screen_quad(const uint32_t prog[][4], uint32_t start, float c[][
                             const float *vf, unsigned nf4, const int *slot, uint32_t count,
                             float (*xy)[2], float *lo, float *hi);
 
+/* The thirds of a w x h frame a letterbox band lies in (nv2a_aspect_third). */
+#define NV2A_BAND_TOP 1u
+#define NV2A_BAND_BOT 2u
+
+/* Which third a screen quad (n vertices at xy, finite, within the frame's
+ * height with 2 pixels of slack) lies wholly in: NV2A_BAND_TOP,
+ * NV2A_BAND_BOT or 0. The bottom third, not quarter: Burnout 3's crash-cam
+ * list backing has a raised right end that starts at y 349. */
+unsigned nv2a_aspect_third(const float (*xy)[2], uint32_t n, uint32_t h);
+
+/* A target's band bars: stamp[t] is the flip (plus one, 0 for never) in
+ * which a full-width screen quad lying in third t (nv2a_aspect_third) was
+ * stretched on it. nv2a_aspect_bars gives the thirds stamped this flip or
+ * the last, so a piece drawn before its bar in a flip still finds it. */
+static inline void nv2a_aspect_bar_mark(uint32_t stamp[2], unsigned third, uint32_t flips)
+{
+    if (third & NV2A_BAND_TOP)
+        stamp[0] = flips + 1u;
+    if (third & NV2A_BAND_BOT)
+        stamp[1] = flips + 1u;
+}
+static inline unsigned nv2a_aspect_bars(const uint32_t stamp[2], uint32_t flips)
+{
+    return (stamp[0] && flips + 1u - stamp[0] <= 1u ? NV2A_BAND_TOP : 0u)
+           | (stamp[1] && flips + 1u - stamp[1] <= 1u ? NV2A_BAND_BOT : 0u);
+}
+
+/* Whether a screen quad (nv2a_aspect_screen_quad, n vertices at xy) drawn
+ * with the depth test off, over no guest picture or unpadded target, is a
+ * piece of a letterbox band on a w x h frame: it keeps within the frame's
+ * width, reaches its left or right edge, and lies in a third that holds a
+ * stretched bar (bars, nv2a_aspect_bars). Such a piece is stretched with
+ * the band. Burnout 3's crash cam draws its bars, their thin edge lines
+ * and the list backing as quads at one fractional w (24.37) from the
+ * program that draws its HUD: each bar spans the frame, but each line is
+ * two half-width quads drawn apart and the backing samples a 32x32
+ * texture, so only the bars passed as full-width passes and the rest
+ * stayed 4:3 inside them. A stretch is one map about the frame's centre,
+ * so pieces that met at stock still meet. Without the bar the rule takes
+ * the front end's menu frame too: its header strips and bottom rule reach
+ * an edge at the same w and broke away into the pads. Text and icons
+ * inside the band reach neither edge and keep their place, unless they
+ * sample a texture at most a quarter of the frame's width
+ * (nv2a_aspect_picture) and touch an edge; lens flares likewise keep their
+ * place unless one touches an edge inside a band. */
+int nv2a_aspect_band(const float (*xy)[2], uint32_t n, uint32_t w, uint32_t h, unsigned bars);
+
 /* Whether one triangle of a 2D triangle list (ntri triangles, idx into xy)
  * spans the w-wide frame (nv2a_aspect_full_width). A batch's bounds are not
  * enough: BLiNX 2 draws its blue corner triangles, one in each corner, as

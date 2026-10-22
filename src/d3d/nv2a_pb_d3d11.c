@@ -228,6 +228,7 @@ typedef struct {
     uint32_t                pitch;      /* the guest pitch it was made with */
     uint32_t                fmt;        /* the SET_SURFACE_FORMAT word it was drawn with */
     struct nv2a_rt_own      own;        /* is the guest memory under it still its own */
+    uint32_t                bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
 } RenderTarget;
 
 typedef struct nv2a_stage Stage;
@@ -2281,9 +2282,13 @@ struct aspect_batch {
     float lo_x, hi_x;
 };
 
-/* Whether hp's batch is a full-width screen quad (nv2a_aspect_screen_quad),
- * its x range then in hp->lo_x, hi_x. */
-static int aspect_quad(struct aspect_batch *hp, const struct nv2a_pb_vsh *v, uint32_t w)
+/* Whether hp's batch is a full-width screen quad (nv2a_aspect_screen_quad;
+ * quad: the stages allow one), which marks its third on rt as holding a
+ * bar, or a piece of a letterbox band (nv2a_aspect_band; band: the stages
+ * and depth allow one, in the thirds bars), its x range then in hp->lo_x,
+ * hi_x. */
+static int aspect_quad(struct aspect_batch *hp, const struct nv2a_pb_vsh *v, RenderTarget *rt,
+                       int quad, unsigned bars)
 {
     float vf[NV2A_ASPECT_QUAD_MAX * NV2A_VS_MAX_INPUTS * 4], xy[NV2A_ASPECT_QUAD_MAX][2];
     int slot[NV2A_VS_MAX_INPUTS];
@@ -2296,11 +2301,18 @@ static int aspect_quad(struct aspect_batch *hp, const struct nv2a_pb_vsh *v, uin
     for (k = 0; k < hp->count; k++)
         for (i = 0; i < nf4; i++)
             vtx_input(hp->d, v, (unsigned)slot[i], hp->lo + k, vf + ((size_t)k * nf4 + i) * 4u);
-    return nv2a_aspect_screen_quad((const uint32_t (*)[4])v->prog, v->start,
-                                   (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, hp->count,
-                                   xy, &hp->lo_x, &hp->hi_x)
-           && nv2a_aspect_quad_span(hp->lo_x, hp->hi_x, w)
-           && nv2a_aspect_full_tris((const float (*)[2])xy, hp->idx, hp->nidx / 3u, w);
+    if (!nv2a_aspect_screen_quad((const uint32_t (*)[4])v->prog, v->start,
+                                 (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, hp->count, xy,
+                                 &hp->lo_x, &hp->hi_x))
+        return 0;
+    if (quad && nv2a_aspect_quad_span(hp->lo_x, hp->hi_x, rt->w)
+        && nv2a_aspect_full_tris((const float (*)[2])xy, hp->idx, hp->nidx / 3u, rt->w)) {
+        nv2a_aspect_bar_mark(rt->bar_flip,
+                             nv2a_aspect_third((const float (*)[2])xy, hp->count, rt->h),
+                             nv2a_pb_gpu_state()->flips);
+        return 1;
+    }
+    return bars && nv2a_aspect_band((const float (*)[2])xy, hp->count, rt->w, rt->h, bars);
 }
 
 static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
@@ -2364,10 +2376,18 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         }
         hp->guest_tex = guest_tex;
         /* A perspective screen quad over padded targets is a full-width
-         * pass too (nv2a_aspect_screen_quad), as in metal_on_draw. */
-        if (hp->d && !hp->two_d && nv2a_aspect_quad_ok(padded_rt, flat_rt, guest_tex)
-            && aspect_quad(hp, v, s_cur->w))
-            hp->two_d = hp->full_w = 1;
+         * pass too (nv2a_aspect_screen_quad) and marks its third as
+         * holding a bar; one drawn without depth in such a third is
+         * stretched as a piece of a letterbox band (nv2a_aspect_band), as
+         * in metal_on_draw. */
+        if (hp->d && !hp->two_d) {
+            int quad = nv2a_aspect_quad_ok(padded_rt, flat_rt, guest_tex);
+            unsigned bars = v->depth_enable || flat_rt || guest_tex
+                                ? 0u
+                                : nv2a_aspect_bars(s_cur->bar_flip, nv2a_pb_gpu_state()->flips);
+            if ((quad || bars) && aspect_quad(hp, v, s_cur, quad, bars))
+                hp->two_d = hp->full_w = 1;
+        }
         /* A square target is a reflection, glow or shadow map, never a
          * movie: display.movie applies to the frame only. */
         hp->place = nv2a_aspect_place(hp->two_d, hp->full_w, guest_tex, flat_rt,

@@ -107,3 +107,49 @@ int nv2a_aspect_full_tris(const float (*xy)[2], const uint32_t *idx, uint32_t nt
     }
     return 0;
 }
+
+/* The finite bounds of xy[0..n), or 0 when n is 0 or a value is not
+ * finite (fminf and fmaxf would skip a NaN). */
+static int quad_box(const float (*xy)[2], uint32_t n, float *lo_x, float *hi_x, float *lo_y,
+                    float *hi_y)
+{
+    uint32_t j;
+
+    if (!n)
+        return 0;
+    *lo_x = *hi_x = xy[0][0];
+    *lo_y = *hi_y = xy[0][1];
+    for (j = 0; j < n; j++) {
+        if (!isfinite(xy[j][0]) || !isfinite(xy[j][1]))
+            return 0;
+        *lo_x = fminf(*lo_x, xy[j][0]);
+        *hi_x = fmaxf(*hi_x, xy[j][0]);
+        *lo_y = fminf(*lo_y, xy[j][1]);
+        *hi_y = fmaxf(*hi_y, xy[j][1]);
+    }
+    return 1;
+}
+
+unsigned nv2a_aspect_third(const float (*xy)[2], uint32_t n, uint32_t h)
+{
+    float lo_x, hi_x, lo_y, hi_y;
+
+    if (!quad_box(xy, n, &lo_x, &hi_x, &lo_y, &hi_y) || lo_y < -2.0f
+        || hi_y > (float)h + 2.0f)
+        return 0;
+    if (hi_y <= (float)h / 3.0f)
+        return NV2A_BAND_TOP;
+    if (lo_y >= (float)h * 2.0f / 3.0f)
+        return NV2A_BAND_BOT;
+    return 0;
+}
+
+int nv2a_aspect_band(const float (*xy)[2], uint32_t n, uint32_t w, uint32_t h, unsigned bars)
+{
+    float lo_x, hi_x, lo_y, hi_y;
+
+    if (!(nv2a_aspect_third(xy, n, h) & bars) || !quad_box(xy, n, &lo_x, &hi_x, &lo_y, &hi_y))
+        return 0;
+    return lo_x >= -2.0f && hi_x <= (float)w + 2.0f
+           && (lo_x <= 2.0f || hi_x >= (float)w - 2.0f);
+}

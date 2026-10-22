@@ -468,6 +468,102 @@ int main(void)
             CHECK(nv2a_aspect_quad_span(lo, hi, 640)
                   && !nv2a_aspect_full_tris((const float (*)[2])xy, cidx, 2, 640));
         }
+        {
+            /* Letterbox band pieces (nv2a_aspect_band), as Burnout 3's
+             * crash cam draws them: quads at w 24.37 on a 640x480 frame. */
+            const float bw = 24.3671875f;
+            unsigned bars = NV2A_BAND_TOP | NV2A_BAND_BOT;
+            uint32_t stamp[2] = { 0, 0 };
+            float q[4][4];
+#define BAND_QUAD(x0, x1, y0, y1)                                                    \
+    (q[0][0] = (x0), q[0][1] = (y0), q[1][0] = (x1), q[1][1] = (y0),                 \
+     q[2][0] = (x0), q[2][1] = (y1), q[3][0] = (x1), q[3][1] = (y1),                 \
+     q[0][3] = q[1][3] = q[2][3] = q[3][3] = bw,                                     \
+     nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &q[0][0], 1, slot, \
+                             4, xy, &lo, &hi)                                        \
+         && nv2a_aspect_band((const float (*)[2])xy, 4, 640, 480, bars))
+            CHECK(BAND_QUAD(0, 640, 16, 72));            /* top bar */
+            CHECK(BAND_QUAD(0, 640, 408, 464));          /* bottom bar */
+            CHECK(BAND_QUAD(0, 320, 72, 73.87f));        /* a half of the top line */
+            CHECK(BAND_QUAD(320, 640, 406.13f, 408));    /* a half of the bottom line */
+            CHECK(BAND_QUAD(0, 640, 379.07f, 408));      /* the list backing */
+            CHECK(BAND_QUAD(608, 640, 349.2f, 379.07f)); /* its raised right end */
+            /* Inside a band but reaching no edge: an icon, the zero-wide
+             * middle of a line. Text overhanging the frame (a ticker). */
+            CHECK(!BAND_QUAD(457.4f, 487.4f, 41.2f, 69.2f));
+            CHECK(!BAND_QUAD(320, 320, 72, 73.87f));
+            CHECK(!BAND_QUAD(550.1f, 715.6f, 382.2f, 404.8f));
+            /* A full-width banner mid-screen, and one that leaves the
+             * top third: not a band. */
+            CHECK(!BAND_QUAD(0, 640, 200, 280));
+            CHECK(!BAND_QUAD(0, 640, 100, 170));
+            /* A lens flare without depth: mid-screen it keeps its place,
+             * as it does at an edge outside the bands. */
+            CHECK(!BAND_QUAD(300, 340, 200, 240));
+            CHECK(!BAND_QUAD(0, 40, 200, 240));
+            /* A quad overhanging the frame (a haze plane) is no piece. */
+            CHECK(!BAND_QUAD(-40, 700, 0, 100));
+            /* Nor one overhanging the top or bottom edge. */
+            CHECK(!BAND_QUAD(0, 640, -40, 100));
+            CHECK(!BAND_QUAD(0, 640, 400, 520));
+            /* A flare that touches an edge inside a band is taken as a
+             * piece of it: the rule has no way to tell them apart. */
+            CHECK(BAND_QUAD(0, 40, 20, 60));
+            /* A NaN corner (fminf would skip it) or an infinite one. */
+            CHECK(!BAND_QUAD(0, 640, 16, NAN));
+            CHECK(!BAND_QUAD(0, 640, -INFINITY, 72));
+            /* No bar stretched in a third: no piece there. Burnout 3's
+             * menu frame has header strips and a bottom rule that reach
+             * an edge at one w, but no bar. */
+            bars = 0;
+            CHECK(!BAND_QUAD(0, 640, 16, 72));
+            CHECK(!BAND_QUAD(320, 640, 406.13f, 408));
+            bars = NV2A_BAND_TOP;
+            CHECK(BAND_QUAD(0, 320, 72, 73.87f));
+            CHECK(!BAND_QUAD(320, 640, 406.13f, 408));
+#undef BAND_QUAD
+            /* The thirds a bar marks, and how long the mark lasts: this
+             * flip and the next. */
+            {
+                float bar[4][2] = { { 0, 408 }, { 640, 408 }, { 0, 464 }, { 640, 464 } };
+                float mid[4][2] = { { 0, 200 }, { 640, 200 }, { 0, 280 }, { 640, 280 } };
+                CHECK(nv2a_aspect_third((const float (*)[2])bar, 4, 480) == NV2A_BAND_BOT);
+                CHECK(nv2a_aspect_third((const float (*)[2])mid, 4, 480) == 0);
+                CHECK(nv2a_aspect_third((const float (*)[2])bar, 0, 480) == 0);
+            }
+            CHECK(nv2a_aspect_bars(stamp, 0) == 0);
+            nv2a_aspect_bar_mark(stamp, NV2A_BAND_BOT, 10);
+            CHECK(nv2a_aspect_bars(stamp, 10) == NV2A_BAND_BOT);
+            CHECK(nv2a_aspect_bars(stamp, 11) == NV2A_BAND_BOT);
+            CHECK(nv2a_aspect_bars(stamp, 12) == 0);
+            nv2a_aspect_bar_mark(stamp, 0, 12);
+            CHECK(nv2a_aspect_bars(stamp, 12) == 0);
+            /* A band piece is placed as a full-width pass: stretched. */
+            CHECK(nv2a_aspect_place(1, 1, 0, 0, NV2A_MOVIE_BLACK) == NV2A_PLACE_STRETCH);
+        }
+        {
+            /* BLiNX 2's corner triangles, one per corner, in one batch:
+             * the batch spans the whole height, so it is no band piece,
+             * and no triangle spans the width (Hor+ H4). */
+            float ct[6][4] = { { 0, 0, 0, 2 }, { 120, 0, 0, 2 }, { 0, 90, 0, 2 },
+                               { 640, 480, 0, 2 }, { 520, 480, 0, 2 }, { 640, 390, 0, 2 } };
+            uint32_t cidx[6] = { 0, 1, 2, 3, 4, 5 };
+            CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &ct[0][0], 1, slot,
+                                          6, xy, &lo, &hi) == 1);
+            CHECK(!nv2a_aspect_band((const float (*)[2])xy, 6, 640, 480,
+                                    NV2A_BAND_TOP | NV2A_BAND_BOT)
+                  && !nv2a_aspect_full_tris((const float (*)[2])xy, cidx, 2, 640));
+        }
+        {
+            /* A world sprite: its corners at different depths, so not a
+             * screen quad, band or not. */
+            float sp[4][4] = { { 0, 10, 0, 3.1f }, { 60, 10, 0, 3.2f },
+                               { 0, 70, 0, 3.1f }, { 60, 70, 0, 3.2f } };
+            CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &sp[0][0], 1, slot,
+                                          4, xy, &lo, &hi) == 0);
+        }
+        CHECK(!nv2a_aspect_band((const float (*)[2])xy, 0, 640, 480,
+                                NV2A_BAND_TOP | NV2A_BAND_BOT));
         /* More than NV2A_ASPECT_QUAD_MAX vertices: not a quad. */
         CHECK(nv2a_aspect_screen_quad((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot,
                                       7, xy, &lo, &hi) == 0);

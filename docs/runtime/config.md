@@ -220,6 +220,21 @@ and its title movie at 100:
   by such a pass take the same columns.
 - 2D, full width over a wider guest texture (a movie, a still):
   `display.movie`.
+- A quad of at most 6 vertices sharing one positive `w` that is not a
+  screen layer (`nv2a_aspect_layer_w`; `nv2a_aspect_screen_quad`) is not 2D by the test above, but it is
+  stretched in either of two cases:
+  - it samples only padded render targets and spans exactly the frame's
+    width: a pass laid over the frame (JSRF's Can boost). Such a quad
+    wholly in the top or bottom third also marks that third as holding a
+    bar, for this flip and the next;
+  - it is drawn with the depth test off, over no guest picture, within the
+    frame's width and height, reaching its left or right edge, and wholly
+    in a third that holds a bar (`nv2a_aspect_band`): a piece of a
+    letterbox band. Burnout 3's crash cam draws its bars, their edge lines
+    (as half-width quads) and the list backing that way at one `w`, so they
+    all reach the target's edges together while the text inside stays in
+    the 4:3 frame. Its front-end menu frame has the same shape but no bar,
+    so it keeps its 4:3 place.
 
 `RECOMP_TRACE=aspect` prints one `[aspect.program]` line per program,
 texture and placement, and the target size per flip.

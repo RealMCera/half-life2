@@ -307,6 +307,7 @@ typedef struct {
     int            dirty;      /* drawn since its last write-back */
     int            presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;    /* is the guest memory under it still its own */
+    uint32_t       bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
@@ -2258,16 +2259,32 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 s_draws_tex++;
         }
         /* Hor+: a perspective screen quad over padded targets is a
-         * full-width pass too (nv2a_aspect_screen_quad). */
-        if (rt->pad && d->program && ve && topo == NV2A_TOPO_TRIANGLES && !two_d
-            && nv2a_aspect_quad_ok(srcs[0] || srcs[1] || srcs[2] || srcs[3], flat_rt, guest_tex)) {
+         * full-width pass too (nv2a_aspect_screen_quad) and marks the third
+         * it lies in as holding a bar; one drawn without depth in such a
+         * third is stretched as a piece of a letterbox band
+         * (nv2a_aspect_band). */
+        if (rt->pad && d->program && ve && topo == NV2A_TOPO_TRIANGLES && !two_d) {
+            uint32_t flips = nv2a_pb_gpu_state()->flips;
+            unsigned bars = nv2a_aspect_bars(rt->bar_flip, flips);
+            int quad = nv2a_aspect_quad_ok(srcs[0] || srcs[1] || srcs[2] || srcs[3], flat_rt,
+                                           guest_tex);
+            int band = bars && !v->depth_enable && !flat_rt && !guest_tex;
             float qxy[NV2A_ASPECT_QUAD_MAX][2];
-            if (nv2a_aspect_screen_quad((const uint32_t (*)[4])v->prog, v->start,
-                                        (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, count,
-                                        qxy, &lo_x, &hi_x)
-                && nv2a_aspect_quad_span(lo_x, hi_x, rt->w)
-                && nv2a_aspect_full_tris((const float (*)[2])qxy, idx, nidx / 3u, rt->w))
-                two_d = full_w = 1;
+            if ((quad || band)
+                && nv2a_aspect_screen_quad((const uint32_t (*)[4])v->prog, v->start,
+                                           (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, count,
+                                           qxy, &lo_x, &hi_x)) {
+                if (quad && nv2a_aspect_quad_span(lo_x, hi_x, rt->w)
+                    && nv2a_aspect_full_tris((const float (*)[2])qxy, idx, nidx / 3u, rt->w)) {
+                    two_d = full_w = 1;
+                    nv2a_aspect_bar_mark(rt->bar_flip,
+                                         nv2a_aspect_third((const float (*)[2])qxy, count, rt->h),
+                                         flips);
+                } else if (band && nv2a_aspect_band((const float (*)[2])qxy, count, rt->w, rt->h,
+                                                    bars)) {
+                    two_d = full_w = 1;
+                }
+            }
         }
         /* A square target is a reflection, glow or shadow map, never a
          * movie: display.movie applies to the frame only. */
