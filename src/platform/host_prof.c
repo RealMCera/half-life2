@@ -50,6 +50,11 @@ static uint64_t s_samples, s_dropped, s_rounds;
 static unsigned s_hz;
 static char s_out[1024];
 static volatile int s_running, s_stop, s_dumped;
+/* Set while the sampler is inside a round (refresh and sample), not while
+ * it naps: the dump waits on this, not on s_running, so a dump during the
+ * start delay or between rounds sorts the table instead of finding the
+ * sampler "busy" for a whole second and writing it unsorted. */
+static volatile int s_in_round;
 static int s_all_threads; /* Windows: no usable cycle counter, every thread counts */
 
 static int slot_for(unsigned long tid, const char *name)
@@ -399,12 +404,21 @@ static void sampler_loop(void)
     t0 = now_ms();
     while (!s_stop) {
         uint64_t now = now_ms();
+        /* Flag first, then look at s_stop again (both seq_cst, as the dump
+         * stores s_stop then reads the flag): either the dump sees the
+         * round or the round sees the stop. */
+        __atomic_store_n(&s_in_round, 1, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&s_stop, __ATOMIC_SEQ_CST)) {
+            __atomic_store_n(&s_in_round, 0, __ATOMIC_SEQ_CST);
+            break;
+        }
         if (now >= next_refresh) {
             refresh_threads();
             next_refresh = now + 500;
         }
         sample_round();
         s_rounds++;
+        __atomic_store_n(&s_in_round, 0, __ATOMIC_SEQ_CST);
         /* Millisecond naps: a 250 Hz period of 4 ms is exact, others round
          * and the sleep error carries over so the average rate holds. */
         acc_us += period_us;
@@ -466,13 +480,13 @@ void host_prof_dump(void)
 
     if (__atomic_exchange_n(&s_dumped, 1, __ATOMIC_ACQ_REL))
         return;
-    s_stop = 1;
-    for (int i = 0; i < 200 && s_running; i++)
+    __atomic_store_n(&s_stop, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < 200 && __atomic_load_n(&s_in_round, __ATOMIC_SEQ_CST); i++)
         nap_ms(5);
     /* A round can outlast the wait (under Wine, threads stuck in wineserver
      * hold SuspendThread up); its in-flight record() calls could still land
      * in s_tab, so the table is then dumped in place, unsorted. */
-    idle = !s_running;
+    idle = !__atomic_load_n(&s_in_round, __ATOMIC_SEQ_CST);
     f = fopen(s_out, "w");
     if (!f) {
         fprintf(stderr, "[PROF] cannot write %s\n", s_out);
