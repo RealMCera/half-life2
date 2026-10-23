@@ -46,7 +46,11 @@
 #include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
+#ifdef XBOXRECOMP_ENHANCE
+#include "nv2a_overlay.h"
+#endif
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
@@ -1766,6 +1770,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
         p += (size_t)row * rows;
     }
     s_tex_uploads++;
+    nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
     if (levels > 1)
         s_tex_mip_uploads++;
     return 1;
@@ -3946,6 +3951,9 @@ static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
  * filtered, less display.overscan's edges (nv2a_present_crop). Under
  * present.surface=internal the back buffer is the frame: the crop fills it,
  * point-sampled for integer as Metal's internal present is. */
+#ifdef XBOXRECOMP_ENHANCE
+static struct nv2a_rect s_ovl_place;    /* the overlay's: the frame in the back buffer */
+#endif
 static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int internal)
 {
     static const float black[4] = {0, 0, 0, 1};
@@ -4012,9 +4020,248 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     /* Every binding above went behind the draw path's state shadow. */
     s_sc_init = 0;
+#ifdef XBOXRECOMP_ENHANCE
+    s_ovl_place = r;
+#endif
 }
 
 static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
+#ifdef XBOXRECOMP_ENHANCE
+/* ── The overlay (nv2a_overlay.h) ─────────────────────────────────────────
+ *
+ * This flip is the overlay's presenting thread here: it polls (the strip
+ * and toasts compose in the poll), then draws the visible lists over the
+ * frame's rectangle after dump_frame, so d3d11_dump never has them, and
+ * before Present. A menu edit therefore shows at the next guest flip, not
+ * within 100 ms as on SDL and Metal (F-9). */
+static ID3D11VertexShader *s_ovl_vs;
+static ID3D11PixelShader  *s_ovl_ps;
+static ID3D11InputLayout  *s_ovl_il;
+static ID3D11BlendState   *s_ovl_bs;
+static ID3D11Buffer       *s_ovl_cb, *s_ovl_vb, *s_ovl_ib;
+static UINT                s_ovl_vb_cap, s_ovl_ib_cap;
+static ID3D11ShaderResourceView *s_ovl_srv[1 + NV2A_OVL_IMAGES];
+static uint64_t            s_ovl_srv_gen[1 + NV2A_OVL_IMAGES];
+static int                 s_ovl_failed;
+
+static const char s_ovl_vs_src[] =
+    "cbuffer C : register(b0) { float4 xf; };\n"
+    "struct VI { float2 p : POSITION; float2 t : TEXCOORD0; float4 c : COLOR0; };\n"
+    "struct VO { float4 p : SV_Position; float2 t : TEXCOORD0; float4 c : COLOR0; };\n"
+    "VO main(VI i) {\n"
+    "    VO o;\n"
+    "    o.p = float4(i.p * xf.xy + xf.zw, 0, 1);\n"
+    "    o.t = i.t;\n"
+    "    o.c = i.c;\n"
+    "    return o;\n"
+    "}\n";
+static const char s_ovl_ps_src[] =
+    "Texture2D t : register(t0);\n"
+    "SamplerState s : register(s0);\n"
+    "struct VO { float4 p : SV_Position; float2 t : TEXCOORD0; float4 c : COLOR0; };\n"
+    "float4 main(VO i) : SV_Target { return t.Sample(s, i.t) * i.c; }\n";
+
+static int ovl_init(void)
+{
+    static const D3D11_INPUT_ELEMENT_DESC il[3] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    ID3DBlob *code = NULL;
+    D3D11_BLEND_DESC bd;
+
+    if (s_ovl_ps || s_ovl_failed)
+        return s_ovl_ps != NULL;
+    s_ovl_failed = 1;
+    if (!blit_init() || !compile("nv2a_overlay_vs", s_ovl_vs_src, "vs_5_0", &code))
+        return 0;
+    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                    ID3D10Blob_GetBufferSize(code), NULL, &s_ovl_vs);
+    ID3D11Device_CreateInputLayout(s_dev, il, 3, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), &s_ovl_il);
+    ID3D10Blob_Release(code);
+    if (!s_ovl_vs || !s_ovl_il || !compile("nv2a_overlay_ps", s_ovl_ps_src, "ps_5_0", &code))
+        return 0;
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), NULL, &s_ovl_ps);
+    ID3D10Blob_Release(code);
+    /* Premultiplied alpha. */
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ID3D11Device_CreateBlendState(s_dev, &bd, &s_ovl_bs);
+    s_ovl_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER);
+    if (!s_ovl_ps || !s_ovl_bs || !s_ovl_cb) {
+        fprintf(stderr, LOGP "overlay pipeline failed; no overlay drawn\n");
+        return 0;
+    }
+    s_ovl_failed = 0;
+    return 1;
+}
+
+/* Texture k of the overlay (0 the atlas, 1.. the image slots), re-made when
+ * its gen moves. */
+static ID3D11ShaderResourceView *ovl_srv(uint16_t k)
+{
+    const uint32_t *px;
+    uint32_t w, h;
+    uint64_t gen;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    ID3D11Texture2D *t = NULL;
+
+    if (k == 0) {
+        const struct nv2a_ovl_atlas *a = nv2a_overlay_atlas();
+        if (!a)
+            return NULL;
+        px = a->px, w = a->w, h = a->h, gen = a->gen;
+    } else {
+        const struct nv2a_ovl_image *im = k <= NV2A_OVL_IMAGES ? nv2a_overlay_image(k) : NULL;
+        if (!im || !im->px)
+            return NULL;
+        px = im->px, w = im->w, h = im->h, gen = im->gen;
+    }
+    if (s_ovl_srv[k] && s_ovl_srv_gen[k] == gen)
+        return s_ovl_srv[k];
+    if (s_ovl_srv[k])
+        ID3D11ShaderResourceView_Release(s_ovl_srv[k]);
+    s_ovl_srv[k] = NULL;
+    s_ovl_srv_gen[k] = gen;
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sd.pSysMem = px;
+    sd.SysMemPitch = w * 4;
+    sd.SysMemSlicePitch = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t))) {
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &s_ovl_srv[k]);
+        ID3D11Texture2D_Release(t);
+    }
+    return s_ovl_srv[k];
+}
+
+static int ovl_fill(ID3D11Buffer **b, UINT *cap, UINT bind, const void *src, UINT n)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (n > *cap) {
+        UINT c = *cap ? *cap : 4096;
+        while (c < n)
+            c *= 2;
+        if (*b)
+            ID3D11Buffer_Release(*b);
+        *b = make_buffer(c, bind);
+        *cap = *b ? c : 0;
+        if (!*b)
+            return 0;
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)*b, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, src, n);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)*b, 0);
+    return 1;
+}
+
+/* After dump_frame, before Present. On the stock copy path this is the
+ * only draw into the back buffer: it binds its own target and viewport
+ * and leaves the draw path's state shadow stale, as present_blit does. */
+static void ovl_present(void)
+{
+    const struct nv2a_ovl_list *ls[NV2A_OVL_COUNT];
+    struct nv2a_rect r = s_ovl_place;
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_VIEWPORT vp;
+    UINT stride = sizeof(struct nv2a_ovl_vtx), off = 0, cb_cap = 16;
+    int n, i;
+    uint32_t c;
+
+    if (!s_back || !nv2a_overlay_armed())
+        return;
+    int copied = r.w > 0 && r.h > 0;
+
+    nv2a_overlay_set_presenter("D3D11");
+    if (!copied) {
+        r.x = r.y = 0;
+        r.w = (int32_t)s_back_w;
+        r.h = (int32_t)s_back_h;
+    }
+    nv2a_overlay_set_placement(r.x, r.y, r.w, r.h);
+    nv2a_overlay_poll(GetTickCount64());
+    if (!nv2a_overlay_visible() || !(n = nv2a_overlay_lists(ls)) || !ovl_init())
+        return;
+    if (!s_back_rtv && FAILED(ID3D11Device_CreateRenderTargetView(
+                s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv)))
+        return;
+    /* Nothing copied this present: a flip-model back buffer holds whatever
+     * an older frame left, so the strip would sit on garbage (review F9). */
+    if (!copied) {
+        static const float black[4] = {0, 0, 0, 1};
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)s_back_w;
+    vp.Height = (float)s_back_h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs_sc[0][0]);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_ovl_bs, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_ovl_il);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_ovl_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_ovl_cb);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ovl_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp[1]);
+    for (i = 0; i < n; i++) {
+        const struct nv2a_ovl_list *l = ls[i];
+        float sx = l->out_w ? (float)r.w / (float)l->out_w : 1.0f;
+        float sy = l->out_h ? (float)r.h / (float)l->out_h : 1.0f;
+        float xf[4] = { sx * 2.0f / (float)s_back_w, -sy * 2.0f / (float)s_back_h,
+                        (float)r.x * 2.0f / (float)s_back_w - 1.0f,
+                        1.0f - (float)r.y * 2.0f / (float)s_back_h };
+        if (!ovl_fill(&s_ovl_vb, &s_ovl_vb_cap, D3D11_BIND_VERTEX_BUFFER, l->vtx,
+                      l->nvtx * (UINT)sizeof *l->vtx)
+            || !ovl_fill(&s_ovl_ib, &s_ovl_ib_cap, D3D11_BIND_INDEX_BUFFER, l->idx,
+                         l->nidx * (UINT)sizeof *l->idx)
+            || !ovl_fill(&s_ovl_cb, &cb_cap, D3D11_BIND_CONSTANT_BUFFER, xf, sizeof xf))
+            continue;
+        ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_ovl_vb, &stride, &off);
+        ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ovl_ib, DXGI_FORMAT_R16_UINT, 0);
+        for (c = 0; c < l->ncmd; c++) {
+            const struct nv2a_ovl_cmd *k = &l->cmd[c];
+            ID3D11ShaderResourceView *t = ovl_srv(k->tex);
+            D3D11_RECT sc;
+            if (!t || !k->count)
+                continue;
+            sc.left = r.x + (LONG)(k->clip[0] * sx);
+            sc.top = r.y + (LONG)(k->clip[1] * sy);
+            sc.right = r.x + (LONG)(k->clip[0] * sx + k->clip[2] * sx + 0.999f);
+            sc.bottom = r.y + (LONG)(k->clip[1] * sy + k->clip[3] * sy + 0.999f);
+            ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &t);
+            ID3D11DeviceContext_DrawIndexed(s_ctx, k->count, k->first, 0);
+        }
+    }
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    s_sc_init = 0;
+}
+#endif /* XBOXRECOMP_ENHANCE */
 /* nv2a_pb_d3d11_back_pixel: a back-buffer pixel read at each flip before
  * Present, since FLIP_DISCARD leaves nothing to read after it. */
 static int s_probe_x = -1, s_probe_y;
@@ -4037,6 +4284,9 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     present_resize();
     s_drawn = present_target(surface_offset);
     s_dump_rt = 0;
+#ifdef XBOXRECOMP_ENHANCE
+    s_ovl_place.w = s_ovl_place.h = 0;     /* no frame: the whole back buffer */
+#endif
     if (s_drawn) {
         static int said;
         const struct nv2a_host_opts *eo = nv2a_host_opts();
@@ -4075,6 +4325,11 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         } else if (same) {
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,
                                              (ID3D11Resource *)s_drawn->tex);
+#ifdef XBOXRECOMP_ENHANCE
+            s_ovl_place.x = s_ovl_place.y = 0;
+            s_ovl_place.w = (int32_t)s_back_w;
+            s_ovl_place.h = (int32_t)s_back_h;
+#endif
         } else {
             static const float black[4] = {0, 0, 0, 1};
             D3D11_BOX b;
@@ -4095,6 +4350,11 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
             ID3D11DeviceContext_CopySubresourceRegion(
                 s_ctx, (ID3D11Resource *)s_back, 0, 0, 0, 0,
                 (ID3D11Resource *)s_drawn->tex, 0, &b);
+#ifdef XBOXRECOMP_ENHANCE
+            s_ovl_place.x = s_ovl_place.y = 0;
+            s_ovl_place.w = (int32_t)b.right;
+            s_ovl_place.h = (int32_t)b.bottom;
+#endif
         }
         if (s_back && !said++)
             fprintf(stderr, LOGP "first present: back buffer %ux%u, frame %ux%u"
@@ -4109,6 +4369,10 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                    : 0xDEADBEEFu;
     s_presents++;
     dump_frame();
+#ifdef XBOXRECOMP_ENHANCE
+    ovl_present();
+    nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
+#endif
     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);

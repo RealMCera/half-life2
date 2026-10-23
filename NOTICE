@@ -95,6 +95,36 @@ MIT and permissive — dsp56300, optional (XBOXRECOMP_APU_DSP)
   archive's own third-party file, verbatim, with each crate's copyright.
 
 
+MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
+-------------------------------------------------------------------
+
+  Vendored unmodified under third_party/ and compiled only in builds with
+  -DXBOXRECOMP_ENHANCE=ON. Each directory's VERSION file names the
+  upstream commit and the sha256 of every file.
+
+  third_party/microui/  microui 2.02
+                        https://github.com/rxi/microui
+                        (c) 2024 rxi. MIT; the text is in
+                        LICENSES/MIT-microui.txt.
+
+  third_party/stb/      stb_truetype.h v1.26
+                        https://github.com/nothings/stb
+                        (c) 2017 Sean Barrett. MIT or public domain, at
+                        the user's choice; the text is in
+                        LICENSES/MIT-stb.txt.
+
+  third_party/fonts/atkinson-hyperlegible/
+                        Atkinson Hyperlegible Regular 1.006
+                        https://github.com/google/fonts (ofl/atkinsonhyperlegible)
+                        (c) 2020 Braille Institute of America, Inc.
+                        SIL Open Font License 1.1; the text is in OFL.txt
+                        beside the font and in
+                        LICENSES/OFL-1.1-atkinson-hyperlegible.txt.
+                        The fonts are embedded in the binary as they are.
+                        The OFL allows bundling them with software; they
+                        are not sold on their own and are not renamed.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 

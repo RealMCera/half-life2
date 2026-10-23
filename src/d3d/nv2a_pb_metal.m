@@ -83,6 +83,7 @@
 
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "d3d8_msl.h"
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
@@ -1410,6 +1411,7 @@ static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash)
             return nil;
     }
     s_tex_uploads++;
+    nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
     return tex;
 }
 

@@ -75,6 +75,9 @@ int enhance_actions_arm(const char *key);
  * when the mod is dropped (enhance_actions_drop_owner). */
 int enhance_actions_arm_owned(const char *key, int owner);
 int enhance_actions_armed(void);
+/* 1 when key is one the hook is armed by (its config value was true):
+ * enhance.c reads overlay.stats through this, so the key has one reader. */
+int enhance_actions_keyed(const char *key);
 
 /* Report these guest bits (wButtons bits 0..7, analog index i as bit
  * 8 + i) released on port until each is physically released: the button

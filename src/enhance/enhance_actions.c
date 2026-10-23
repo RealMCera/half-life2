@@ -44,6 +44,9 @@
 #include "mod.h"
 #include "mouse.h"
 #include "nv2a_backend_common.h"
+#ifdef XBOXRECOMP_ENHANCE
+#include "nv2a_overlay.h"
+#endif
 #include "recomp_env.h"
 
 #ifdef _WIN32
@@ -180,6 +183,21 @@ static void disarm_where(int all_mods, int owner);
 
 static uint64_t s_log_sec;
 static int s_log_n, s_log_dropped;
+
+/* The toolkit's actions that act at the fire (menu.open is the menu's,
+ * 3D). Fires run under s_step_lock, so the strip's read-then-set never
+ * races another fire. */
+static int s_stats_act = -1;
+
+static void toolkit_fire(int action)
+{
+#ifdef XBOXRECOMP_ENHANCE
+    if (action == s_stats_act)
+        nv2a_overlay_set_stats(!nv2a_overlay_stats());
+#else
+    (void)action;
+#endif
+}
 
 static void fire_log(const struct binding *b, uint64_t now)
 {
@@ -553,6 +571,7 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
             b->fired = 1;
             __atomic_add_fetch(&s_act[b->action].pressed, 1, __ATOMIC_ACQ_REL);
             fire_log(b, now);
+            toolkit_fire(b->action);
         }
         if (b->active && b->fired && !b->held_over)
             __atomic_or_fetch(&s_act[b->action].down, 1u << b->idx, __ATOMIC_ACQ_REL);
@@ -1064,6 +1083,14 @@ int enhance_actions_armed(void)
     return __atomic_load_n(&s_armed, __ATOMIC_ACQUIRE);
 }
 
+int enhance_actions_keyed(const char *key)
+{
+    for (int i = 0; key && i < s_narm; i++)
+        if (!strcmp(s_arm_keys[i], key))
+            return 1;
+    return 0;
+}
+
 /* A mod left out (its init failed) or dropped takes the keys it armed
  * with; the last one gone disarms the hook. */
 static void disarm_where(int all_mods, int owner)
@@ -1100,7 +1127,7 @@ void enhance_actions_init(void)
 
     enhance_actions_reset();
     enhance_action_register("menu.open", "Open the menu", menu_open);
-    enhance_action_register("overlay.stats", "Stats strip", NULL);
+    s_stats_act = enhance_action_register("overlay.stats", "Stats strip", NULL);
     enhance_action_register("shot.window", "Window screenshot", NULL);
 }
 

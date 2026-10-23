@@ -166,6 +166,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
+| `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
 
 A title adds its own tables (`[fps]`, `[fx]`, ...) in the same files, and
 lists them with their stock values in its `config.default.toml`. The
@@ -615,7 +616,7 @@ The toolkit's actions:
 | Action | Default bindings | Does |
 |---|---|---|
 | `menu.open` | `F10`, `guide+a` | opens and closes the menu (a log line until the menu lands) |
-| `overlay.stats` | none | toggles the stats strip (a log line until the overlay lands) |
+| `overlay.stats` | none | toggles the stats strip |
 | `shot.window` | none | a window shot (a log line for now) |
 
 A game's `config.default.toml` adds to these, for example a fallback chord
@@ -675,7 +676,9 @@ gets one line and the rest of the action's bindings stand:
    [ENHANCE] actions hook=on (menu.enabled, camera.free)
    ```
 
-   A golden run (`RECOMP_CONFIG=none`) has `hook=off`.
+   A golden run (`RECOMP_CONFIG=none`) has `hook=off`. The overlay's
+   stats and toast layers are armed with the hook and only then: stock
+   bakes no font, and a mod's toast is then its log line only.
 7. A modifier chord (`guide+a`) fires on the guest button's press while
    the host-only button is held; no hold is needed. While the host-only
    button is held, the guest members of every modifier chord on that port
@@ -766,6 +769,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |
 | `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
+| `RECOMP_OVERLAY_STATS` | overrides `overlay.stats` |
 | `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |
 | `RECOMP_MOUSE` | overrides `input.mouse` |
 

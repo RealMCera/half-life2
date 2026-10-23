@@ -19,6 +19,7 @@
 #include "mod.h"
 #include "mouse.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_overlay.h"
 #include "nv2a_pb_state.h"
 #include "recomp_env.h"
 
@@ -60,6 +61,20 @@ ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
 
 static struct nv2a_pb_present s_present = { 0x00C00000u, 640, 480, 2560, 0 };
 const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
+
+/* The overlay (tests/overlay has it): what enhance.c arms and what the
+ * overlay.stats action asks of it. */
+static uint32_t s_ovl_layers;
+static int s_ovl_stats;
+int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
+{
+    (void)out_h;
+    s_ovl_layers = layers;
+    return 0;
+}
+void nv2a_overlay_set_stats(int on) { s_ovl_stats = on; }
+int nv2a_overlay_stats(void) { return s_ovl_stats; }
+void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 
 /* ---- the fake pad backend --------------------------------------------- */
 
@@ -699,6 +714,50 @@ static void test_paddle_and_log(void)
     CHECK(strstr(out, "[ACTION] 2 more fires not logged\n") != NULL);
 }
 
+/* ---- the overlay.stats action toggles the strip ------------------------ */
+
+static void press_paddle(void)
+{
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    advance(16);
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    poll0();
+    advance(16);
+}
+
+static void test_stats_toggle(void)
+{
+    const char *out;
+
+    /* Stock: neither the hook nor the overlay is armed. */
+    s_ovl_layers = 0;
+    s_ovl_stats = 0;
+    out = start(NULL);
+    CHECK(s_ovl_layers == 0);
+    CHECK(strstr(out, "overlay.stats=off\n") != NULL);
+
+    /* A feature key arms both layers, the strip hidden; each fire flips it. */
+    out = start(ARMED "[input.actions]\n\"overlay.stats\" = \"paddle1\"\n");
+    CHECK(s_ovl_layers == ((1u << NV2A_OVL_STATS) | (1u << NV2A_OVL_TOAST)));
+    CHECK(s_ovl_stats == 0);
+    press_paddle();
+    CHECK(s_ovl_stats == 1);
+    press_paddle();
+    CHECK(s_ovl_stats == 0);
+
+    /* overlay.stats on: armed by its own key, shown at start, then off. */
+    s_ovl_layers = 0;
+    out = start("[overlay]\nstats = true\n[input.actions]\n\"overlay.stats\" = \"paddle1\"\n");
+    CHECK(s_ovl_layers == ((1u << NV2A_OVL_STATS) | (1u << NV2A_OVL_TOAST)));
+    CHECK(strstr(out, "overlay.stats=on\n") != NULL);
+    CHECK(strstr(out, "actions hook=on (overlay.stats)\n") != NULL);
+    CHECK(s_ovl_stats == 1);
+    press_paddle();
+    CHECK(s_ovl_stats == 0);
+    s_ovl_stats = 0;
+}
+
 /* ---- 10. the flip tick: guide+a with no guest poll --------------------- */
 
 static void test_tick(void)
@@ -1079,6 +1138,7 @@ int main(void)
     test_scripts();
     test_disarmed();
     test_paddle_and_log();
+    test_stats_toggle();
     test_tick();
     test_tick_race();
     test_mod_api();

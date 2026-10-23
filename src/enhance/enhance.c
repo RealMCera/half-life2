@@ -13,6 +13,7 @@
 #include "kernel_pacing.h"
 #include "mod.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_overlay.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_exe_dir.h"
 
@@ -196,6 +197,23 @@ int xbox_enhance_init(const char *root, const char *title)
     /* [input.actions] once every action is registered (the key map of
      * rule 2 is the one enhance_input_init applied), then the hook line. */
     enhance_actions_start();
+    /* The stats strip (R2) and the toasts. Both layers are armed here, on
+     * the init thread, whenever the actions hook is (a feature key is on,
+     * rule 6): the overlay.stats action and a mod's toast can then show
+     * them later without arming under a running presenter. Stock leaves
+     * both the hook and the overlay disarmed, so a golden run has no atlas
+     * line; a toast from a mod's init, before this, is its log line only.
+     * Armed but hidden, nothing is drawn; the cost is the font bake and
+     * two layers' lists. overlay.stats is read once, by the hook's arming
+     * (enhance_actions_start). */
+    {
+        int stats = enhance_actions_keyed("overlay.stats");
+        fprintf(stderr, LOGP "overlay.stats=%s\n", stats ? "on" : "off");
+        if (enhance_actions_armed()
+            && nv2a_overlay_arm((1u << NV2A_OVL_STATS) | (1u << NV2A_OVL_TOAST), 1080) == 0
+            && stats)
+            nv2a_overlay_set_stats(1);
+    }
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

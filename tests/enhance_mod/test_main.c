@@ -17,9 +17,11 @@
 #include "mod.h"
 #include "mouse.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_overlay.h"
 #include "nv2a_pb_state.h"
 #include "recomp_exit_hook.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +42,24 @@ static int s_fail, s_checks;
 
 void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { (void)mode; }
+/* The overlay (tests/overlay has it); overlay.stats stays off here. */
+int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
+{
+    (void)layers;
+    (void)out_h;
+    return -1;
+}
+void nv2a_overlay_set_stats(int on) { (void)on; }
+int nv2a_overlay_stats(void) { return 0; }
+/* api_toast's overlay push: the last line, to check the mod's text. */
+static char s_toast_last[256];
+void nv2a_overlay_toast(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_toast_last, sizeof s_toast_last, fmt, ap);
+    va_end(ap);
+}
 
 /* The guest's memory: a buffer, and an offset that maps guest 0x1000 to
  * its start, as xbox_GetMemoryOffset maps the title's address space. */
@@ -172,6 +192,10 @@ static void test_table(void)
         memcpy(&f, s_guest + 8, sizeof f);
         CHECK(f == 2.5f);
     }
+    /* A toast reaches the overlay's TOAST layer with the mod's text. */
+    s_toast_last[0] = 0;
+    s_api->toast(&k_alpha, "speed %lld", s_speed);
+    CHECK(strcmp(s_toast_last, "speed 3") == 0);
     /* Registration is init only. */
     CHECK(s_api->on_frame(beta_frame, NULL) == 0);
     /* Reverse order, the bad one never, once. */

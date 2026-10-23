@@ -41,7 +41,54 @@ set(KERNEL_SOURCES
     nv2a_combiner.c
 )
 
+# The enhancements overlay (stats strip, toasts, the menu; enhance-menu-
+# preview R2, R7, R8): microui and stb_truetype vendored unmodified in
+# third_party/, built with their own warnings off, and the Atkinson
+# Hyperlegible Regular TTF embedded as C arrays at build time. Only
+# XBOXRECOMP_ENHANCE builds carry any of it.
+if(XBOXRECOMP_ENHANCE)
+    get_filename_component(_xr_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(_xr_tp "${_xr_root}/third_party")
+    set(_ovl_fonts
+        "${_xr_tp}/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf")
+    # The size gate of 3B.1: the embedded faces stay under 0.7 MB.
+    set(_ovl_font_bytes 0)
+    foreach(_f IN LISTS _ovl_fonts)
+        file(SIZE "${_f}" _sz)
+        math(EXPR _ovl_font_bytes "${_ovl_font_bytes} + ${_sz}")
+    endforeach()
+    if(_ovl_font_bytes GREATER_EQUAL 716800)
+        message(FATAL_ERROR "overlay fonts: ${_ovl_font_bytes} bytes, over the 0.7 MB cap")
+    endif()
+    set(_ovl_fonts_c "${CMAKE_CURRENT_BINARY_DIR}/nv2a_overlay_fonts.c")
+    # "|" between list items: a ";" would split the command's argument.
+    string(REPLACE ";" "|" _ovl_fonts_arg "${_ovl_fonts}")
+    add_custom_command(
+        OUTPUT "${_ovl_fonts_c}"
+        COMMAND ${CMAKE_COMMAND} "-DOUT=${_ovl_fonts_c}"
+                "-DNAMES=nv2a_ovl_font_regular"
+                "-DFILES=${_ovl_fonts_arg}"
+                -P "${_xr_root}/cmake/embed_files.cmake"
+        DEPENDS ${_ovl_fonts} "${_xr_root}/cmake/embed_files.cmake"
+        COMMENT "Embedding the overlay fonts"
+        VERBATIM)
+    set(_ovl_vendored "${_xr_tp}/microui/microui.c"
+                      "${CMAKE_CURRENT_SOURCE_DIR}/nv2a_overlay_stb.c")
+    set_source_files_properties(${_ovl_vendored} PROPERTIES
+        COMPILE_OPTIONS "$<IF:$<C_COMPILER_ID:MSVC>,/w,-w>")
+    list(APPEND KERNEL_SOURCES
+        nv2a_overlay.c
+        nv2a_overlay_ui.c
+        nv2a_overlay_font.c
+        nv2a_stats.c
+        ${_ovl_vendored}
+        "${_ovl_fonts_c}")
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+if(XBOXRECOMP_ENHANCE)
+    target_include_directories(xbox_kernel PUBLIC "${_xr_tp}/microui" "${_xr_tp}/stb")
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

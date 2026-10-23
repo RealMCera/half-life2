@@ -14,6 +14,9 @@
 
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#ifdef XBOXRECOMP_ENHANCE
+#include "nv2a_overlay.h"
+#endif
 #include "recomp_exit_hook.h"
 #include "xbox_memory_layout.h"
 
@@ -47,15 +50,20 @@ static void api_log(const struct xbox_mod *m, const char *fmt, ...)
     fputc('\n', stderr);
 }
 
-/* Until the overlay's TOAST layer (phase 3B) a toast is a log line. */
+/* The "[MOD <name>] toast:" line, which names the mod, then the overlay's
+ * TOAST layer (its own "[TOAST]" line; on screen only when it is armed,
+ * which a feature key does). */
 static void api_toast(const struct xbox_mod *m, const char *fmt, ...)
 {
+    char line[256];
     va_list ap;
-    fprintf(stderr, "[MOD %s] toast: ", m && m->name ? m->name : "?");
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
+    fprintf(stderr, "[MOD %s] toast: %s\n", m && m->name ? m->name : "?", line);
+#ifdef XBOXRECOMP_ENHANCE
+    nv2a_overlay_toast("%s", line);
+#endif
 }
 
 static int api_action_register(const char *name, const char *label,

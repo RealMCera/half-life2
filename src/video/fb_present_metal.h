@@ -15,7 +15,11 @@ void  fbm_get(void **device, void **queue);
 void *fbm_slot(int k, uint32_t w, uint32_t h);
 int   fbm_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pitch,
                  uint32_t bpp);
+/* layers: the overlay's visible lists (nv2a_overlay.h), drawn over the
+ * frame in the same pass; NULL and 0 when none is visible. */
+struct nv2a_ovl_list;
 int   fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
-                  uint32_t pad, int filter, const char *shot_path, uint32_t flip);
+                  uint32_t pad, int filter, const char *shot_path, uint32_t flip,
+                  const struct nv2a_ovl_list *const *layers, int nlayers);
 
 #endif

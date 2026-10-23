@@ -521,6 +521,9 @@ licence:
 |---|---|---|
 | the MCPX APU sources in `src/apu/` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
 | `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel |
+| microui in `third_party/microui/` | MIT | rxi |
+| stb in `third_party/stb/` | MIT or public domain | Sean Barrett |
+| Atkinson Hyperlegible in `third_party/fonts/` | SIL OFL 1.1 | Braille Institute of America |
 | everything else | MIT | sp00nz and contributors |
 
 The APU and the NV2A register definitions were extracted from

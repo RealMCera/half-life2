@@ -49,6 +49,7 @@
 #include "nv2a_tex_pack.h"
 #include "nv2a_zbuf_cache.h"
 #include "../video/video_player.h"   /* xbox_FramebufferWindowFrameStats */
+#include "nv2a_stats.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -7050,6 +7051,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {
             static uint32_t last_draws;
             xbox_FramebufferWindowFrameStats(s_gpu.draws - last_draws);
+            /* The stats strip's flips, draws and frame time (one flag
+             * test while nothing shows them). */
+            nv2a_stats_flip(s_gpu.draws - last_draws, rt_now());
             last_draws = s_gpu.draws;
         }
         dump_at_flip(s_gpu.flips);

@@ -28,6 +28,11 @@
  *   overscan       display.overscan > 0: a second pipeline (vs_crop) samples
  *                  nv2a_present_crop's part of the slot. At 0 the stock
  *                  pipeline draws, so nothing changes.
+ *   overlay        enhancements builds: the lists fb_present_sdl.c took from
+ *                  nv2a_overlay (the SDL loop stays the overlay's one reader)
+ *                  drawn in the same pass after the frame, premultiplied, so
+ *                  the drawable shot has them and the Metal frame dump (the
+ *                  backend's render target) never does.
  *
  * Manual retain/release, like nv2a_pb_metal.m. Every entry point is wrapped in
  * an autorelease pool: the main loop and the ack thread have none of their own.
@@ -46,6 +51,9 @@
 #include <string.h>
 
 #include "kernel/nv2a_backend_common.h"
+#ifdef XBOXRECOMP_ENHANCE
+#include "kernel/nv2a_overlay.h"
+#endif
 #include "fb_present_metal.h"
 
 #if __has_feature(objc_arc)
@@ -70,6 +78,23 @@ static uint32_t                   *s_conv;     /* R5G6B5 -> BGRA8 rows */
 static size_t                      s_conv_cap;
 static int                         s_internal;  /* present.surface=internal */
 static int                         s_layer_filter = -1;
+#ifdef XBOXRECOMP_ENHANCE
+static id<MTLRenderPipelineState>  s_pso_ovl;  /* the overlay, premultiplied */
+static id<MTLTexture>              s_ovl_tex[1 + NV2A_OVL_IMAGES];
+static uint64_t                    s_ovl_tex_gen[1 + NV2A_OVL_IMAGES];
+/* Each layer's vertices and indices, copied in only when its gen moves.
+ * Three sets a layer, so a new list never overwrites one a frame still in
+ * flight reads; the last command buffer that used a set is waited on
+ * before the set is written again. */
+#define OVL_SETS 3
+static struct ovl_set {
+    id<MTLBuffer> vb, ib;
+    NSUInteger vcap, icap;
+    uint64_t gen;
+    id<MTLCommandBuffer> cb;
+} s_ovl_set[NV2A_OVL_COUNT][OVL_SETS];
+static int s_ovl_cur[NV2A_OVL_COUNT];
+#endif
 
 static const char s_blit_msl[] =
     "#include <metal_stdlib>\n"
@@ -90,6 +115,26 @@ static const char s_blit_msl[] =
     "fragment float4 fs_blit(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
     "                        sampler s [[sampler(0)]]) {\n"
     "    return float4(t.sample(s, i.t).rgb, 1);\n"
+    "}\n"
+    /* The overlay: a list's vertices and indices as they are (20-byte
+     * vertices, uint16 indices), each index read by vertex_id, so a command
+     * is drawPrimitives over its index range. xf maps the list's output
+     * pixels into the placement in clip space. */
+    "struct OV { packed_float2 p; packed_float2 t; uint c; };\n"
+    "struct OO { float4 p [[position]]; float2 t; float4 c; };\n"
+    "vertex OO vs_ovl(uint i [[vertex_id]], const device OV *v [[buffer(0)]],\n"
+    "                 const device ushort *ix [[buffer(1)]],\n"
+    "                 constant float4 &xf [[buffer(2)]]) {\n"
+    "    OV a = v[ix[i]];\n"
+    "    OO o;\n"
+    "    o.p = float4(float2(a.p) * xf.xy + xf.zw, 0, 1);\n"
+    "    o.t = float2(a.t);\n"
+    "    o.c = unpack_unorm4x8_to_float(a.c);\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 fs_ovl(OO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+    "                       sampler s [[sampler(0)]]) {\n"
+    "    return t.sample(s, i.t) * i.c;\n"
     "}\n";
 
 static int fail(char *err, size_t n, const char *what)
@@ -132,6 +177,18 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         pd.vertexFunction = [[lib newFunctionWithName:@"vs_crop"] autorelease];
         s_pso_crop = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+#ifdef XBOXRECOMP_ENHANCE
+        pd.vertexFunction = [[lib newFunctionWithName:@"vs_ovl"] autorelease];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_ovl"] autorelease];
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        s_pso_ovl = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!s_pso_ovl)
+            fprintf(stderr, "[PRESENT] overlay pipeline failed; the layer draws no overlay\n");
+#endif
         [pd release];
         [lib release];
         if (!s_pso || !s_pso_crop)
@@ -215,6 +272,21 @@ void fbm_destroy(void)
         s_pso = nil;
         [s_pso_crop release];
         s_pso_crop = nil;
+#ifdef XBOXRECOMP_ENHANCE
+        [s_pso_ovl release];
+        s_pso_ovl = nil;
+        for (k = 0; k <= NV2A_OVL_IMAGES; k++) {
+            [s_ovl_tex[k] release];
+            s_ovl_tex[k] = nil;
+        }
+        for (k = 0; k < NV2A_OVL_COUNT * OVL_SETS; k++) {
+            struct ovl_set *o = &s_ovl_set[k / OVL_SETS][k % OVL_SETS];
+            [o->vb release];
+            [o->ib release];
+            [o->cb release];
+            memset(o, 0, sizeof *o);
+        }
+#endif
         [s_smp[0] release];
         [s_smp[1] release];
         s_smp[0] = s_smp[1] = nil;
@@ -330,8 +402,134 @@ static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *pat
 /* Slot k (fw x fh, drawn at render scale n with hor+ pad pad) into the
  * window. 0 when no drawable came (timeout, display asleep, window hidden):
  * the caller keeps the frame and tries again. */
+#ifdef XBOXRECOMP_ENHANCE
+/* Texture k of the overlay (0 the atlas, 1.. the image slots), re-made when
+ * its gen moves. */
+static id<MTLTexture> ovl_texture(uint16_t k)
+{
+    const uint32_t *px;
+    uint32_t w, h;
+    uint64_t gen;
+    MTLTextureDescriptor *td;
+    if (k == 0) {
+        const struct nv2a_ovl_atlas *a = nv2a_overlay_atlas();
+        if (!a)
+            return nil;
+        px = a->px, w = a->w, h = a->h, gen = a->gen;
+    } else {
+        const struct nv2a_ovl_image *im = k <= NV2A_OVL_IMAGES ? nv2a_overlay_image(k) : NULL;
+        if (!im || !im->px)
+            return nil;
+        px = im->px, w = im->w, h = im->h, gen = im->gen;
+    }
+    if (s_ovl_tex[k] && s_ovl_tex_gen[k] == gen)
+        return s_ovl_tex[k];
+    [s_ovl_tex[k] release];
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                            width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    s_ovl_tex[k] = [s_dev newTextureWithDescriptor:td];
+    s_ovl_tex_gen[k] = gen;
+    [s_ovl_tex[k] replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+                      withBytes:px bytesPerRow:(NSUInteger)w * 4];
+    return s_ovl_tex[k];
+}
+
+/* Grows b to hold n bytes, doubling from 4 KiB as D3D11's ovl_fill does. */
+static int ovl_grow(id<MTLBuffer> *b, NSUInteger *cap, NSUInteger n)
+{
+    NSUInteger c;
+    if (n <= *cap)
+        return 1;
+    for (c = *cap ? *cap : 4096; c < n; c *= 2)
+        ;
+    [*b release];
+    *b = [s_dev newBufferWithLength:c options:MTLResourceStorageModeShared];
+    *cap = *b ? c : 0;
+    return *b != nil;
+}
+
+/* The set holding list l's current gen, filled when the gen moved; the
+ * command buffer cb now uses it. */
+static struct ovl_set *ovl_set(const struct nv2a_ovl_list *l, id<MTLCommandBuffer> cb)
+{
+    int y = (int)l->layer;
+    struct ovl_set *o;
+    if (y < 0 || y >= NV2A_OVL_COUNT)
+        return NULL;
+    o = &s_ovl_set[y][s_ovl_cur[y]];
+    if (o->gen != l->gen) {
+        s_ovl_cur[y] = (s_ovl_cur[y] + 1) % OVL_SETS;
+        o = &s_ovl_set[y][s_ovl_cur[y]];
+        if (o->cb && [o->cb status] < MTLCommandBufferStatusCompleted)
+            [o->cb waitUntilCompleted];
+        o->gen = 0;
+        if (!ovl_grow(&o->vb, &o->vcap, l->nvtx * sizeof *l->vtx)
+            || !ovl_grow(&o->ib, &o->icap, l->nidx * sizeof *l->idx))
+            return NULL;
+        memcpy([o->vb contents], l->vtx, l->nvtx * sizeof *l->vtx);
+        memcpy([o->ib contents], l->idx, l->nidx * sizeof *l->idx);
+        o->gen = l->gen;
+    }
+    [o->cb release];
+    o->cb = [cb retain];
+    return o;
+}
+
+/* The lists over the frame at r, in a drawable of dw x dh. */
+static void ovl_draw(id<MTLRenderCommandEncoder> enc, id<MTLCommandBuffer> cb,
+                     const struct nv2a_ovl_list *const *ls, int nls, struct nv2a_rect r,
+                     int dw, int dh)
+{
+    int i;
+    uint32_t c;
+    MTLViewport vp = { 0, 0, dw, dh, 0.0, 1.0 };
+    [enc setRenderPipelineState:s_pso_ovl];
+    [enc setViewport:vp];
+    [enc setFragmentSamplerState:s_smp[1] atIndex:0];
+    for (i = 0; i < nls; i++) {
+        const struct nv2a_ovl_list *l = ls[i];
+        float sx = l->out_w ? (float)r.w / (float)l->out_w : 1.0f;
+        float sy = l->out_h ? (float)r.h / (float)l->out_h : 1.0f;
+        float xf[4] = { sx * 2.0f / dw, -sy * 2.0f / dh,
+                        r.x * 2.0f / dw - 1.0f, 1.0f - r.y * 2.0f / dh };
+        struct ovl_set *o = ovl_set(l, cb);
+        if (o) {
+            [enc setVertexBuffer:o->vb offset:0 atIndex:0];
+            [enc setVertexBuffer:o->ib offset:0 atIndex:1];
+            [enc setVertexBytes:xf length:sizeof xf atIndex:2];
+            for (c = 0; c < l->ncmd; c++) {
+                const struct nv2a_ovl_cmd *k = &l->cmd[c];
+                id<MTLTexture> t = ovl_texture(k->tex);
+                long x0 = r.x + (long)(k->clip[0] * sx), y0 = r.y + (long)(k->clip[1] * sy);
+                long x1 = r.x + (long)(k->clip[0] * sx + k->clip[2] * sx + 0.999f);
+                long y1 = r.y + (long)(k->clip[1] * sy + k->clip[3] * sy + 0.999f);
+                MTLScissorRect sc;
+                if (!t || !k->count)
+                    continue;
+                x0 = x0 < 0 ? 0 : x0 > dw ? dw : x0;
+                y0 = y0 < 0 ? 0 : y0 > dh ? dh : y0;
+                x1 = x1 < x0 ? x0 : x1 > dw ? dw : x1;
+                y1 = y1 < y0 ? y0 : y1 > dh ? dh : y1;
+                if (x1 == x0 || y1 == y0)
+                    continue;
+                sc.x = (NSUInteger)x0;
+                sc.y = (NSUInteger)y0;
+                sc.width = (NSUInteger)(x1 - x0);
+                sc.height = (NSUInteger)(y1 - y0);
+                [enc setScissorRect:sc];
+                [enc setFragmentTexture:t atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:k->first
+                        vertexCount:k->count];
+            }
+        }
+    }
+}
+#endif /* XBOXRECOMP_ENHANCE */
+
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
-                uint32_t pad, int filter, const char *shot_path, uint32_t flip)
+                uint32_t pad, int filter, const char *shot_path, uint32_t flip,
+                const struct nv2a_ovl_list *const *layers, int nlayers)
 {
     int ok = 0;
 
@@ -341,7 +539,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         id<MTLRenderCommandEncoder> enc;
         MTLRenderPassDescriptor *rp;
         id<MTLBuffer> shot = nil;
-        struct nv2a_rect r;
+        struct nv2a_rect r = {0, 0, 0, 0};
         int whole, dw = 0, dh = 0;
         unsigned ov = nv2a_host_opts()->overscan;
         CGSize cur = s_layer.drawableSize;
@@ -411,6 +609,21 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             }
         }
+#ifdef XBOXRECOMP_ENHANCE
+        /* Every overlay size comes from the frame's rectangle (the whole
+         * drawable before the first frame). */
+        if (r.w <= 0 || r.h <= 0) {
+            r.x = r.y = 0;
+            r.w = dw;
+            r.h = dh;
+        }
+        nv2a_overlay_set_placement(r.x, r.y, r.w, r.h);
+        if (nlayers && s_pso_ovl)
+            ovl_draw(enc, cb, layers, nlayers, r, dw, dh);
+#else
+        (void)layers;
+        (void)nlayers;
+#endif
         [enc endEncoding];
         if (shot_path) {
             shot = [s_dev newBufferWithLength:(NSUInteger)dw * dh * 4

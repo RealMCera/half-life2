@@ -89,6 +89,10 @@
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #include "mouse_sdl.h"        /* src/input: the mouse and its capture */
 #include "present_sdl_quit.h"
+#ifdef XBOXRECOMP_ENHANCE
+#include "kernel/nv2a_overlay.h"
+#include "kernel/nv2a_stats.h"
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
@@ -402,6 +406,18 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     __atomic_store_n(&s_have_draws, 1, __ATOMIC_RELAXED);
 }
 
+/* The flips the title's FPS counts: in enhancements builds the stats
+ * counters, so the title and the stats strip agree (RECOMP_TRACE=title
+ * holds NV2A_STATS_TITLE for the run); otherwise this file's own. */
+static uint64_t title_flips(void)
+{
+#ifdef XBOXRECOMP_ENHANCE
+    return nv2a_stats_count(NV2A_STAT_FLIPS);
+#else
+    return __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+#endif
+}
+
 static const char *window_name(void)
 {
     if (__atomic_load_n(&s_host_title_set, __ATOMIC_ACQUIRE) || !s_xbe_title[0])
@@ -519,9 +535,164 @@ static void shot_save(SDL_Renderer *ren, uint32_t flip)
     SDL_DestroySurface(surf);
 }
 
+#ifdef XBOXRECOMP_ENHANCE
+/* ── The overlay (nv2a_overlay.h) on the renderer ─────────────────────────
+ *
+ * This loop is the overlay's one reader on SDL and on the CAMetalLayer: it
+ * polls (the strip and toasts compose here), takes the visible lists and
+ * draws them, or hands them to fbm_present. The overlay's wake posts the
+ * frame event, so a change shows within one loop turn even while the guest
+ * does not flip. */
+
+static void ovl_wake(void)
+{
+    if (!__atomic_load_n(&s_running, __ATOMIC_ACQUIRE) || !s_frame_event)
+        return;
+    if (!__atomic_exchange_n(&s_wake_pending, 1, __ATOMIC_ACQ_REL)) {
+        SDL_Event ev;
+        memset(&ev, 0, sizeof ev);
+        ev.type = s_frame_event;
+        SDL_PushEvent(&ev);
+    }
+}
+
+/* Texture 0 is the atlas, 1.. the image slots; each re-made when its gen
+ * moves. Premultiplied, linear: a list built for another size is scaled. */
+static SDL_Texture *s_ovl_tex[1 + NV2A_OVL_IMAGES];
+static uint64_t     s_ovl_tex_gen[1 + NV2A_OVL_IMAGES];
+/* Each layer's list in SDL's vertex form, converted again only when its
+ * gen or the placement moves. */
+static struct ovl_conv {
+    SDL_Vertex *v;
+    uint32_t cap;
+    uint64_t gen;
+    SDL_FRect place;
+} s_ovl_conv[NV2A_OVL_COUNT];
+
+static SDL_Texture *ovl_texture(SDL_Renderer *ren, uint16_t k)
+{
+    const uint32_t *px;
+    uint32_t w, h;
+    uint64_t gen;
+    if (k == 0) {
+        const struct nv2a_ovl_atlas *a = nv2a_overlay_atlas();
+        if (!a)
+            return NULL;
+        px = a->px, w = a->w, h = a->h, gen = a->gen;
+    } else {
+        const struct nv2a_ovl_image *im = k <= NV2A_OVL_IMAGES ? nv2a_overlay_image(k) : NULL;
+        if (!im || !im->px)
+            return NULL;
+        px = im->px, w = im->w, h = im->h, gen = im->gen;
+    }
+    if (s_ovl_tex[k] && s_ovl_tex_gen[k] == gen)
+        return s_ovl_tex[k];
+    if (s_ovl_tex[k])
+        SDL_DestroyTexture(s_ovl_tex[k]);
+    s_ovl_tex[k] = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
+                                     (int)w, (int)h);
+    s_ovl_tex_gen[k] = gen;
+    if (s_ovl_tex[k]) {
+        SDL_SetTextureBlendMode(s_ovl_tex[k], SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+        SDL_SetTextureScaleMode(s_ovl_tex[k], SDL_SCALEMODE_LINEAR);
+        SDL_UpdateTexture(s_ovl_tex[k], NULL, px, (int)(w * 4));
+    }
+    return s_ovl_tex[k];
+}
+
+/* The visible lists over the frame at place (output pixels), after the
+ * frame and before the shot, so a window shot has them. */
+static void ovl_draw(SDL_Renderer *ren, const SDL_FRect *place)
+{
+    const struct nv2a_ovl_list *ls[NV2A_OVL_COUNT];
+    SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;
+    int n, i, lw = 0, lh = 0;
+
+    nv2a_overlay_set_placement((int)place->x, (int)place->y, (int)place->w, (int)place->h);
+    n = nv2a_overlay_lists(ls);
+    if (!n)
+        return;
+    /* The lists are in output pixels, not the frame's logical size. SDL
+     * 3.2 maps each draw by the logical presentation as it is queued (no
+     * intermediate target), so turning it off around these draws and back
+     * on before the present leaves the frame's draw as it was. Re-check
+     * after an SDL bump. */
+    SDL_GetRenderLogicalPresentation(ren, &lw, &lh, &mode);
+    if (mode != SDL_LOGICAL_PRESENTATION_DISABLED)
+        SDL_SetRenderLogicalPresentation(ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+    for (i = 0; i < n; i++) {
+        const struct nv2a_ovl_list *l = ls[i];
+        float sx = l->out_w ? place->w / (float)l->out_w : 1.0f;
+        float sy = l->out_h ? place->h / (float)l->out_h : 1.0f;
+        struct ovl_conv *cv = &s_ovl_conv[l->layer < NV2A_OVL_COUNT ? l->layer : 0];
+        uint32_t v, c;
+        if (l->nvtx > cv->cap) {
+            SDL_Vertex *nv = (SDL_Vertex *)realloc(cv->v, l->nvtx * sizeof *nv);
+            if (!nv)
+                continue;
+            cv->v = nv;
+            cv->cap = l->nvtx;
+            cv->gen = 0;
+        }
+        /* Converted already unless the list or the placement moved. */
+        v = cv->gen == l->gen && !memcmp(&cv->place, place, sizeof *place) ? l->nvtx : 0;
+        cv->gen = l->gen;
+        cv->place = *place;
+        for (; v < l->nvtx; v++) {
+            const struct nv2a_ovl_vtx *p = &l->vtx[v];
+            SDL_Vertex *q = &cv->v[v];
+            q->position.x = place->x + p->x * sx;
+            q->position.y = place->y + p->y * sy;
+            q->tex_coord.x = p->u;
+            q->tex_coord.y = p->v;
+            q->color.r = (float)(p->rgba & 0xff) / 255.0f;
+            q->color.g = (float)((p->rgba >> 8) & 0xff) / 255.0f;
+            q->color.b = (float)((p->rgba >> 16) & 0xff) / 255.0f;
+            q->color.a = (float)(p->rgba >> 24) / 255.0f;
+        }
+        for (c = 0; c < l->ncmd; c++) {
+            const struct nv2a_ovl_cmd *k = &l->cmd[c];
+            SDL_Texture *t = ovl_texture(ren, k->tex);
+            SDL_Rect clip;
+            if (!t || !k->count)
+                continue;
+            clip.x = (int)(place->x + k->clip[0] * sx);
+            clip.y = (int)(place->y + k->clip[1] * sy);
+            clip.w = (int)(k->clip[2] * sx + 0.999f);
+            clip.h = (int)(k->clip[3] * sy + 0.999f);
+            SDL_SetRenderClipRect(ren, &clip);
+            SDL_RenderGeometryRaw(ren, t, &cv->v[0].position.x, sizeof(SDL_Vertex),
+                                  &cv->v[0].color, sizeof(SDL_Vertex),
+                                  &cv->v[0].tex_coord.x, sizeof(SDL_Vertex),
+                                  (int)l->nvtx, l->idx + k->first, (int)k->count, 2);
+        }
+    }
+    SDL_SetRenderClipRect(ren, NULL);
+    if (mode != SDL_LOGICAL_PRESENTATION_DISABLED)
+        SDL_SetRenderLogicalPresentation(ren, lw, lh, mode);
+}
+
+static void ovl_close(void)
+{
+    unsigned k;
+    nv2a_overlay_set_wake(NULL);
+    for (k = 0; k <= NV2A_OVL_IMAGES; k++) {
+        if (s_ovl_tex[k])
+            SDL_DestroyTexture(s_ovl_tex[k]);
+        s_ovl_tex[k] = NULL;
+    }
+    for (k = 0; k < NV2A_OVL_COUNT; k++)
+        free(s_ovl_conv[k].v);
+    memset(s_ovl_conv, 0, sizeof s_ovl_conv);
+}
+#endif /* XBOXRECOMP_ENHANCE */
+
 /* The renderer, or the layer's resources; the window goes after. */
 static void close_present(SDL_Renderer *ren)
 {
+#ifdef XBOXRECOMP_ENHANCE
+    ovl_close();
+#endif
 #if defined(__APPLE__)
     if (s_layer) {
         fbm_destroy();
@@ -555,12 +726,19 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int filter = eo->present_filter;
     SDL_FRect dst;               /* integer: where the frame goes */
     int dst_ok = 0, out_w = 0, out_h = 0;
+#ifdef XBOXRECOMP_ENHANCE
+    uint64_t ovl_seen = 0;       /* nv2a_overlay_poll's value at the last draw */
+#endif
 
     /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
      * SDL would turn them into SDL_EVENT_QUIT. Set before the headless
      * return: audio and input start SDL subsystems in headless runs too. */
     xbox_sdl_env_compat();
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#ifdef XBOXRECOMP_ENHANCE
+    if (title_stats)
+        nv2a_stats_use(NV2A_STATS_TITLE, 1);
+#endif
     if (recomp_env_on(RENV_HEADLESS))
         return guest_main();
     shot_parse();
@@ -647,6 +825,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         return guest_main();
     }
     s_frame_event = s_guest_done_event + 1;
+#ifdef XBOXRECOMP_ENHANCE
+    nv2a_overlay_set_presenter(s_layer ? "Metal" : "SDL");
+    nv2a_overlay_set_wake(ovl_wake);
+#endif
     s_guest_main = guest_main;
     xbox_InputSetMainPump(1);
     xbox_InputSdlInit(win);
@@ -748,6 +930,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
             dirty = 1;
         }
+#ifdef XBOXRECOMP_ENHANCE
+        /* Disarmed (every golden): one load. Armed, the poll composes the
+         * strip and toasts when due; a move in what it draws redraws. */
+        if (nv2a_overlay_armed()) {
+            uint64_t e = nv2a_overlay_poll(now_ns(CLOCK_MONOTONIC) / 1000000ull);
+            if (e != ovl_seen) {
+                ovl_seen = e;
+                dirty = 1;
+            }
+        }
+#endif
 #if defined(__APPLE__)
         /* Not while minimised or hidden: nextDrawable then blocks for up to
          * its 1 s timeout, and the event pump and pad poll with it. */
@@ -757,13 +950,24 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             struct fb_slot *f = &s_slot[s_front];
             uint64_t t0 = now_ns(CLOCK_MONOTONIC);
             char path[512];
+#ifdef XBOXRECOMP_ENHANCE
+            const struct nv2a_ovl_list *ls[NV2A_OVL_COUNT];
+            int nls = nv2a_overlay_visible() ? nv2a_overlay_lists(ls) : 0;
+#else
+            const struct nv2a_ovl_list *const *ls = NULL;
+            int nls = 0;
+#endif
             if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
-                            f->n, f->pad, filter, shoot ? path : NULL, shown_flip)) {
+                            f->n, f->pad, filter, shoot ? path : NULL, shown_flip,
+                            nls ? ls : NULL, nls)) {
                 dirty = 0;
                 shoot = 0;
                 presents++;
+#ifdef XBOXRECOMP_ENHANCE
+                nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
+#endif
             }
             /* else no drawable (display asleep, window occluded): try again
              * at the next event or the 100 ms wake. */
@@ -796,19 +1000,36 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 SDL_RenderTexture(ren, tex, NULL, &dst);
             } else if (tex)
                 SDL_RenderTexture(ren, tex, NULL, NULL);
+#ifdef XBOXRECOMP_ENHANCE
+            if (nv2a_overlay_visible()) {
+                SDL_FRect pl = {0, 0, 0, 0};
+                int ow = 0, oh = 0;
+                if (tex && filter == NV2A_PRESENT_INTEGER && dst_ok)
+                    pl = dst;
+                else if (!tex || !SDL_GetRenderLogicalPresentationRect(ren, &pl)
+                         || pl.w <= 0) {
+                    SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
+                    pl.w = (float)ow;
+                    pl.h = (float)oh;
+                }
+                ovl_draw(ren, &pl);
+            }
+#endif
             if (shoot) {
                 shoot = 0;
                 shot_save(ren, shown_flip);
             }
             SDL_RenderPresent(ren);
             presents++;
+#ifdef XBOXRECOMP_ENHANCE
+            nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
+#endif
         }
 
         if (win) {                     /* title bar: name, or 1 Hz stats */
             double fps;
             if (xbox_title_due(&title_clock, title_stats,
-                               now_ns(CLOCK_MONOTONIC) / 1000000ull,
-                               __atomic_load_n(&s_flips, __ATOMIC_RELAXED),
+                               now_ns(CLOCK_MONOTONIC) / 1000000ull, title_flips(),
                                __atomic_load_n(&s_name_gen, __ATOMIC_ACQUIRE),
                                &fps)) {
                 char tb[192];

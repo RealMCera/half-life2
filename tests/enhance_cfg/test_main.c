@@ -18,6 +18,7 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_overlay.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
@@ -965,6 +966,19 @@ const struct nv2a_pb_present *nv2a_pb_present_state(void)
     static struct nv2a_pb_present p;
     return &p;
 }
+/* The overlay (nv2a_overlay.c, tests/overlay has it): record what
+ * overlay.stats asks of it. */
+static uint32_t s_ovl_layers;
+static int s_ovl_stats = -1;
+int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
+{
+    (void)out_h;
+    s_ovl_layers = layers;
+    return 0;
+}
+void nv2a_overlay_set_stats(int on) { s_ovl_stats = on; }
+int nv2a_overlay_stats(void) { return s_ovl_stats > 0; }
+void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 DWORD xbox_InputLastState(DWORD port, XBOX_INPUT_STATE *st)
 {
     (void)port;
@@ -1000,6 +1014,7 @@ static void enhance_reset_env(void)
     recomp_env_set(RENV_HOST_GAMESCOPE, NULL);
     recomp_env_set(RENV_TEXTURES_FONT, NULL);
     recomp_env_set(RENV_TEXTURES_TEXT, NULL);
+    recomp_env_set(RENV_OVERLAY_STATS, NULL);
 }
 
 static void test_enhance_init(void)
@@ -1193,6 +1208,24 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_PRESENT_PACING, "nap");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
+
+    /* overlay.stats: stock arms neither the actions hook nor the overlay
+     * (no atlas line in a golden). A feature key arms the stats and toast
+     * layers, hidden, so the action and toasts can show later; on also
+     * shows the strip. */
+    s_ovl_layers = 0;
+    s_ovl_stats = -1;
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_ovl_stats == -1 && s_ovl_layers == 0);
+    write_file("ecfg_menu.toml", "[menu]\nenabled = true\n");
+    recomp_env_set(RENV_CONFIG, "ecfg_menu.toml");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_ovl_stats == -1);
+    CHECK(s_ovl_layers == ((1u << NV2A_OVL_STATS) | (1u << NV2A_OVL_TOAST)));
+    recomp_env_set(RENV_CONFIG, "none");
+    s_ovl_layers = 0;
+    recomp_env_set(RENV_OVERLAY_STATS, "1");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_ovl_stats == 1);
+    CHECK(s_ovl_layers == ((1u << NV2A_OVL_STATS) | (1u << NV2A_OVL_TOAST)));
+    recomp_env_set(RENV_OVERLAY_STATS, NULL);
 
     /* A file that does not parse: -1, stock. */
     write_file("ecfg_broken.toml", "[render]\nscale = \n");

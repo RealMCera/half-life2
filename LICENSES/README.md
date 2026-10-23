@@ -21,3 +21,12 @@ The rest are for dsp56300, linked only in builds with
 - `Apache-2.0.txt`, `LLVM-exception.txt`, `Unicode-3.0.txt`,
   `Zlib-foldhash.txt`: the licence texts those crates use, taken from that
   file.
+
+The enhancements overlay, compiled only with `-DXBOXRECOMP_ENHANCE=ON`
+(see "the enhancements overlay" in the top-level NOTICE), vendors three
+components under `third_party/`:
+
+- `MIT-microui.txt`: microui's licence, verbatim from its repository.
+- `MIT-stb.txt`: the stb licence file, verbatim (MIT or public domain).
+- `OFL-1.1-atkinson-hyperlegible.txt`: the Atkinson Hyperlegible font
+  licence, verbatim from google/fonts (also beside the font as `OFL.txt`).

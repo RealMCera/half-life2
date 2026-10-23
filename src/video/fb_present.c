@@ -24,6 +24,7 @@
 #include <string.h>
 #include "video_player.h"   /* the xbox_FramebufferWindow* prototypes */
 #include "window_title.h"
+#include "../kernel/nv2a_stats.h"
 #include "keyboard.h"       /* src/input: the key table this window feeds */
 #include "mouse.h"
 
@@ -315,10 +316,20 @@ int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, struct xbox_title_clock 
     double fps;
     const char *name;
 
-    if (stats < 0)
+    if (stats < 0) {
         stats = recomp_env_on(RENV_TITLE_STATS);
+        if (stats)
+            nv2a_stats_use(NV2A_STATS_TITLE, 1);
+    }
+    /* In enhancements builds the flips are the stats counters', so the
+     * title and the stats strip agree. */
+#ifdef XBOXRECOMP_ENHANCE
+    if (n < 1 || !xbox_title_due(c, stats, GetTickCount64(),
+                                 nv2a_stats_count(NV2A_STAT_FLIPS), (unsigned)s_name_gen, &fps))
+#else
     if (n < 1 || !xbox_title_due(c, stats, GetTickCount64(),
                                  (uint32_t)s_flips, (unsigned)s_name_gen, &fps))
+#endif
         return 0;
     name = s_host_title_set ? s_title : s_xbe_title[0] ? s_xbe_title : s_title;
     xbox_title_format(u8, sizeof u8, name, stats, fps, 1,
