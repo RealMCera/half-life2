@@ -3178,6 +3178,41 @@ uint32_t xbox_VblankCount(void)
     return (uint32_t)g_vblank_total;
 }
 
+/* Written by the timer thread, read by the nv2a-ack thread. The stamp means
+ * something only next to the count: a walk that sees a vblank's count must
+ * see that vblank's stamp. The timer thread stores it before the count's
+ * InterlockedIncrement (a full barrier, so a release), and the reader
+ * fences (acquire) between its count read and its stamp read
+ * (nv2a_pb_exec_walk_begin). The stamped-vblank count and the latest raise
+ * since the last pacing line are for the trace only. */
+static uint64_t g_vblank_behind_ns;
+static uint32_t g_vblank_behind_n;
+static uint64_t g_vblank_late_max_ns;
+
+uint64_t xbox_VblankBehindNs(void)
+{
+    return __atomic_load_n(&g_vblank_behind_ns, __ATOMIC_RELAXED);
+}
+
+void xbox_VblankBehindTake(uint32_t *behind, uint64_t *late_max_ns)
+{
+    *behind = __atomic_exchange_n(&g_vblank_behind_n, 0, __ATOMIC_RELAXED);
+    *late_max_ns = __atomic_exchange_n(&g_vblank_late_max_ns, 0,
+                                       __ATOMIC_RELAXED);
+}
+
+static void kernel_vblank_behind(uint64_t late_ns)
+{
+    /* One writer; a reset that races this only loses one window's max. */
+    if (late_ns > __atomic_load_n(&g_vblank_late_max_ns, __ATOMIC_RELAXED))
+        __atomic_store_n(&g_vblank_late_max_ns, late_ns, __ATOMIC_RELAXED);
+    if (late_ns > XBOX_VBLANK_BEHIND_NS) {
+        __atomic_store_n(&g_vblank_behind_ns, xbox_HostNowNs(),
+                         __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_vblank_behind_n, 1, __ATOMIC_RELAXED);
+    }
+}
+
 /* RECOMP_DEBUG=vblank_clock=ms: the timer loop as it was before the
  * nanosecond schedule (millisecond grid, Sleep(ms), 10 ms re-poll after a
  * gate-busy drain), kept for A/B runs and bisecting. */
@@ -3395,6 +3430,7 @@ static long kernel_vblank_tick(void)
     due = t0 + (long long)(count * 1000ull / 60ull);
     if (now < due)
         return (long)(due - now);
+    kernel_vblank_behind((uint64_t)(now - due) * 1000000ull);
     if (now - due > 100) {
         t0 = now;
         count = 0;
@@ -3429,6 +3465,8 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
         return 0;
     if (late && xbox_ProfOn())
         xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
+    kernel_vblank_behind(late ? late
+                              : now_ns - xbox_VblankScheduleLastDue(&sched));
     kernel_vblank_count(kernel_clock_ms());
     xbox_PacingVblank(now_ns);
     kernel_vblank_raise();

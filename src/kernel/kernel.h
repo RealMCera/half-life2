@@ -1323,6 +1323,16 @@ extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
  * parity that the field pin (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
 
+/* Host time (xbox_HostNowNs) of the last vblank raised more than
+ * XBOX_VBLANK_BEHIND_NS after its edge, 0 for none: the clock catching up
+ * one vblank per millisecond after a host stall. The flip hold reads it to
+ * tell a walk the stall made late from one in its usual window. */
+#define XBOX_VBLANK_BEHIND_NS 4000000ull
+uint64_t xbox_VblankBehindNs(void);
+/* For the pacing trace: the vblanks stamped behind, and the latest any
+ * vblank was raised after its edge, since the last call (then reset). */
+void xbox_VblankBehindTake(uint32_t *behind, uint64_t *late_max_ns);
+
 /* One vblank's acknowledgement (kernel_bridge.c, the vblank-ack thread):
  * waits for the DPC's write of the PCRTC_INTR_0 vblank bit and clears it and
  * PMC_INTR_0's PCRTC bit. Yields for 2 ms, then waits on `rearm` in 1 ms

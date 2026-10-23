@@ -463,10 +463,21 @@ static uint64_t s_vbl_moved_ns;
  * vblank past it; the title's next frame then counted as a second flip in
  * the same vblank and was held for most of a frame. */
 static uint32_t s_walk_vbl;
+/* Each read of PUT by the ack loop, with the count read before it: the
+ * flip hold's bound on a late walk's kick (nv2a_flip_hold.h). */
+void nv2a_pb_exec_put_read(uint32_t vbl, uint32_t put)
+{
+    xbox_FlipHoldPutRead(&s_flip_hold, vbl, put, xbox_HostNowNs());
+}
 
 void nv2a_pb_exec_walk_begin(void)
 {
     s_walk_vbl = xbox_VblankCount();
+    /* The stamp after the count: seeing a catch-up vblank's count without
+     * its stamp (arm64 may load them out of order) would take the late
+     * count for the flip, the slip the stamp exists to prevent. */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    xbox_FlipHoldWalk(&s_flip_hold, xbox_VblankBehindNs());
 }
 
 /* RECOMP_DEBUG=flip_pacing: 0 off (flips complete at once, frame counters
@@ -524,14 +535,23 @@ void nv2a_pb_exec_flip_cancel(void)
 void nv2a_pb_exec_flip_report(void)
 {
     XboxFlipHold *h = &s_flip_hold;
+    uint32_t behind;
+    uint64_t vbl_late_max;
     if (nv2a_pb_exec_flip_pacing() == 0)
         return;
+    /* behind: vblanks raised more than XBOX_VBLANK_BEHIND_NS late (stalls
+     * the late-walk gate trusts); vbl_late_max_ms: the margin under it on a
+     * host with no stall. */
+    xbox_VblankBehindTake(&behind, &vbl_late_max);
     fprintf(stderr, "[PACING]   flip hold: holds %u held_ms %.1f hold_timeouts %u"
             " clock_stops %u iv0 %u iv1 %u iv2 %u iv3 %u nonop %u"
-            " counters_owned %u\n", h->holds, h->held_ns / 1e6, h->timeouts,
-            h->clock_stops, h->iv[0], h->iv[1], h->iv[2], h->iv[3], h->nonop,
-            xbox_Nv2aFrameCountersOwned());
+            " counters_owned %u late_walks %u late_max %u behind %u"
+            " vbl_late_max_ms %.2f\n", h->holds,
+            h->held_ns / 1e6, h->timeouts, h->clock_stops, h->iv[0], h->iv[1],
+            h->iv[2], h->iv[3], h->nonop, xbox_Nv2aFrameCountersOwned(),
+            h->late_walks, h->late_max, behind, vbl_late_max / 1e6);
     h->holds = h->timeouts = h->clock_stops = h->nonop = 0;
+    h->late_walks = h->late_max = 0;
     h->iv[0] = h->iv[1] = h->iv[2] = h->iv[3] = 0;
     h->held_ns = 0;
 }

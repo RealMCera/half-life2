@@ -1231,6 +1231,7 @@ static DWORD g_frame_counter_last_ms = 0;
 static uint32_t g_frame_counters_owned;
 
 extern int nv2a_pb_exec_flip_pacing(void);
+extern void nv2a_pb_exec_put_read(uint32_t vbl, uint32_t put);
 
 uint32_t xbox_Nv2aFrameCountersOwned(void) { return g_frame_counters_owned; }
 
@@ -2054,10 +2055,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              * is being drawn and the missing piece is upstream of the GPU. */
             static DWORD  last_put_ms;
             DWORD now_ms = GetTickCount();
-            uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            /* Read before PUT: the last read that saw the old PUT bounds
+             * the kick's vblank from below (nv2a_pb_exec_put_read). */
+            uint32_t idle_vbl = xbox_VblankCount();
+            uint32_t put;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* the count first */
+            put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             /* The title wrote its commands before PUT: acquire, so the walk
              * reads them and not older data (arm64 reorders loads). */
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            nv2a_pb_exec_put_read(idle_vbl, put);
             if (!flip_held
                     && (put != g_scanned_put || (now_ms - last_put_ms) > 2000)) {
                 /* Survey the segment the title just submitted, once. */
@@ -2225,10 +2232,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             /* A PUT watch that ran out: poll for the rest of this tick. */
             int watch_missed = 0;
             for (;;) {
-                uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-                uint32_t vbl = xbox_VblankCount();  /* before the hold's poll */
+                /* Before the hold's poll, and before PUT: as at the scan. */
+                uint32_t vbl = xbox_VblankCount();
+                uint32_t put;
                 int held, acked = 0;
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* as at the scan */
+                nv2a_pb_exec_put_read(vbl, put);
                 held = nv2a_pb_exec_flip_poll();
                 if (held) {
                     /* Held: no walk and no kick ack, even with nothing to

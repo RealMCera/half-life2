@@ -65,6 +65,11 @@ int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
     return 1;
 }
 
+uint64_t xbox_VblankScheduleLastDue(const XboxVblankSchedule *s)
+{
+    return vblank_due(s, s->count ? s->count - 1u : 0u);
+}
+
 /* ── Mode and the wait ───────────────────────────────────── */
 
 #define SPIN_TIMEOUT_MS 1

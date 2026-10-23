@@ -44,6 +44,10 @@ typedef struct {
 int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
                         uint64_t *next_due_ns, uint64_t *restarted_late_ns);
 
+/* The edge of the vblank the last call that returned 1 fired: now minus
+ * this is how far behind the grid it was raised (0 after a restart). */
+uint64_t xbox_VblankScheduleLastDue(const XboxVblankSchedule *s);
+
 /* ── The pacing mode ── */
 enum { XBOX_PACING_SPIN = 0, XBOX_PACING_SLEEP = 1 };
 

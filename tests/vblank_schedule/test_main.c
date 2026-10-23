@@ -61,7 +61,7 @@ static void late_tick(void)
 {
     XboxVblankSchedule s = {0};
     uint64_t t0 = 1 * NS_PER_S, now, next, late;
-    int fired = 0, restarted = 0;
+    int fired = 0, restarted = 0, behind_ok = 1;
 
     xbox_VblankSchedule(&s, t0, &next, &late);
     /* The next pass comes 50 ms late: edges 1, 2 and 3 (16.7, 33.3 and
@@ -71,12 +71,16 @@ static void late_tick(void)
     while (xbox_VblankSchedule(&s, now, &next, &late)) {
         fired++;
         restarted |= late != 0;
+        /* The kernel stamps a vblank raised this far behind its edge as
+         * the clock catching up (the flip hold's late-walk gate). */
+        behind_ok &= xbox_VblankScheduleLastDue(&s) == edge(t0, fired);
         if (fired > 10)
             break;
     }
     check(fired == 3, "50 ms late: the three missed edges fire one per call");
     check(!restarted && s.t0_ns == t0, "50 ms late: the grid keeps its epoch");
     check(next == edge(t0, 4), "50 ms late: then waits for the next edge");
+    check(behind_ok, "50 ms late: each fired edge is the one it was raised for");
 }
 
 static void stall_restart(void)
