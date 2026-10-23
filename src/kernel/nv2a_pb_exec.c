@@ -5939,6 +5939,10 @@ static void get_report(uint32_t param)
  * (writes_back): the CPU rasteriser's tris_drawn stays put under one, and
  * RECOMP_FB_DUMP_FLIPS reads "drew something" from both. */
 static uint32_t s_gpu_backend_batches;
+/* Every batch handed to a non-CPU backend, writes_back or not: the pacing
+ * trace's draw count (D3D11 does not write back, and the CPU counters stay
+ * at 0 under any GPU backend, so its flips read 0 batches without this). */
+static uint32_t s_pacing_backend_batches;
 static int s_null_draw_us;  /* RECOMP_PB_NULL_DRAW_US: a backend's cost, simulated */
 static void null_on_draw(const struct nv2a_pb_draw *d)
 {
@@ -6332,6 +6336,10 @@ static void draw_primitive(void)
         } else
             s_backend->on_draw(&d);
         s_perf.draw += rt_now() - t0;
+        /* The CPU rasteriser already counts its batches into s_gpu.batches_*,
+         * so counting it here too would double the [PACING] figure. */
+        if (s_backend != &s_cpu_backend)
+            s_pacing_backend_batches++;
         if (s_backend->writes_back)
             s_gpu_backend_batches++;
     }
@@ -7005,7 +7013,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {
             static uint32_t prev;
             uint32_t b = s_gpu.batches_textured + s_gpu.batches_no_uv
-                       + s_gpu.batches_no_tex + s_gpu_backend_batches;
+                       + s_gpu.batches_no_tex + s_pacing_backend_batches;
             xbox_PacingFlip(s_gpu.flips, b - prev);
             prev = b;
         }

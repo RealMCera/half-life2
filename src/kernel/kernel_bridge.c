@@ -30,6 +30,7 @@
 #include "kernel_pacing.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
+#include "platform/host_prof.h"
 #include "recomp_exit_hook.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
@@ -543,8 +544,11 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
         snprintf(os, sizeof os, "guest-w-%04X", (unsigned)(routine & 0xFFFF));
     else
         snprintf(os, sizeof os, "%.15s", role);
-    if (!strcmp(role, "process-main"))
+    if (!strcmp(role, "process-main")) {
         main_tid = GetCurrentThreadId();
+        /* RECOMP_TRACE=prof: the earliest point every host passes once. */
+        host_prof_start_from_env();
+    }
     /* Not the initial thread: on Linux (Wine included) its name is the
      * process comm, so renaming it to guest-main breaks pgrep and ps. */
     if (GetCurrentThreadId() != main_tid)

@@ -332,7 +332,21 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 
 static void pump(void)
 {
+    /* RECOMP_WINDOW_QUIT_AFTER=<seconds>: close the window then, as the SDL
+     * window does, so a timed bench run leaves through WM_CLOSE (the exit
+     * hooks: profile and summaries) rather than a kill. Timed from the
+     * first pump, the window's first frame. */
+    static ULONGLONG quit_at;
+    static int quit_posted;
     MSG msg;
+    if (!quit_at && recomp_env(RENV_WINDOW_QUIT_AFTER)) {
+        double s = atof(recomp_env(RENV_WINDOW_QUIT_AFTER));
+        quit_at = s > 0 ? GetTickCount64() + (ULONGLONG)(s * 1000.0) : (ULONGLONG)-1;
+    }
+    if (quit_at && quit_at != (ULONGLONG)-1 && !quit_posted && GetTickCount64() >= quit_at) {
+        quit_posted = 1;
+        PostMessageA(s_hwnd, WM_CLOSE, 0, 0);
+    }
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);

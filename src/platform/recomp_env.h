@@ -273,6 +273,9 @@ extern "C" {
     X(PB_REPORT_MS,      TRACE, "pb_report_ms",    "RECOMP_PB_REPORT_MS",      "=ms: [PB] report / fb_dump interval (10000, min 100)") \
     X(DPC_PROF,          TRACE, "dpc",             NULL,                       "[DPCPROF] time per host-run DPC/ISR routine and its waits, under the 600-vblank line") \
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, the flip hold (holds, held ms, timeouts, intervals), CPU and spin-wait sites every 600 flips; =all also every flip") \
+    X(PROF,              TRACE, "prof",            NULL,                       "=hz (1: 250): sample every thread's pc in-process (Windows, Wine, macOS); report at exit, module offsets for the bench to symbolise (host_prof.h)") \
+    X(PROF_DELAY,        TRACE, "prof_delay",      NULL,                       "=s: prof starts sampling after this many seconds (default 0)") \
+    X(PROF_OUT,          TRACE, "prof_out",        NULL,                       "=path: prof's report (default recomp-prof.txt in the working directory)") \
     X(GUEST_CPU_TRACE,   TRACE, "guest_cpu",       NULL,                       "=ms: [GUEST] each hold of the guest CPU (RECOMP_GUEST_LOCK) longer than ms and where it ended (first 50, then one a second)") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
     X(FLIP_PACING,       DEBUG, "flip_pacing",     NULL,                       "=0: a FLIP_STALL completes at once and registered frame counters are bumped on every flip, as before (default: the walker and the KickOff ack hold after a flip until the guest vblank reaches the swap's interval, and a counter the title moves itself is left to it); =edge: D3D's rule, a late frame waits for the next vblank (A/B)") \
