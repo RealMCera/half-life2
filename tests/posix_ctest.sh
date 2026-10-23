@@ -88,6 +88,11 @@ if [ -f "$here/template_main/CMakeLists.txt" ]; then
     # dsp56300 archive and its system libraries to the game's link.
     build_one template_main_apu_dsp template_main -DXBOXRECOMP_APU_DSP=ON >>"$built"
 fi
+# input_actions once more under ThreadSanitizer: its live rebuild case races
+# a polling thread and a flip thread against rebuilds (n/a without TSan).
+if [ -f "$here/input_actions/CMakeLists.txt" ]; then
+    build_one input_actions_tsan input_actions -DINPUT_ACTIONS_TSAN=ON >>"$built"
+fi
 for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] || echo "n/a   $(basename "$d"): no CMakeLists.txt, not a ctest"
 done >>"$built"

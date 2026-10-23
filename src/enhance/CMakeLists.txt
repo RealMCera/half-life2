@@ -5,6 +5,8 @@
 #   enhance.c      xbox_enhance_init: the toolkit's keys into nv2a_host_opts
 #   enhance_input.c the [input] keys into src/input (keyboard and mouse),
 #                  and a mod's input state and capture
+#   enhance_actions.c host actions: the registry, [input.actions], the pad
+#                  filter and the flip tick (enhance_actions.h)
 #   mod.c          the mods: the title's table, the mod API, the frame and
 #                  batch-filter dispatch (mod.h)
 # docs/runtime/config.md has the file format and the keys.
@@ -13,7 +15,7 @@
 # the other way round: with the layer off the options stay zero (stock).
 
 add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_input.c
-    mod.c)
+    enhance_actions.c mod.c)
 target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
 if(NOT MSVC)

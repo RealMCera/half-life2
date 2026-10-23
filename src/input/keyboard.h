@@ -78,7 +78,19 @@ void xbox_InputKeyEventWin32(int vk, unsigned long lparam, int down);
  * then one in 50, so a held key or a busy wheel cannot flood the log. */
 void xbox_InputTraceEdge(const char *fmt, ...);
 
-/* The runtime table. Reset copies the compiled-in map back. Bind adds one
+/* The runtime table is edited as a staging copy. Until the first Commit
+ * the poll composes from the staging copy itself (a title or a test that
+ * binds before its first poll); Commit publishes a snapshot of it and of
+ * xbox_InputKeyboardOpts, which the poll thread takes at its next poll by
+ * one pointer swap, so a live rebuild (the menu, a reload) never changes
+ * the table under a poll in flight. Commit is any thread; Reset also drops
+ * the committed table at the next poll (tests). Stage copies the
+ * compiled-in map into the staging copy only: the poll keeps the committed
+ * table until the next Commit, so a live rebuild never shows it a half-built
+ * one. */
+void xbox_InputBindingsCommit(void);
+void xbox_InputBindingsStage(void);
+/* Reset copies the compiled-in map back. Bind adds one
  * input to a control: 0, or -1 when the control already has
  * XBOX_BIND_MAX inputs or an argument is out of range. BindingsOf copies
  * up to max of a control's inputs out and returns how many it has. */
@@ -93,6 +105,9 @@ int  xbox_InputBindingsOf(int control, int *codes, int *is_mouse, int max);
  * walk_scale of full. Code defaults: 0, 0, 1.0. */
 #define XBOX_KBM_STICK_FLOOR 0.41
 void xbox_InputKeyboardOpts(int stick_ramp_ms, int walk_code, double walk_scale);
+/* The walk key the last KeyboardOpts set (0: none), for the host actions'
+ * check that an action key is not one the guest receives. */
+int  xbox_InputKeyboardWalkKey(void);
 /* The poll's clock (input_core.c installs the backend's now_ms). Without
  * one a ramp is instant. */
 void xbox_InputKbmSetClock(uint64_t (*now_ms)(void));

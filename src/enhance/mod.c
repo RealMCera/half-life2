@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "enhance_actions.h"
 #include "enhance_cfg.h"
 #include "recomp_exit_hook.h"
 #include "xbox_memory_layout.h"
@@ -44,6 +45,32 @@ static void api_log(const struct xbox_mod *m, const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+
+/* Until the overlay's TOAST layer (phase 3B) a toast is a log line. */
+static void api_toast(const struct xbox_mod *m, const char *fmt, ...)
+{
+    va_list ap;
+    fprintf(stderr, "[MOD %s] toast: ", m && m->name ? m->name : "?");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static int api_action_register(const char *name, const char *label,
+                               const char *const *defaults)
+{
+    if (s_init_owner < 0)
+        return -1;
+    return enhance_action_register_owned(name, label, defaults, s_init_owner);
+}
+
+static int api_actions_arm(const char *key)
+{
+    if (s_init_owner < 0)
+        return enhance_actions_armed();
+    return enhance_actions_arm_owned(key, s_init_owner);
 }
 
 static int api_on_frame(xbox_mod_frame_fn fn, void *user)
@@ -96,6 +123,7 @@ static void drop_owner(int owner)
         if (s_filter[i].owner != owner)
             s_filter[n++] = s_filter[i];
     s_nfilter = n;
+    enhance_actions_drop_owner(owner);
 }
 
 static void exit_hook(const char *why)
@@ -121,6 +149,7 @@ int xbox_mod_init(void)
     s_nrunning = s_nframe = s_nfilter = 0;
     s_shut = 0;
     memset(&s_api, 0, sizeof s_api);
+    enhance_actions_drop_mods();
     if (!s_table || !s_table[0]) {
         nv2a_batch_filter_set(NULL);
         return 0;   /* no lines: a title without mods logs as before */
@@ -139,6 +168,11 @@ int xbox_mod_init(void)
     s_api.input_state = enhance_input_state;
     s_api.input_capture = enhance_input_capture;
     s_api.batch_filter = api_batch_filter;
+    s_api.action_register = api_action_register;
+    s_api.action_pressed = enhance_action_pressed;
+    s_api.action_down = enhance_action_down;
+    s_api.toast = api_toast;
+    s_api.actions_arm = api_actions_arm;
 
     for (i = 0; s_table[i]; i++) {
         const struct xbox_mod *m = s_table[i];

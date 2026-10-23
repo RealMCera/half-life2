@@ -242,6 +242,22 @@ static int parse_string(P *ps, Buf *out)
 
 /* ── keys ──────────────────────────────────────────────────────────── */
 
+/* Tables whose keys are names with dots in them, stored flat: under
+ * [input.actions], "menu.open" = [...] (what a TOML writer emits for that
+ * key) and menu.open = [...] are the same entry. Only a last key part may
+ * quote a dot, and only directly under one of these. */
+static const char *const flat_tables[] = { "input.actions." };
+
+static int flat_quoted(const Buf *out, size_t before)
+{
+    for (size_t i = 0; i < sizeof flat_tables / sizeof flat_tables[0]; i++) {
+        size_t n = strlen(flat_tables[i]);
+        if (before == n && !memcmp(out->b, flat_tables[i], n))
+            return 1;
+    }
+    return 0;
+}
+
 /* A bare, quoted or dotted key, appended to `out` with '.' between parts. */
 static int parse_key(P *ps, Buf *out)
 {
@@ -253,8 +269,14 @@ static int parse_key(P *ps, Buf *out)
                 return 0;
             if (out->n == before)
                 return fail(ps, "empty key");
-            if (memchr(out->b + before, '.', out->n - before))
-                return fail(ps, "'.' inside a quoted key is not supported");
+            if (memchr(out->b + before, '.', out->n - before)) {
+                if (!flat_quoted(out, before))
+                    return fail(ps, "'.' inside a quoted key is not supported");
+                skip_ws(ps);
+                if (ps->p < ps->end && *ps->p == '.')
+                    return fail(ps, "a quoted key with '.' must be the last part");
+                return 1;
+            }
         } else {
             const char *s = ps->p;
             while (ps->p < ps->end && is_bare(*ps->p))

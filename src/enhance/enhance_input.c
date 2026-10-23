@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "enhance_actions.h"
 #include "enhance_cfg.h"
 #include "input_names.h"
 #include "keyboard.h"
@@ -75,7 +76,7 @@ static const char *reserved_use(int code, int is_mouse)
         return NULL;
     switch (code) {
     case 0x78: return "frees the cursor (input.mouse_release_key)";
-    case 0x79: return "the menu hotkey (menu.hotkey)";
+    case 0x79: return "menu.open's default ([input.actions])";
     case 0x7A: return "reserved for the fullscreen hotkey";
     }
     return NULL;
@@ -329,7 +330,9 @@ static int taken_above(int f, int code, int mouse)
 /* Resolve and apply; counts[f] is how many controls file f decided. */
 static void apply_bindings(int counts[NFILES])
 {
-    xbox_InputBindingsReset();
+    /* The poll keeps the committed table until enhance_input_init commits
+     * this one (a live reload). */
+    xbox_InputBindingsStage();
     for (int ctl = 0; ctl < XBOX_CTL_COUNT; ctl++) {
         int f;
         for (f = 0; f < NFILES && !s_set[f][ctl].named; f++)
@@ -425,6 +428,9 @@ int enhance_input_init(void)
     for (int f = SLOT_DEF; f >= 0; f--)
         scan_file(f);
     apply_bindings(counts);
+    /* Published as one table the poll swaps in, so a reload never edits
+     * what a poll in flight composes from. */
+    xbox_InputBindingsCommit();
     warn_key_clash("input.mouse_release_key", mo.release_key);
     warn_key_clash("input.walk_key", walk_code);
     if (walk_code && walk_code == mo.release_key)
@@ -464,6 +470,15 @@ int enhance_input_init(void)
                     " (%s)\n", script);
     }
     fflush(stderr);
+    return 0;
+}
+
+/* A live reload (the menu's Apply, R1): the knobs and the bindings again,
+ * then the actions, whose rule 2 checks against the new key map. */
+int enhance_input_reload(void)
+{
+    enhance_input_init();
+    enhance_actions_rebuild();
     return 0;
 }
 

@@ -1856,6 +1856,32 @@ static inline int nv2a_batch_skip(const struct nv2a_pb_draw *d, const struct nv2
     return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Flip hook (enhancements layer only)                                      */
+/* ------------------------------------------------------------------------ */
+
+/* Called once per flip on the ack thread, after the backend's on_flip, for
+ * the host actions' tick (src/enhance/enhance_actions.c): a title that stops
+ * polling its pad (a loading screen) still opens the menu. Installed only
+ * when a feature key arms the actions; with none installed the cost is one
+ * load and a branch per flip, and with XBOXRECOMP_ENHANCE off nothing. */
+typedef void (*nv2a_flip_hook_fn)(void);
+
+#ifdef XBOXRECOMP_ENHANCE
+extern nv2a_flip_hook_fn nv2a_flip_hook_installed;
+/* Install (NULL removes) the hook. One. */
+void nv2a_flip_hook_set(nv2a_flip_hook_fn fn);
+#endif
+
+static inline void nv2a_flip_hook_run(void)
+{
+#ifdef XBOXRECOMP_ENHANCE
+    nv2a_flip_hook_fn fn = __atomic_load_n(&nv2a_flip_hook_installed, __ATOMIC_ACQUIRE);
+    if (fn)
+        fn();
+#endif
+}
+
 #ifdef __cplusplus
 }
 #endif

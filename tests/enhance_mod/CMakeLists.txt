@@ -18,6 +18,7 @@ add_executable(enhance_mod_test
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/enhance/enhance.c
     ${XR_SRC}/enhance/enhance_input.c
+    ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/mod.c
     ${XR_SRC}/input/input_core.c
     ${XR_SRC}/input/keyboard.c

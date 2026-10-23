@@ -38,9 +38,21 @@
 #define XCHG(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_ACQ_REL)
 #define ADD(p, v)    __atomic_add_fetch((p), (v), __ATOMIC_ACQ_REL)
 
-static xbox_mouse_opts s_opts = {
+/* The options, read by the poll and the window threads while the menu may
+ * change them live: a writer fills the next slot of a ring and publishes
+ * its index, so a reader sees one whole set, old or new. A reader that
+ * still holds a slot is overwritten only XBOX_MOUSE_OPT_RING writes later.
+ * One writer at a time (the config layer, the menu). */
+#define XBOX_MOUSE_OPT_RING 8
+static xbox_mouse_opts s_optbuf[XBOX_MOUSE_OPT_RING] = { {
     XBOX_MOUSE_LOOK_RIGHT, 1.0, 0, 0, 0.45, XBOX_MOUSE_CAPTURE_FOCUS, 0x78, 100
-};
+} };
+static unsigned s_optidx;
+
+static const xbox_mouse_opts *opts(void)
+{
+    return &s_optbuf[LOAD(&s_optidx) % XBOX_MOUSE_OPT_RING];
+}
 static int s_enable = -1;
 
 /* Window thread in, poll thread out. */
@@ -90,16 +102,19 @@ static void update(const char *reason);
 
 void xbox_InputMouseOpts(const xbox_mouse_opts *o)
 {
+    unsigned n = LOAD(&s_optidx) + 1;
+
     if (o)
-        s_opts = *o;
+        s_optbuf[n % XBOX_MOUSE_OPT_RING] = *o;
     else
-        xbox_InputMouseDefaultOpts(&s_opts);
+        xbox_InputMouseDefaultOpts(&s_optbuf[n % XBOX_MOUSE_OPT_RING]);
+    STORE(&s_optidx, n);
     update("off");
 }
 
 void xbox_InputMouseGetOpts(xbox_mouse_opts *o)
 {
-    *o = s_opts;
+    *o = *opts();
 }
 
 void xbox_InputMouseEnable(int on)
@@ -127,9 +142,9 @@ static int want_capture(void)
         return !LOAD(&s_windowed) || LOAD(&s_focus);
     if (!LOAD(&s_focus) || LOAD(&s_suspend) || LOAD(&s_key_free))
         return 0;
-    if (s_opts.capture == XBOX_MOUSE_CAPTURE_NEVER)
+    if (opts()->capture == XBOX_MOUSE_CAPTURE_NEVER)
         return 0;
-    return s_opts.capture != XBOX_MOUSE_CAPTURE_CLICK || LOAD(&s_clicked);
+    return opts()->capture != XBOX_MOUSE_CAPTURE_CLICK || LOAD(&s_clicked);
 }
 
 static void release_all(void)
@@ -217,7 +232,7 @@ void xbox_InputMouseClose(void)
 
 int xbox_InputMouseKey(int vk, int down)
 {
-    if (!s_opts.release_key || vk != s_opts.release_key)
+    if (!opts()->release_key || vk != opts()->release_key)
         return 0;
     if (down && xbox_InputMouseOn()) {
         if (LOAD(&s_captured)) {
@@ -268,7 +283,7 @@ void xbox_InputMouseButton(int n, int down)
         return;
     /* "focus": the click that brought the window forward is the player
      * picking the window, so it drives nothing (as "click" mode's grab). */
-    if (XCHG(&s_activate_click, 0) && s_opts.capture == XBOX_MOUSE_CAPTURE_FOCUS)
+    if (XCHG(&s_activate_click, 0) && opts()->capture == XBOX_MOUSE_CAPTURE_FOCUS)
         return;
     int edge = 0, grab = 0;
     lock();
@@ -276,10 +291,10 @@ void xbox_InputMouseButton(int n, int down)
         /* "click": the press that grabs is the player asking for the
          * mouse, not a press of B. "never": the window only reports
          * presses over it, so they drive. */
-        if (s_opts.capture == XBOX_MOUSE_CAPTURE_CLICK && LOAD(&s_focus)
+        if (opts()->capture == XBOX_MOUSE_CAPTURE_CLICK && LOAD(&s_focus)
             && !LOAD(&s_suspend))
             grab = 1;
-        else if (s_opts.capture == XBOX_MOUSE_CAPTURE_NEVER)
+        else if (opts()->capture == XBOX_MOUSE_CAPTURE_NEVER)
             edge = !XCHG(&s_btn[n], 1);
     } else {
         edge = !XCHG(&s_btn[n], 1);
@@ -301,7 +316,7 @@ void xbox_InputMouseWheel(int notches)
     if (!notches || !xbox_InputMouseOn())
         return;
     lock();
-    if (LOAD(&s_captured) || s_opts.capture == XBOX_MOUSE_CAPTURE_NEVER) {
+    if (LOAD(&s_captured) || opts()->capture == XBOX_MOUSE_CAPTURE_NEVER) {
         ADD(&s_wheel_q[notches > 0 ? 0 : 1], notches > 0 ? notches : -notches);
         took = 1;
     }
@@ -329,8 +344,8 @@ void xbox_InputMouseTick(uint64_t now_ms, int have_clock)
             ;
         if (q > 0) {
             s_wheel_held[i] = 1;
-            s_wheel_until[i] = now_ms + (uint64_t)(s_opts.wheel_pulse_ms > 0
-                                                   ? s_opts.wheel_pulse_ms : 0);
+            s_wheel_until[i] = now_ms + (uint64_t)(opts()->wheel_pulse_ms > 0
+                                                   ? opts()->wheel_pulse_ms : 0);
         }
     }
 }
@@ -387,30 +402,31 @@ int xbox_InputMouseTakeCounts(int *dx, int *dy)
 int xbox_InputMouseLook(int *x, int *y)
 {
     static unsigned traced;
+    const xbox_mouse_opts *o = opts();    /* one set for the whole poll */
     int dx, dy;
 
     *x = *y = 0;
 #ifdef XBOXRECOMP_ENHANCE
     if (LOAD(&s_divert))
-        return s_opts.look;
+        return o->look;
 #endif
     dx = XCHG(&s_dx, 0);
     dy = XCHG(&s_dy, 0);
-    if (s_opts.look == XBOX_MOUSE_LOOK_NONE || (!dx && !dy))
-        return s_opts.look;
-    *x = xbox_InputMouseModel(dx, s_opts.sensitivity, s_opts.min_deflection);
+    if (o->look == XBOX_MOUSE_LOOK_NONE || (!dx && !dy))
+        return o->look;
+    *x = xbox_InputMouseModel(dx, o->sensitivity, o->min_deflection);
     /* Mouse forward is negative dy on Win32 and SDL alike; stick up is
      * positive. */
-    *y = xbox_InputMouseModel(-dy, s_opts.sensitivity, s_opts.min_deflection);
-    if (s_opts.invert_x) *x = -*x;
-    if (s_opts.invert_y) *y = -*y;
+    *y = xbox_InputMouseModel(-dy, o->sensitivity, o->min_deflection);
+    if (o->invert_x) *x = -*x;
+    if (o->invert_y) *y = -*y;
     if (recomp_env(RENV_MOUSE_TRACE) && traced < 200) {
         traced++;
         fprintf(stderr, "[MOUSE] dx=%d dy=%d -> %s(%d,%d)\n", dx, dy,
-                s_opts.look == XBOX_MOUSE_LOOK_LEFT ? "LS" : "RS", *x, *y);
+                o->look == XBOX_MOUSE_LOOK_LEFT ? "LS" : "RS", *x, *y);
         fflush(stderr);
     }
-    return s_opts.look;
+    return o->look;
 }
 
 void xbox_InputMouseReset(void)

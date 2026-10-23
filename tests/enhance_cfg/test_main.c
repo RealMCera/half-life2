@@ -13,6 +13,7 @@
 #include "enhance.h"
 #include "enhance_cfg.h"
 #include "enhance_input.h"
+#include "host_pad.h"
 #include "input_names.h"
 #include "keyboard.h"
 #include "mouse.h"
@@ -351,6 +352,40 @@ static void test_errors(void)
         CHECK(recomp_cfg_load_file("ecfg_does_not_exist.toml", err, sizeof err) == NULL);
         CHECK(strstr(err, "cannot open") != NULL);
     }
+}
+
+/* A quoted key with '.' in it: only as the last part directly under a flat
+ * table ([input.actions], whose keys are dotted action names), where it is
+ * the same entry as the bare dotted key. */
+static void test_quoted_dots(void)
+{
+    char err[256];
+    recomp_cfg *c = recomp_cfg_load_string(
+        "[input.actions]\n\"menu.open\" = [\"F10\"]\n'overlay.stats' = \"F11\"\n"
+        "shot.window = \"F12\"\n", "q", err, sizeof err);
+    CHECK(c != NULL);
+    if (c) {
+        CHECK(recomp_cfg_type_of(c, "input.actions.menu.open") == RCFG_ARRAY);
+        CHECK(!strcmp(recomp_cfg_string(c, "input.actions.overlay.stats", ""), "F11"));
+        CHECK(!strcmp(recomp_cfg_string(c, "input.actions.shot.window", ""), "F12"));
+        recomp_cfg_free(c);
+    }
+    c = recomp_cfg_load_string("[input]\nactions.\"menu.open\" = \"F10\"\n", "q",
+                               err, sizeof err);
+    CHECK(c && !strcmp(recomp_cfg_string(c, "input.actions.menu.open", ""), "F10"));
+    recomp_cfg_free(c);
+    /* The quoted and the bare spelling are one key. */
+    expect_error("[input.actions]\n\"menu.open\" = \"F10\"\nmenu.open = \"F9\"\n",
+                 "duplicate key 'input.actions.menu.open'", 3);
+    /* x.y beside x.y.z: a value and a table of it. */
+    expect_error("[input.actions]\nmenu.open = \"F10\"\nmenu.open.all = \"F9\"\n",
+                 "'input.actions.menu.open' is a value", 3);
+    /* Anywhere else, and not as a middle part. */
+    expect_error("[render]\n\"a.b\" = 1\n", "'.' inside a quoted key", 2);
+    expect_error("\"input.actions\".x = 1\n", "'.' inside a quoted key", 1);
+    expect_error("[\"input.actions\"]\n", "'.' inside a quoted key", 1);
+    expect_error("[input.actions]\n\"menu.open\".x = 1\n", "must be the last part", 2);
+    expect_error("[input.actions.sub]\n\"a.b\" = 1\n", "'.' inside a quoted key", 2);
 }
 
 /* What the strict pass must still accept. */
@@ -934,6 +969,21 @@ DWORD xbox_InputLastState(DWORD port, XBOX_INPUT_STATE *st)
 {
     (void)port;
     memset(st, 0, sizeof *st);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+/* input_core.c's host-action seam (enhance_actions.c): no pad here. */
+void xbox_InputSetPadFilter(xbox_input_pad_filter_fn fn)
+{
+    (void)fn;
+}
+uint64_t xbox_InputNowMs(void)
+{
+    return 0;
+}
+DWORD xbox_input_backend_read_host(DWORD slot, struct xbox_host_pad *host)
+{
+    (void)slot;
+    memset(host, 0, sizeof *host);
     return ERROR_DEVICE_NOT_CONNECTED;
 }
 
@@ -1565,7 +1615,7 @@ static void test_input(void)
     CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:9: input.bindings.a is a string or"
                  " a list of strings (got integer); ignored\n") != NULL);
     CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:10: input.bindings.white 'F10' is"
-                 " the menu hotkey (menu.hotkey); bound anyway\n") != NULL);
+                 " menu.open's default ([input.actions]); bound anyway\n") != NULL);
     CHECK(strstr(out, "[ENHANCE] ecfg_in") == NULL);     /* [INPUT] lines only */
     CHECK(!strcmp(bound(XBOX_CTL_X), "K"));
     CHECK(!strcmp(bound(XBOX_CTL_A), "Space"));            /* the defaults' */
@@ -1637,6 +1687,7 @@ int main(void)
 {
     test_subset();
     test_errors();
+    test_quoted_dots();
     test_strict_valid();
     test_locale();
     test_layers();

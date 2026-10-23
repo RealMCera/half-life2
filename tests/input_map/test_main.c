@@ -316,10 +316,10 @@ static int f_kb(XBOX_INPUT_STATE *s)
 }
 static uint64_t f_clock(void) { return f_now; }
 
-static const xbox_input_backend k_fake = { f_init, f_get, f_set, f_kb, f_clock };
+static const xbox_input_backend k_fake = { f_init, f_get, f_set, f_kb, f_clock, NULL, NULL };
 
 /* input_core.c's default; never called here. */
-const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock };
+const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock, NULL, NULL };
 
 static void test_cache(void)
 {

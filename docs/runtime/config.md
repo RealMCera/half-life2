@@ -140,6 +140,7 @@ decimal point does not change how `0.5` is read, either in the file or in the
 environment.
 
 Keys are bare (`A-Z a-z 0-9 _ -`) or quoted, with no `.` inside a quoted part.
+The one exception is `[input.actions]` (below), whose keys are action names.
 A lookup uses the full dotted name, such as `render.scale`. A UTF-8 BOM and
 CRLF line endings are accepted.
 
@@ -481,6 +482,8 @@ table of `src/input/README.md` and no mouse.
 | `input.stick_ramp_ms` | int | `0` .. `2000`: a stick key goes from 0.41 of full deflection to full over this time; `0` is full at once | `0` | none |
 | `input.walk_key` | string | a key name: while held, the stick keys give `walk_scale` of full; `""` or `"none"`: no walk key | none | none |
 | `input.walk_scale` | float | `0.41` .. `1.0` (outside is clamped) | `1.0` | none |
+| `input.chord_delay_ms` | int | `0` .. `100`: a member of a host-action pad chord reaches the game this long after its press, so a chord completed inside the window never does ([input.actions], rule 3) | `0` | `RECOMP_INPUT_CHORD_DELAY_MS` |
+| `[input.actions]` | table | an action name to a binding or a list of them; `[]` unbinds (below) | the actions' defaults | none |
 
 These defaults are the layer's. The three stick knobs default to the
 legacy keyboard (no ramp, no walk key), so a title that ships no `[input]`
@@ -550,10 +553,12 @@ is one line, with the file and the line of the key:
 [INPUT] config error: config/config.toml:5: input.stick_ramp_ms should be an integer (got string); using the default
 ```
 
-`F9`, `F10` and `F11` are reserved (freeing the cursor, the menu hotkey,
-fullscreen); binding one is applied with a warning in the same format,
-`... input.bindings.white 'F10' is the menu hotkey (menu.hotkey); bound
-anyway`.
+`F9`, `F10` and `F11` are reserved (freeing the cursor, `menu.open`'s
+default in `[input.actions]`, fullscreen); binding one is applied with a
+warning in the same format, `... input.bindings.white 'F10' is menu.open's
+default ([input.actions]); bound anyway`. A key bound here is then refused
+for a host action (rule 2 of `[input.actions]`), so F10 bound to a control
+leaves `menu.open` on its pad bindings.
 
 The release key and the walk key act before the bindings, so a control
 bound to either never sees it. That gets a warning, as does setting both to
@@ -577,6 +582,160 @@ and how many controls each file decided, lowest file first:
 
 The `[ENHANCE]` lines do not mention `[input]`, and the golden runs, which
 run under `RECOMP_CONFIG=none`, keep both off.
+
+### Host actions (`[input.actions]`)
+
+An action is something the host does rather than the game: open the menu,
+toggle the stats strip, a mod's free camera. `src/enhance/enhance_actions.c`
+binds actions to keys, to host-only pad buttons and to pad chords, and
+never gives the game a press it would not have had: it reads the host pad
+beside the state the game gets, and only ever takes presses out of that
+state (a consumed chord). Remapping the game's own controls stays with
+`[input.bindings]`.
+
+```toml
+[input.actions]
+menu.open = ["F10", "guide+a", "back+lthumb@400"]
+camera.free.toggle = "F6"
+overlay.stats = []                  # unbound
+```
+
+The action name is a bare dotted key, as above, or quoted: `"menu.open" =
+[...]` is the same entry, which is what a TOML writer emits for it. A quoted
+name must be the whole key directly under `[input.actions]` (or
+`actions."menu.open"` under `[input]`); writing both spellings of one
+action is a duplicate key. Because a bare `menu.open` is a table `menu` in
+TOML, no action is named after another plus a part (`menu.open` and
+`menu.open.all`); the registry refuses the second. Per action, the highest file that names it decides all of its
+bindings, as for a control under `[input.bindings]`; an action no file
+names keeps its defaults. An action holds up to 8 bindings.
+
+The toolkit's actions:
+
+| Action | Default bindings | Does |
+|---|---|---|
+| `menu.open` | `F10`, `guide+a` | opens and closes the menu (a log line until the menu lands) |
+| `overlay.stats` | none | toggles the stats strip (a log line until the overlay lands) |
+| `shot.window` | none | a window shot (a log line for now) |
+
+A game's `config.default.toml` adds to these, for example a fallback chord
+for hosts where Guide is not seen (BLiNX 2: `back+lthumb@400`). A mod
+registers its own actions, named after the mod (`camera.free.toggle`).
+
+**A binding** is one of:
+
+- **A key**, by the names of `[input.bindings]`, optionally after
+  modifiers: `F10`, `ctrl+F6`. A plain key fires only with no modifier
+  held, and `ctrl+F6` only with Ctrl and no other modifier. Mouse inputs
+  are not bindings.
+- **A host-only button** alone: `guide`, `misc1` (share, capture),
+  `paddle1` .. `paddle4` (upper right, upper left, lower right, lower
+  left: the Elite's P1, P3, P2, P4 and the Deck's R4, L4, R5, L5), and
+  `touchpad`. The Duke has none of them, so the game never sees one.
+- **A pad chord**: two to eight buttons joined by `+`, from `a b x y
+  white black ltrigger rtrigger start back lthumb rthumb dpad_up
+  dpad_down dpad_left dpad_right` and the host-only names, with an
+  optional hold `@<ms>` (`0` .. `2000`). It is read on port 0 (player
+  1) unless it starts with `pad2:` .. `pad4:`. A chord whose first member
+  is host-only and whose others are guest buttons (`guide+a`) is a
+  modifier chord (rule 7).
+
+**Rules**, so a binding never takes what the game uses. A refused binding
+gets one line and the rest of the action's bindings stand:
+
+1. A single guest button (`a`, `start`) is refused. A chord of guest
+   buttons needs a hold of at least 200 ms.
+2. A key the game receives is refused, and the game keeps it. The check
+   is against the effective key map: the compiled-in table, then
+   `[input.bindings]`, `input.walk_key` and `input.mouse_release_key`.
+   Modifiers count: Ctrl and Shift drive the game in the compiled-in
+   table, so `ctrl+F6` is refused unless the player unbinds them.
+3. A chord is consumed. From the moment all of its buttons are down, they
+   reach the game released until each is let go. A chord let go before
+   its hold fires nothing. The game does still see the first button's
+   press, and masking then gives it a release the player did not make:
+   with `back+start`, START pauses BLiNX 2 and is then released. So pick
+   members the game ignores on a lone press (a button with no use plus
+   one used only in menus, as `back+lthumb` in BLiNX 2), or set
+   `input.chord_delay_ms`, which holds each chord member back from the
+   game for that long after its press. That costs the same latency on
+   those buttons, which is why it is off by default.
+4. The defaults use only F-keys, host-only buttons, modifier chords and
+   chords with a hold.
+5. A scripted or replayed pad (a game harness's) never fires an action:
+   actions read the host pad, which the script does not touch. A key from
+   `RECOMP_KBM_SCRIPT` does, because it goes through the same key table
+   as a real key; that is how an unattended run drives the free camera.
+6. Only a feature key arms the actions: `menu.enabled`, `overlay.stats`,
+   or a mod's enable key (`camera.free`). Registering an action never
+   does. Disarmed, nothing is read or masked. The start line says which:
+
+   ```
+   [ENHANCE] actions hook=off
+   [ENHANCE] actions hook=on (menu.enabled, camera.free)
+   ```
+
+   A golden run (`RECOMP_CONFIG=none`) has `hook=off`.
+7. A modifier chord (`guide+a`) fires on the guest button's press while
+   the host-only button is held; no hold is needed. While the host-only
+   button is held, the guest members of every modifier chord on that port
+   reach the game released from their press until they are let go, even
+   when the host-only button goes first, so the game never sees the A of
+   `guide+a`. A guest member pressed before the host-only one goes to the
+   game and does not complete the chord. The button that closes the menu
+   stays masked after the close until it is let go.
+
+The game may stop polling the pad (a loading screen). The flip then reads
+the host pad itself when a port has not been polled for 100 ms, so keys,
+host-only buttons and modifier chords still fire there. Plain chords of
+guest buttons fire only from a poll.
+
+**Errors and the log.** Each refusal names the action, the file and the
+line (or `(default)` for a default), and the binding:
+
+```
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'a' refused: a single guest button would take it from the game; use a chord of two with a hold (back+lthumb@400) or a host-only button (guide, paddle1)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'back+lthumb' refused: a chord of guest buttons needs a hold of at least 200 ms (back+lthumb@400)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'a+guide' refused: a chord with a host-only button needs it first and only once (guide+a)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'Z' refused: 'Z' is bound to the guest's a (input.bindings); the game keeps it
+[INPUT] action input.actions.menu.open (./config/config.toml:3): more than 8 bindings; the rest skipped
+[INPUT] config warning: ./config/config.toml:4: no action named 'menu.opne'
+[INPUT] config warning: input.chord_delay_ms=500 out of 0..100; using 100
+```
+
+Every fire is logged, at most 10 lines a second:
+
+```
+[ACTION] menu.open via guide+a
+[ACTION] 2 more fires not logged
+```
+
+**Guide per host.** `guide+a` needs the host to hand the Guide button to
+the game. Where it does not, F10 and the game's fallback chord still work.
+
+| Host | Backend | Guide seen? | What to do |
+|---|---|---|---|
+| macOS | SDL3 (GameController or HIDAPI) | Usually. macOS may keep the Home button: System Settings > Game Controllers > the controller, then let apps use the Home button. | the setting; F10; the fallback chord |
+| Linux desktop, native | SDL3 (evdev or HIDAPI) | Yes, unless Steam runs with Steam Input on for the pad, which keeps Guide for its overlay | Steam Input off for the title; F10; the fallback chord |
+| Steam Deck | XInput through Steam's virtual pad (Proton), or SDL3 | No: SteamOS always keeps the Steam button | a back grip bound to F10 in Steam Input (below); the fallback chord |
+| Windows, native | XInput (`XInputGetStateEx`) | Yes, unless the Xbox Game Bar takes the Xbox button: Windows 11: Settings > Gaming > Game Bar, "Allow your controller to open Game Bar", off | the setting; F10; the fallback chord |
+| Windows build under Proton (desktop Linux) | XInput through Wine | Only with Steam Input off for the title | Steam Input off; F10; the fallback chord |
+
+Only Guide reaches a Windows build: XInput has no paddles, share button or
+touchpad. A chord with Guide stays incomplete where Guide is not seen, and
+its guest member then reaches the game as usual.
+
+**The Steam Deck and Steam Input.** Under Proton, Steam Input is on by
+default and the game sees Steam's virtual pad: the back grips (L4, L5, R4,
+R5) are not on it, and the Steam button opens Steam. Bind a grip to a key
+in Steam Input instead: in the game's controller settings, pick a grip and
+set it to the keyboard key `F10` (the menu) or `F6` (BLiNX 2's free
+camera). The key then fires the action like a real key. A native Linux
+build sees the grips as `paddle1` .. `paddle4` only with Steam Input off
+for the title, through SDL's HIDAPI Steam Deck driver. Elite and
+DualSense Edge paddles show as `paddle1` .. `paddle4` only where the
+firmware and SDL's HIDAPI driver report them; in some firmware modes they
+copy face buttons instead, and those are guest buttons.
 
 ### Naming rule
 

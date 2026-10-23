@@ -65,9 +65,9 @@ static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
     return ERROR_SUCCESS;
 }
 static DWORD f_set(DWORD p, const XBOX_VIBRATION *v) { (void)p; (void)v; return ERROR_SUCCESS; }
-static const xbox_input_backend k_fake = { NULL, f_get, f_set, xbox_InputKbmPoll, f_clock };
+static const xbox_input_backend k_fake = { NULL, f_get, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL };
 /* input_core.c's default; never called here. */
-const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock };
+const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock, NULL, NULL };
 
 static void write_file(const char *path, const char *text)
 {

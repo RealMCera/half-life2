@@ -62,6 +62,16 @@ int  xbox_InputControlFromName(const char *name);
 /* XBOX_CTL_* to its name, NULL out of range. */
 const char *xbox_InputControlName(int control);
 
+/* The host-only buttons a host action may use (host_pad.h): no guest
+ * control has them. Index i is the XBOX_HOST_* bit 1 << i: guide, misc1
+ * (share, capture), paddle1..4 (upper right, upper left, lower right,
+ * lower left) and touchpad. */
+#define XBOX_HOST_BUTTONS 7
+/* A host-only button name (case-insensitive) to its index, -1 when unknown. */
+int  xbox_InputHostButtonFromName(const char *name);
+/* Index to name, NULL out of range. */
+const char *xbox_InputHostButtonName(int index);
+
 /* The name table, entry by entry (tests and docs): 0 past the end. Aliases
  * come back with *alias set. */
 int  xbox_InputNameAt(int i, const char **name, int *code, int *is_mouse,

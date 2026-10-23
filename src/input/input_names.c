@@ -139,7 +139,11 @@ static const char *const k_controls[XBOX_CTL_COUNT] = {
     "rstick_up", "rstick_down", "rstick_left", "rstick_right",
 };
 
-/* ASCII only: every name in both tables is. */
+static const char *const k_host_buttons[XBOX_HOST_BUTTONS] = {
+    "guide", "misc1", "paddle1", "paddle2", "paddle3", "paddle4", "touchpad",
+};
+
+/* ASCII only: every name in the tables is. */
 static int same_name(const char *a, const char *b)
 {
     for (;; a++, b++) {
@@ -200,4 +204,19 @@ int xbox_InputNameAt(int i, const char **name, int *code, int *is_mouse,
     if (is_mouse) *is_mouse = k_names[i].is_mouse;
     if (alias) *alias = k_names[i].alias;
     return 1;
+}
+
+int xbox_InputHostButtonFromName(const char *name)
+{
+    if (!name)
+        return -1;
+    for (int i = 0; i < XBOX_HOST_BUTTONS; i++)
+        if (same_name(name, k_host_buttons[i]))
+            return i;
+    return -1;
+}
+
+const char *xbox_InputHostButtonName(int index)
+{
+    return index >= 0 && index < XBOX_HOST_BUTTONS ? k_host_buttons[index] : NULL;
 }

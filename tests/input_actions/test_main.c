@@ -1,0 +1,1095 @@
+/*
+ * input_actions test: the host actions (src/enhance/enhance_actions.c) as a
+ * title runs them, through xbox_enhance_init and xbox_InputGetState against
+ * a fake input backend with its own clock: the rules that keep a binding
+ * off what the title uses (docs/runtime/config.md, "[input.actions]"), hold
+ * chords and their consumption, guide+a (rule 7), chord_delay_ms, the flip
+ * tick that reads a pad the title has stopped polling, arming by feature
+ * keys only, the mod API v2 calls, and the pad filter seam in input_core.c.
+ * Runs in its working directory, where it writes config/config.toml.
+ */
+#include "enhance.h"
+#include "enhance_actions.h"
+#include "enhance_cfg.h"
+#include "enhance_input.h"
+#include "host_pad.h"
+#include "input_backend.h"
+#include "input_names.h"
+#include "keyboard.h"
+#include "mod.h"
+#include "mouse.h"
+#include "nv2a_backend_common.h"
+#include "nv2a_pb_state.h"
+#include "recomp_env.h"
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#define MKDIR(p) _mkdir(p)
+#define DUP _dup
+#define DUP2 _dup2
+#define CLOSE _close
+#define OPEN_TRUNC(p) _open(p, _O_WRONLY | _O_CREAT | _O_TRUNC, 0644)
+#else
+#include <pthread.h>
+#include <unistd.h>
+#define MKDIR(p) mkdir(p, 0755)
+#define DUP dup
+#define DUP2 dup2
+#define CLOSE close
+#define OPEN_TRUNC(p) open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644)
+#endif
+
+static int s_fail, s_checks;
+
+#define CHECK(c) do { s_checks++; if (!(c)) { s_fail++; \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
+
+/* ---- stubs for what the runtime would link ---------------------------- */
+
+void xbox_PacingSetMode(int mode);
+void xbox_PacingSetMode(int mode) { (void)mode; }
+
+ptrdiff_t xbox_GetMemoryOffset(void);
+ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
+
+static struct nv2a_pb_present s_present = { 0x00C00000u, 640, 480, 2560, 0 };
+const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
+
+/* ---- the fake pad backend --------------------------------------------- */
+
+/* Win32 virtual-key codes, as the key table holds them. */
+#define VK_F6  0x75
+#define VK_F8  0x77
+#define VK_F10 0x79
+
+#define A_BIT  (1u << (8 + XBOX_BUTTON_A))
+#define B_BIT  (1u << (8 + XBOX_BUTTON_B))
+
+static uint64_t s_now = 1000;               /* atomic: the poll and flip threads read it */
+static XBOX_INPUT_STATE f_pad[4];
+static int f_conn[4] = { 1, 0, 0, 0 };
+static uint32_t f_extra[4];
+static int f_reads;                         /* read_host calls */
+static int f_busy;
+static void (*f_during_read)(void);         /* runs once inside the next read_host */
+
+static uint64_t f_clock(void) { return __atomic_load_n(&s_now, __ATOMIC_ACQUIRE); }
+static void advance(uint64_t ms) { __atomic_add_fetch(&s_now, ms, __ATOMIC_ACQ_REL); }
+
+static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
+{
+    if (p >= 4 || !f_conn[p])
+        return ERROR_DEVICE_NOT_CONNECTED;
+    *s = f_pad[p];
+    return ERROR_SUCCESS;
+}
+static DWORD f_set(DWORD p, const XBOX_VIBRATION *v) { (void)p; (void)v; return ERROR_SUCCESS; }
+static uint32_t f_host_extra(DWORD p) { return p < 4 ? f_extra[p] : 0; }
+static DWORD f_read_host(DWORD p, XBOX_INPUT_STATE *out, uint32_t *extra)
+{
+    f_reads++;
+    if (f_busy)
+        return XBOX_INPUT_BUSY;
+    if (p >= 4 || !f_conn[p])
+        return ERROR_DEVICE_NOT_CONNECTED;
+    *out = f_pad[p];
+    *extra = f_extra[p];
+    if (f_during_read) {
+        void (*fn)(void) = f_during_read;
+        f_during_read = NULL;
+        fn();
+    }
+    return ERROR_SUCCESS;
+}
+
+static const xbox_input_backend k_fake = {
+    NULL, f_get, f_set, xbox_InputKbmPoll, f_clock, f_host_extra, f_read_host };
+/* A backend with no host-only buttons at all (a pad without Guide). */
+static const xbox_input_backend k_plain = {
+    NULL, f_get, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL };
+/* input_core.c's default; never called here. */
+const xbox_input_backend xbox_input_host_backend = {
+    NULL, f_get, f_set, NULL, f_clock, NULL, NULL };
+
+static void pad_clear(void)
+{
+    memset(f_pad, 0, sizeof f_pad);
+    memset(f_extra, 0, sizeof f_extra);
+    f_conn[0] = 1;
+    f_busy = 0;
+}
+static void hold_a(int on) { f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_A] = on ? 255 : 0; }
+static void hold_b(int on) { f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_B] = on ? 255 : 0; }
+static void hold_btn(WORD w, int on)
+{
+    if (on)
+        f_pad[0].Gamepad.wButtons |= w;
+    else
+        f_pad[0].Gamepad.wButtons &= (WORD)~w;
+}
+static void hold_extra(uint32_t x, int on)
+{
+    if (on)
+        f_extra[0] |= x;
+    else
+        f_extra[0] &= ~x;
+}
+
+/* What the title gets from port 0. */
+static XBOX_INPUT_STATE poll0(void)
+{
+    XBOX_INPUT_STATE st;
+    memset(&st, 0, sizeof st);
+    xbox_InputGetState(0, &st);
+    return st;
+}
+
+/* ---- stderr capture ---------------------------------------------------- */
+
+static int s_saved_fd = -1;
+static char s_cap[32768];
+
+static void capture_begin(void)
+{
+    int fd;
+    fflush(stderr);
+    s_saved_fd = DUP(2);
+    fd = OPEN_TRUNC("actions_stderr.txt");
+    if (s_saved_fd < 0 || fd < 0) { fprintf(stderr, "cannot capture stderr\n"); exit(2); }
+    DUP2(fd, 2);
+    CLOSE(fd);
+}
+
+static const char *capture_end(void)
+{
+    FILE *f;
+    size_t n = 0;
+    fflush(stderr);
+    DUP2(s_saved_fd, 2);
+    CLOSE(s_saved_fd);
+    s_cap[0] = 0;
+    f = fopen("actions_stderr.txt", "rb");
+    if (f) {
+        n = fread(s_cap, 1, sizeof s_cap - 1, f);
+        fclose(f);
+    }
+    s_cap[n] = 0;
+    {
+        char *r = s_cap, *w = s_cap;
+        for (; *r; r++)
+            if (*r != '\r')
+                *w++ = *r;
+        *w = 0;
+    }
+    return s_cap;
+}
+
+static int count(const char *hay, const char *needle)
+{
+    int n = 0;
+    for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += strlen(needle))
+        n++;
+    return n;
+}
+
+/* ---- setup -------------------------------------------------------------- */
+
+static void set_env(const char *k, const char *v)
+{
+#ifdef _WIN32
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s=%s", k, v ? v : "");
+    _putenv(buf);
+#else
+    if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+    recomp_env_reload();
+}
+
+static void write_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "cannot write %s\n", path);
+        exit(2);
+    }
+    fputs(text, f);
+    fclose(f);
+}
+
+/* A fresh title start with this user config (NULL: none) and backend; the
+ * startup lines are returned. */
+static const char *start_with(const char *toml, const xbox_input_backend *be,
+                              const struct xbox_mod *const *mods)
+{
+    xbox_mod_shutdown();
+    xbox_InputSetBackend(be);
+    xbox_InputKeysClear();
+    pad_clear();
+    if (toml)
+        write_file("config/config.toml", toml);
+    else
+        remove("config/config.toml");
+    xbox_mod_register_table(mods);
+    capture_begin();
+    xbox_enhance_init(".", NULL);
+    return capture_end();
+}
+
+/* The same with the backend's first poll, nothing held: a binding built
+ * while its input is down fires only after a release, so a test that
+ * presses first needs the title to have polled once. */
+static const char *start(const char *toml)
+{
+    const char *out = start_with(toml, &k_fake, NULL);
+    poll0();
+    return out;
+}
+
+static int menu_fires(void)
+{
+    return enhance_action_pressed(enhance_action_find("menu.open"));
+}
+
+#define ARMED "[menu]\nenabled = true\n"
+
+/* ---- 1. a hold chord: fires once after the hold, consumed until release -- */
+
+static void test_hold_chord(void)
+{
+    XBOX_INPUT_STATE st;
+    const char *out = start(ARMED "[input.actions]\nmenu.open = [\"back+lthumb@400\"]\n");
+
+    CHECK(strstr(out, "[ENHANCE] actions hook=on (menu.enabled)\n") != NULL);
+    CHECK(enhance_actions_armed());
+
+    /* Back alone passes; the chord is not complete. */
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK);
+    /* Both down: the title sees neither from now on. */
+    advance(10);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB)));
+    advance(300);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB)));
+    /* Let go before the hold: nothing fires, and Back, still held, stays
+     * the host's until its own release. */
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 0);
+    advance(10);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK));
+    advance(500);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK));
+    CHECK(menu_fires() == 0);
+    hold_btn(XBOX_GAMEPAD_BACK, 0);
+    poll0();
+    /* A new press of Back is the title's again. */
+    advance(10);
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK);
+    hold_btn(XBOX_GAMEPAD_BACK, 0);
+    poll0();
+
+    /* Held through the hold: one fire, down while held, gone at release. */
+    capture_begin();
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 1);
+    poll0();
+    advance(399);
+    poll0();
+    CHECK(menu_fires() == 0);
+    CHECK(!enhance_action_down(enhance_action_find("menu.open")));
+    advance(1);
+    poll0();
+    advance(200);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB)));
+    CHECK(enhance_action_down(enhance_action_find("menu.open")));
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 0);
+    poll0();
+    out = capture_end();
+    CHECK(menu_fires() == 1);
+    CHECK(menu_fires() == 0);
+    CHECK(!enhance_action_down(enhance_action_find("menu.open")));
+    CHECK(count(out, "[ACTION] menu.open via back+lthumb@400\n") == 1);
+}
+
+/* ---- 2. guide+a (rule 7) ---------------------------------------------- */
+
+static void test_guide_a(void)
+{
+    XBOX_INPUT_STATE st;
+    const char *out = start(ARMED);     /* menu.open's defaults: F10, guide+a */
+
+    CHECK(strstr(out, "[ENHANCE] actions hook=on (menu.enabled)\n") != NULL);
+    /* Guide, then A: fires on A's press; the title never sees A, and the
+     * rest of the pad passes. */
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    capture_begin();
+    hold_a(1);
+    hold_btn(XBOX_GAMEPAD_START, 1);
+    st = poll0();
+    out = capture_end();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_START);
+    CHECK(menu_fires() == 1);
+    CHECK(strstr(out, "[ACTION] menu.open via guide+a\n") != NULL);
+    /* Guide let go first: A, still held, is still not the title's. */
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    advance(16);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    advance(500);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    CHECK(menu_fires() == 0);
+    hold_a(0);
+    poll0();
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    CHECK(menu_fires() == 0);
+
+    /* A before Guide: A passes, Guide joining does not complete it. */
+    hold_a(0);
+    hold_btn(XBOX_GAMEPAD_START, 0);
+    poll0();
+    advance(16);
+    hold_a(1);
+    poll0();
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    advance(500);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    CHECK(menu_fires() == 0);
+    hold_a(0);
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    poll0();
+}
+
+/* ---- 3. a backend with no Guide: A passes unchanged -------------------- */
+
+static void test_no_guide(void)
+{
+    XBOX_INPUT_STATE st;
+    start_with(ARMED, &k_plain, NULL);
+    f_extra[0] = XBOX_HOST_GUIDE;     /* the backend cannot report it */
+    poll0();
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    CHECK(menu_fires() == 0);
+    CHECK(xbox_InputHostExtra(0) == 0);
+}
+
+/* ---- 4. the button that closed the menu, masked until release --------- */
+
+static void test_mask_until_release(void)
+{
+    XBOX_INPUT_STATE st;
+    start(ARMED);
+    hold_b(1);
+    poll0();
+    /* B is held, A is not: only B is masked. */
+    enhance_actions_mask_until_release(0, B_BIT | A_BIT);
+    advance(16);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0);
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0);
+    hold_b(0);
+    advance(16);
+    poll0();
+    hold_b(1);
+    advance(16);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255);
+}
+
+/* ---- 5. refusals (rules 1, 2 and 7) ------------------------------------ */
+
+static void test_refusals(void)
+{
+    const char *out = start(
+        ARMED
+        "[input]\nwalk_key = \"F7\"\n"
+        "[input.bindings]\nwhite = \"F6\"\n"
+        "[input.actions]\nmenu.open = [\"a\", \"back+lthumb\", \"back+lthumb@100\","
+        " \"lthumb+guide\", \"F6\", \"F7\", \"Ctrl+F8\", \"F8\"]\n"
+        "overlay.stats = [\"Z\", \"F9\", \"MouseLeft\", \"F2+F8\", \"pad2:F8\","
+        " \"guide+a+b\", \"paddle1@5000\", \"F3\", \"F4\"]\n");
+
+    CHECK(strstr(out, "'a' refused: a single guest button") != NULL);
+    CHECK(strstr(out, "'back+lthumb' refused: a chord of guest buttons needs a hold"
+                 " of at least 200 ms") != NULL);
+    CHECK(strstr(out, "'back+lthumb@100' refused: a chord of guest buttons") != NULL);
+    CHECK(strstr(out, "'lthumb+guide' refused: a chord with a host-only button needs"
+                 " it first") != NULL);
+    CHECK(strstr(out, "'F6' refused: 'F6' is bound to the guest's") != NULL);
+    CHECK(strstr(out, "'F7' refused: 'F7' is the walk key (input.walk_key)") != NULL);
+    CHECK(strstr(out, "'Ctrl+F8' refused: 'Ctrl' is bound to the guest's") != NULL);
+    CHECK(strstr(out, "'Z' refused: 'Z' is bound to the guest's") != NULL);
+    CHECK(strstr(out, "'F9' refused: 'F9' is the mouse release key") != NULL);
+    CHECK(strstr(out, "'MouseLeft' refused: 'MouseLeft' is a mouse input") != NULL);
+    CHECK(strstr(out, "'F2+F8' refused: 'F2' is not a modifier") != NULL);
+    CHECK(strstr(out, "'pad2:F8' refused: '@' and 'padN:' are for pad bindings") != NULL);
+    CHECK(strstr(out, "'paddle1@5000' refused: the hold after '@' must be") != NULL);
+    /* guide+a+b is a modifier chord of two guest members: allowed. */
+    CHECK(strstr(out, "'guide+a+b' refused") == NULL);
+    CHECK(strstr(out, "'F8' refused") == NULL);
+    /* Eight bindings an action at most. */
+    CHECK(strstr(out, "more than 8 bindings; the rest skipped") != NULL);
+    CHECK(strstr(out, "'F4'") == NULL);
+    /* Each refusal names where it came from. */
+    CHECK(strstr(out, "[INPUT] action input.actions.menu.open (./config/config.toml:")
+          != NULL);
+
+    /* The one that stood fires; Ctrl held with it is another binding. */
+    xbox_InputKeyEvent(VK_F8, 1);
+    poll0();
+    xbox_InputKeyEvent(VK_F8, 0);
+    poll0();
+    CHECK(menu_fires() == 1);
+    xbox_InputKeyEvent(XBOX_VK_LCONTROL, 1);
+    xbox_InputKeyEvent(VK_F8, 1);
+    poll0();
+    CHECK(menu_fires() == 0);
+    xbox_InputKeysClear();
+    poll0();
+    /* F10 is not bound any more: the list replaced the defaults. */
+    xbox_InputKeyEvent(VK_F10, 1);
+    poll0();
+    CHECK(menu_fires() == 0);
+
+    /* Unknown actions under [input.actions] are named. */
+    out = start(ARMED "[input.actions]\nmenu.opne = \"F8\"\n");
+    CHECK(strstr(out, "no action named 'menu.opne'") != NULL);
+
+    /* The quoted spelling a TOML writer emits is the same binding. */
+    out = start(ARMED "[input.actions]\n\"menu.open\" = [\"F8\"]\n");
+    CHECK(strstr(out, "config error") == NULL);
+    CHECK(strstr(out, "no action named") == NULL);
+    xbox_InputKeyEvent(VK_F8, 1);
+    poll0();
+    xbox_InputKeyEvent(VK_F8, 0);
+    poll0();
+    CHECK(menu_fires() == 1);
+
+    /* x.y beside x.y.z cannot both be keys: the second is refused. */
+    capture_begin();
+    CHECK(enhance_action_register("menu.open.all", "All", NULL) < 0);
+    CHECK(enhance_action_register("menu", "Bare", NULL) < 0);
+    CHECK(enhance_action_register("overlay", "Bare", NULL) < 0);
+    out = capture_end();
+    CHECK(strstr(out, "'menu.open.all' refused: it and 'menu.open' cannot both be"
+                 " TOML keys") != NULL);
+}
+
+/* ---- 6. chord_delay_ms -------------------------------------------------- */
+
+static void test_chord_delay(void)
+{
+    XBOX_INPUT_STATE st;
+    const char *out = start(ARMED "[input]\nchord_delay_ms = 50\n"
+                            "[input.actions]\nmenu.open = [\"back+lthumb@400\"]\n");
+    CHECK(strstr(out, "chord_delay_ms") == NULL);   /* no warning */
+
+    /* A lone chord member reaches the title after the delay. */
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK));
+    advance(30);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK));
+    advance(30);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK);
+    /* A button that is in no chord is never held back. */
+    hold_btn(XBOX_GAMEPAD_START, 1);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_START);
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START, 0);
+    poll0();
+
+    /* Completed inside the window: the title never sees either member. */
+    advance(100);
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK));
+    advance(20);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB)));
+    advance(100);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB)));
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 0);
+    poll0();
+    CHECK(menu_fires() == 0);
+
+    /* Out of range: clamped with a line. */
+    out = start(ARMED "[input]\nchord_delay_ms = 500\n");
+    CHECK(strstr(out, "input.chord_delay_ms=500 out of 0..100; using 100") != NULL);
+}
+
+/* ---- 7. a script's pad never fires; a kbm-script key does -------------- */
+
+static void test_scripts(void)
+{
+    XBOX_INPUT_STATE st;
+    struct xbox_host_pad none;
+    const char *out;
+
+    start(ARMED "[input.actions]\nmenu.open = [\"a+b@200\", \"F10\"]\n");
+    /* RECOMP_INPUT_SCRIPT's pad (cat's glue): no host pad behind it. The
+     * state passes untouched and nothing fires. */
+    memset(&none, 0, sizeof none);
+    none.slot = -1;
+    for (int i = 0; i < 4; i++) {
+        memset(&st, 0, sizeof st);
+        st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+        st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+        xbox_enhance_pad_filter(0, &none, &st);
+        CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+        CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255);
+        advance(100);
+    }
+    CHECK(menu_fires() == 0);
+    /* The same buttons on the host pad do fire. */
+    hold_a(1);
+    hold_b(1);
+    poll0();
+    advance(200);
+    poll0();
+    CHECK(menu_fires() == 1);
+    hold_a(0);
+    hold_b(0);
+    poll0();
+
+    /* A kbm_script key is a key: it fires. */
+    xbox_InputKbmScriptReset();
+    CHECK(xbox_InputKbmScriptParse("0p key down F10\n2p key up F10\n", "test") == 2);
+    capture_begin();
+    for (int i = 0; i < 4; i++) {
+        advance(16);
+        poll0();
+    }
+    out = capture_end();
+    CHECK(menu_fires() == 1);
+    CHECK(strstr(out, "[ACTION] menu.open via F10\n") != NULL);
+    xbox_InputKbmScriptReset();
+}
+
+/* ---- 8. disarmed: hook=off, nothing filtered or fired ------------------ */
+
+static int s_probe_id = -2;
+static int probe_init(const struct xbox_mod_api *api)
+{
+    static const char *const defs[] = { "F6", "paddle1", NULL };
+    s_probe_id = api->action_register("probe.go", "Probe", defs);
+    return 0;
+}
+static const struct xbox_mod k_probe = { "probe", probe_init, NULL };
+
+static void test_disarmed(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_probe, NULL };
+    XBOX_INPUT_STATE st;
+    const char *out;
+
+    set_env("RECOMP_CONFIG", "none");
+    out = start_with(ARMED, &k_fake, mods);
+    set_env("RECOMP_CONFIG", NULL);
+    CHECK(strstr(out, "[ENHANCE] actions hook=off\n") != NULL);
+    CHECK(strstr(out, "hook=on") == NULL);
+    CHECK(!enhance_actions_armed());
+    CHECK(s_probe_id >= 0);
+    CHECK(nv2a_flip_hook_installed == NULL);
+    /* The mod's bindings, guide+a and F10: nothing fires, A passes. */
+    xbox_InputKeyEvent(VK_F6, 1);
+    xbox_InputKeyEvent(VK_F10, 1);
+    hold_extra(XBOX_HOST_GUIDE | XBOX_HOST_PADDLE1, 1);
+    poll0();
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    enhance_actions_tick();
+    nv2a_flip_hook_run();
+    CHECK(enhance_action_pressed(s_probe_id) == 0);
+    CHECK(menu_fires() == 0);
+    xbox_InputKeysClear();
+
+    /* No config file at all: off too. */
+    out = start(NULL);
+    CHECK(strstr(out, "[ENHANCE] actions hook=off\n") != NULL);
+    /* A non-feature key does not arm it. */
+    out = start("[input.actions]\nmenu.open = [\"paddle1\"]\n");
+    CHECK(strstr(out, "[ENHANCE] actions hook=off\n") != NULL);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    CHECK(menu_fires() == 0);
+}
+
+/* ---- 9. a host-only single fires, and the fire log's limit ------------- */
+
+static void test_paddle_and_log(void)
+{
+    const char *out = start(ARMED "[input.actions]\nmenu.open = [\"paddle1\", \"pad2:touchpad\"]\n");
+    int fired = 0;
+
+    capture_begin();
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    advance(16);
+    poll0();
+    CHECK(enhance_action_down(enhance_action_find("menu.open")));
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    poll0();
+    out = capture_end();
+    CHECK(menu_fires() == 1);
+    CHECK(count(out, "[ACTION] menu.open via paddle1\n") == 1);
+    /* Port 1's binding does not answer port 0. */
+    hold_extra(XBOX_HOST_TOUCHPAD, 1);
+    poll0();
+    CHECK(menu_fires() == 0);
+    hold_extra(XBOX_HOST_TOUCHPAD, 0);
+    poll0();
+
+    /* Twelve fires inside one second: ten lines, then a count. */
+    __atomic_store_n(&s_now, 50000, __ATOMIC_RELEASE);
+    capture_begin();
+    for (int i = 0; i < 12; i++) {
+        hold_extra(XBOX_HOST_PADDLE1, 1);
+        poll0();
+        advance(10);
+        hold_extra(XBOX_HOST_PADDLE1, 0);
+        poll0();
+        advance(10);
+    }
+    advance(1000);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    out = capture_end();
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    poll0();
+    fired = menu_fires();
+    CHECK(fired == 13);
+    CHECK(count(out, "[ACTION] menu.open via paddle1\n") == 11);
+    CHECK(strstr(out, "[ACTION] 2 more fires not logged\n") != NULL);
+}
+
+/* ---- 10. the flip tick: guide+a with no guest poll --------------------- */
+
+static void test_tick(void)
+{
+    XBOX_INPUT_STATE st;
+    int reads;
+
+    start_with(ARMED, &k_fake, NULL);
+    CHECK(nv2a_flip_hook_installed == enhance_actions_tick);
+    /* The title brought input up (its XInitDevices) but never polls. */
+    xbox_InputInit();
+    f_reads = 0;
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    nv2a_flip_hook_run();
+    CHECK(f_reads == 1);
+    CHECK(xbox_InputHostExtra(0) == XBOX_HOST_GUIDE);
+    CHECK(menu_fires() == 0);
+    advance(16);
+    hold_a(1);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 1);
+    advance(16);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 0);
+    /* The title polls again: A, pressed with Guide held, stays the host's. */
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    advance(16);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    /* While polled, the tick leaves the port to the poll. */
+    reads = f_reads;
+    advance(50);
+    nv2a_flip_hook_run();
+    CHECK(f_reads == reads);
+    hold_a(0);
+    poll0();
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    CHECK(menu_fires() == 0);
+    hold_a(0);
+    poll0();
+
+    /* Stale for 100 ms: the tick reads again. A busy read keeps what the
+     * port had. */
+    advance(100);
+    f_busy = 1;
+    reads = f_reads;
+    nv2a_flip_hook_run();
+    CHECK(f_reads == reads + 1);
+    f_busy = 0;
+
+    /* The pad goes away with Guide held: the tick lets Guide go and clears
+     * the snapshot, so a glue that reads it (cat's) cannot complete the
+     * chord when the pad comes back with A. */
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    advance(16);
+    nv2a_flip_hook_run();
+    CHECK(xbox_InputHostExtra(0) == XBOX_HOST_GUIDE);
+    f_conn[0] = 0;
+    advance(16);
+    nv2a_flip_hook_run();
+    CHECK(xbox_InputHostExtra(0) == 0);
+    f_conn[0] = 1;
+    f_extra[0] = 0;
+    hold_a(1);
+    {
+        struct xbox_host_pad h;
+        memset(&h, 0, sizeof h);
+        h.pad = f_pad[0];
+        h.extra = xbox_InputHostExtra(0);
+        h.connected = 1;
+        h.slot = 0;
+        st = f_pad[0];
+        advance(16);
+        xbox_enhance_pad_filter(0, &h, &st);
+        CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    }
+    CHECK(menu_fires() == 0);
+}
+
+/* A guest poll that lands while the tick reads the pad: it sees guide+a,
+ * then guide and A go up and it polls again. Straight into the filter, as
+ * the title's poll on its own thread would reach it. */
+static void filter_now(void)
+{
+    struct xbox_host_pad h;
+    XBOX_INPUT_STATE st;
+
+    memset(&h, 0, sizeof h);
+    h.pad = f_pad[0];
+    h.extra = f_extra[0];
+    h.connected = 1;
+    h.slot = 0;
+    st = f_pad[0];
+    xbox_enhance_pad_filter(0, &h, &st);
+}
+
+static void poll_press_release(void)
+{
+    advance(5);
+    filter_now();
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    hold_a(0);
+    advance(5);
+    filter_now();
+}
+
+static void test_tick_race(void)
+{
+    start_with(ARMED, &k_fake, NULL);
+    xbox_InputInit();
+    f_conn[0] = 1;
+    memset(&f_pad[0], 0, sizeof f_pad[0]);
+    f_extra[0] = 0;
+    /* The port is stale, so the tick reads guide+a. The polls during that
+     * read step the press and the release; the tick's older read must not
+     * step after them, or it would press guide+a a second time. */
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    filter_now();           /* the modifier first, as a chord needs */
+    advance(200);
+    hold_a(1);
+    f_during_read = poll_press_release;
+    nv2a_flip_hook_run();
+    CHECK(f_during_read == NULL);
+    CHECK(menu_fires() == 1);
+    CHECK(enhance_action_down(enhance_action_find("menu.open")) == 0);
+}
+
+/* ---- 11. the mod API: a v1 mod, a v2 mod, a failed init ----------------- */
+
+static int s_v1_frames;
+static void v1_frame(void *u) { (void)u; s_v1_frames++; }
+static int v1_init(const struct xbox_mod_api *api)
+{
+    /* A mod built against version 1 touches nothing past batch_filter. */
+    return api->on_frame(v1_frame, NULL) ? 0 : -1;
+}
+static const struct xbox_mod k_v1 = { "oldmod", v1_init, NULL };
+
+static const struct xbox_mod_api *s_v2_api;
+static int s_cam_id = -2, s_cam_armed = -1;
+static int v2_init(const struct xbox_mod_api *api)
+{
+    static const char *const defs[] = { "F6", "guide+y", NULL };
+    if (api->size < offsetof(struct xbox_mod_api, actions_arm) + sizeof api->actions_arm)
+        return -1;
+    s_v2_api = api;
+    s_cam_id = api->action_register("camera.toggle", "Free camera", defs);
+    s_cam_armed = api->actions_arm("camera.free");
+    return 0;
+}
+static const struct xbox_mod k_v2 = { "camera", v2_init, NULL };
+
+static int bad_init(const struct xbox_mod_api *api)
+{
+    api->action_register("bad.thing", "Bad", NULL);
+    api->actions_arm("bad.on");
+    return -1;
+}
+static const struct xbox_mod k_bad = { "bad", bad_init, NULL };
+
+static void test_mod_api(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_v1, &k_v2, &k_bad, NULL };
+    const char *out;
+    int id;
+
+    CHECK(XBOX_MOD_API_VERSION == 2u);
+    out = start_with("[camera]\nfree = true\n", &k_fake, mods);
+    CHECK(strstr(out, "[ENHANCE] actions hook=on (camera.free)\n") != NULL);
+    CHECK(s_cam_armed == 1);
+    CHECK(s_v2_api && s_v2_api->version == XBOX_MOD_API_VERSION);
+    s_v1_frames = 0;
+    xbox_mod_frame();
+    CHECK(s_v1_frames == 1);
+    id = enhance_action_find("camera.toggle");
+    CHECK(id >= 0 && id == s_cam_id);
+    CHECK(enhance_action_find("bad.thing") < 0);
+    CHECK(enhance_action_find("menu.open") >= 0);
+    /* Registration is init only. */
+    CHECK(s_v2_api->action_register("camera.late", "Late", NULL) < 0);
+    /* The mod's default binding fires through its own calls. */
+    poll0();
+    xbox_InputKeyEvent(VK_F6, 1);
+    poll0();
+    CHECK(s_v2_api->action_down(id));
+    xbox_InputKeyEvent(VK_F6, 0);
+    poll0();
+    CHECK(s_v2_api->action_pressed(id) == 1);
+    CHECK(s_v2_api->action_pressed(id) == 0);
+    CHECK(!s_v2_api->action_down(id));
+    /* guide+y */
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = 255;
+    poll0();
+    CHECK(s_v2_api->action_pressed(id) == 1);
+    pad_clear();
+    poll0();
+    capture_begin();
+    s_v2_api->toast(&k_v2, "free camera %s", "on");
+    out = capture_end();
+    CHECK(strstr(out, "[MOD camera] toast: free camera on\n") != NULL);
+
+    /* A mod whose init fails takes the key it armed with: the hook stays
+     * off. */
+    {
+        static const struct xbox_mod *const bad_only[] = { &k_bad, NULL };
+        out = start_with("[bad]\non = true\n", &k_fake, bad_only);
+        CHECK(strstr(out, "[ENHANCE] actions hook=off\n") != NULL);
+        CHECK(strstr(out, "bad.on") == NULL);
+        CHECK(!enhance_actions_armed());
+        CHECK(nv2a_flip_hook_installed == NULL);
+    }
+
+    /* An armed key that is false arms nothing. */
+    out = start_with("[camera]\nfree = false\n", &k_fake, mods);
+    CHECK(strstr(out, "[ENHANCE] actions hook=off\n") != NULL);
+    CHECK(s_cam_armed == 0);
+    xbox_mod_shutdown();
+    xbox_mod_register_table(NULL);
+}
+
+/* ---- 12. the seam in xbox_InputGetState (3A.1) ------------------------- */
+
+static struct xbox_host_pad s_seen;
+static int s_calls;
+static void rewrite(DWORD port, const struct xbox_host_pad *host, XBOX_INPUT_STATE *st)
+{
+    (void)port;
+    s_calls++;
+    s_seen = *host;
+    st->Gamepad.wButtons &= (WORD)~XBOX_GAMEPAD_START;
+}
+
+static void test_seam(void)
+{
+    XBOX_INPUT_STATE st;
+
+    start(NULL);
+    xbox_InputKeyboardEnable(1);
+    /* The filter sees the pad before the keyboard merge, with the extra
+     * bits, and its change is what the title gets. */
+    xbox_InputSetPadFilter(rewrite);
+    hold_btn(XBOX_GAMEPAD_START | XBOX_GAMEPAD_BACK, 1);
+    hold_extra(XBOX_HOST_PADDLE2, 1);
+    xbox_InputKeyEvent('Z', 1);
+    s_calls = 0;
+    st = poll0();
+    CHECK(s_calls == 1);
+    CHECK(s_seen.connected && s_seen.slot == 0);
+    CHECK(s_seen.extra == XBOX_HOST_PADDLE2);
+    CHECK(s_seen.pad.Gamepad.wButtons & XBOX_GAMEPAD_START);
+    CHECK(s_seen.pad.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_START));
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK);
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] != 0);   /* Z, the keyboard's */
+    /* No pad: the filter still runs, with connected 0, on the keyboard's state. */
+    f_conn[0] = 0;
+    s_calls = 0;
+    advance(2000);
+    st = poll0();
+    CHECK(s_calls == 1 && !s_seen.connected);
+    f_conn[0] = 1;
+    /* No filter: untouched. */
+    xbox_InputSetPadFilter(NULL);
+    advance(2000);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_START);
+    /* Disarmed, the toolkit's filter is a no-op even when set. */
+    xbox_InputSetPadFilter(xbox_enhance_pad_filter);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_START);
+    xbox_InputSetPadFilter(NULL);
+    xbox_InputKeyboardEnable(0);
+    xbox_InputKeysClear();
+}
+
+/* ---- 13. a live rebuild while a thread polls and another flips ---------- */
+
+#ifndef _WIN32
+static int s_stop;
+
+static void *poll_thread(void *u)
+{
+    (void)u;
+    while (!__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE)) {
+        XBOX_INPUT_STATE st;
+        xbox_InputGetState(0, &st);
+        advance(1);
+    }
+    return NULL;
+}
+
+static void *flip_thread(void *u)
+{
+    (void)u;
+    while (!__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE))
+        nv2a_flip_hook_run();
+    return NULL;
+}
+
+static void test_live_rebuild(void)
+{
+    pthread_t p, f;
+    int fires = 0;
+
+    /* The keyboard on, so the reload's [input.bindings] swap races the
+     * poll's composition too. */
+    start_with(ARMED "[input]\nkeyboard = true\n"
+               "[input.actions]\nmenu.open = [\"paddle1\", \"back+lthumb@200\"]\n",
+               &k_fake, NULL);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 1);
+    __atomic_store_n(&s_stop, 0, __ATOMIC_RELEASE);
+    pthread_create(&p, NULL, poll_thread, NULL);
+    pthread_create(&f, NULL, flip_thread, NULL);
+    for (int i = 0; i < 200; i++) {
+        if (i % 20 == 0)
+            enhance_input_reload();     /* [input] and [input.actions] */
+        else
+            enhance_actions_rebuild();
+        fires += menu_fires();
+    }
+    __atomic_store_n(&s_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(p, NULL);
+    pthread_join(f, NULL);
+    fires += menu_fires();
+    /* Held since before every rebuild: a new table never fires on it. */
+    CHECK(fires == 0);
+    CHECK(enhance_action_find("menu.open") >= 0);
+    pad_clear();
+    poll0();
+
+    /* A rebuild that moves a held binding's bit: the old bit does not stay
+     * down, and the held input reads as up until let go and pressed. */
+    {
+        int id;
+        start(ARMED "[input.actions]\nmenu.open = [\"F8\", \"paddle1\"]\n");
+        id = enhance_action_find("menu.open");
+        hold_extra(XBOX_HOST_PADDLE1, 1);
+        poll0();
+        CHECK(enhance_action_down(id));
+        CHECK(menu_fires() == 1);
+        write_file("config/config.toml", ARMED "[input.actions]\nmenu.open = [\"paddle1\"]\n");
+        enhance_input_reload();
+        CHECK(!enhance_action_down(id));
+        poll0();
+        CHECK(!enhance_action_down(id));
+        CHECK(menu_fires() == 0);
+        hold_extra(XBOX_HOST_PADDLE1, 0);
+        poll0();
+        CHECK(!enhance_action_down(id));
+        hold_extra(XBOX_HOST_PADDLE1, 1);
+        poll0();
+        CHECK(enhance_action_down(id));
+        CHECK(menu_fires() == 1);
+        hold_extra(XBOX_HOST_PADDLE1, 0);
+        poll0();
+        CHECK(!enhance_action_down(id));
+    }
+}
+#endif
+
+int main(void)
+{
+    MKDIR("config");
+    set_env("RECOMP_CONFIG", NULL);
+    set_env("RECOMP_INPUT_CHORD_DELAY_MS", NULL);
+    test_hold_chord();
+    test_guide_a();
+    test_no_guide();
+    test_mask_until_release();
+    test_refusals();
+    test_chord_delay();
+    test_scripts();
+    test_disarmed();
+    test_paddle_and_log();
+    test_tick();
+    test_tick_race();
+    test_mod_api();
+    test_seam();
+#ifndef _WIN32
+    test_live_rebuild();
+#endif
+    xbox_mod_shutdown();
+    enhance_actions_reset();
+    remove("config/config.toml");
+    remove("actions_stderr.txt");
+    printf("input_actions: %d checks, %d failed\n", s_checks, s_fail);
+    return s_fail ? 1 : 0;
+}

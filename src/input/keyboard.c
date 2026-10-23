@@ -24,6 +24,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Reading this needs no lock. Each entry is written only by the window's
@@ -254,10 +255,18 @@ static void bindings_ready(void)
     }
 }
 
-void xbox_InputBindingsReset(void)
+static void drop_committed(void);
+
+void xbox_InputBindingsStage(void)
 {
     compiled_bindings(s_bind);
     s_bind_ready = 1;
+}
+
+void xbox_InputBindingsReset(void)
+{
+    xbox_InputBindingsStage();
+    drop_committed();
 }
 
 void xbox_InputBindingsClear(int control)
@@ -305,6 +314,11 @@ void xbox_InputKeyboardOpts(int stick_ramp_ms, int walk_code, double walk_scale)
     s_ramp_ms = stick_ramp_ms > 0 ? stick_ramp_ms : 0;
     s_walk_code = walk_code > 0 && walk_code < 256 ? walk_code : 0;
     s_walk_scale = walk_scale > 0.0 && walk_scale <= 1.0 ? walk_scale : 1.0;
+}
+
+int xbox_InputKeyboardWalkKey(void)
+{
+    return s_walk_code;
 }
 
 void xbox_InputKbmSetClock(uint64_t (*now_ms)(void))
@@ -431,11 +445,81 @@ static void compose(XBOX_INPUT_STATE *out, const bind_set *t,
     out->dwPacketNumber = ++packet;
 }
 
+/* ---- the committed table ------------------------------------------------- */
+
+typedef struct {
+    bind_set     bind[XBOX_CTL_COUNT];
+    compose_opts o;
+} live_table;
+
+/* s_pending: the last commit, not yet taken (atomic; any thread swaps a
+ * newer one in and frees the one it displaced, which no poll has seen).
+ * s_live: the poll thread's table. s_retired: the table s_live replaced,
+ * freed at the next swap, so a poll that loaded s_live just before a swap
+ * still reads valid memory. s_drop: Reset asked for staging again.
+ * s_live and s_retired swap without atomics: one poll thread per title is
+ * assumed (cat polls under its LOCK(), a USB-style title from its one
+ * input thread). A second thread composing at once would need a lock. */
+static live_table *s_pending;
+static live_table *s_live;
+static live_table *s_retired;
+static int         s_drop;
+
+void xbox_InputBindingsCommit(void)
+{
+    live_table *t = malloc(sizeof *t), *old;
+
+    if (!t)
+        return;
+    bindings_ready();
+    memcpy(t->bind, s_bind, sizeof t->bind);
+    t->o.ramp_ms = s_ramp_ms;
+    t->o.walk_code = s_walk_code;
+    t->o.walk_scale = s_walk_scale;
+    __atomic_store_n(&s_drop, 0, __ATOMIC_RELEASE);
+    old = __atomic_exchange_n(&s_pending, t, __ATOMIC_ACQ_REL);
+    free(old);
+}
+
+static void drop_committed(void)
+{
+    free(__atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL));
+    __atomic_store_n(&s_drop, 1, __ATOMIC_RELEASE);
+}
+
+/* Poll thread: the committed table, newest first, or NULL for staging. */
+static const live_table *live(void)
+{
+    live_table *p;
+
+    if (__atomic_exchange_n(&s_drop, 0, __ATOMIC_ACQ_REL)) {
+        free(s_retired);
+        s_retired = s_live;
+        s_live = NULL;
+    }
+    p = __atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL);
+    if (p) {
+        free(s_retired);
+        s_retired = s_live;
+        s_live = p;
+    }
+    return s_live;
+}
+
 void xbox_InputKbmState(XBOX_INPUT_STATE *out, int keys, int mouse)
 {
-    compose_opts o = { s_ramp_ms, s_walk_code, s_walk_scale };
-    bindings_ready();
-    compose(out, s_bind, &o, keys, mouse);
+    const live_table *t = live();
+
+    if (t) {
+        compose(out, t->bind, &t->o, keys, mouse);
+        return;
+    }
+    {
+        /* Staging, before the first Commit: one thread binds and polls. */
+        compose_opts o = { s_ramp_ms, s_walk_code, s_walk_scale };
+        bindings_ready();
+        compose(out, s_bind, &o, keys, mouse);
+    }
 }
 
 int xbox_InputKbmPoll(XBOX_INPUT_STATE *out)

@@ -10,6 +10,7 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | `input_map.h`, `input_map.c` | The host → Xbox mapping table, the pure map and deadzone helpers |
 | `input_core.c` | The public API: connection cache, probe backoff, keyboard merge, shutdown |
 | `input_backend.h` | The seam between `input_core.c` and a host backend (tests swap it) |
+| `host_pad.h` | The host pad before any merge (`struct xbox_host_pad`, the host-only buttons) and the pad filter seam |
 | `xinput_device.c` | Host backends: XInput (Windows, Proton) and the SDL3 gamepad API |
 | `keyboard.c` | The key table, the compiled-in key map, the runtime bindings and the keyboard-and-mouse composer, every host |
 | `mouse.h`, `mouse.c` | The mouse: motion as a stick, buttons, the wheel, the capture state machine; its `_WIN32` half is the Win32 windows' mouse |
@@ -174,6 +175,38 @@ and fails if the table below and the code disagree. Regenerate it with
 | Right stick X | `sThumbRX` | -32768..32767, right positive | `sThumbRX` | `RIGHTX` |
 | Right stick Y | `sThumbRY` | -32768..32767, up positive | `sThumbRY` | `RIGHTY` as `-1 - v` |
 <!-- input_map:end -->
+
+**Host-only buttons.** A host pad has buttons the Duke never had, and the
+table above maps none of them to the guest. The backends report them
+beside the guest state as `host_extra` (`host_pad.h`: `XBOX_HOST_GUIDE`,
+`MISC1`, `PADDLE1`..`PADDLE4`, `TOUCHPAD`). SDL3 reads Guide and, in a
+second loop past the guest map, `MISC1`, the four paddles and the touchpad
+(`XBOX_SDL_BUTTON_COUNT` stays 15). XInput has Guide only, through
+`XInputGetStateEx` (xinput1_4 ordinal 100, resolved at run time; without
+it Guide reads 0). `xbox_InputHostExtra(slot)` answers what the last read
+of a slot saw. `xbox_input_backend_read_host(slot, &host)` reads a slot
+off the poll thread (the flip tick below) and clears the bits when no pad
+is open, so a Guide held as the pad went away does not stay held. Under
+Steam Input, and on some hosts by default, the system keeps Guide; the
+per-host table is in `docs/runtime/config.md` ("Host actions").
+
+**The pad filter.** `xbox_InputSetPadFilter(fn)` installs one function
+that `xbox_InputGetState` calls last, with the port, the host pad behind
+it (`struct xbox_host_pad`: the backend's state before the keyboard and
+script merge, `extra`, `connected`, and the backend slot) and the state
+the title is about to get, which it may change. With none set nothing
+changes. The enhancements layer sets `xbox_enhance_pad_filter` (`mod.h`)
+for its host actions (`src/enhance/enhance_actions.c`, `[input.actions]`
+in `docs/runtime/config.md`): it fires actions from keys, host-only
+buttons and pad chords, and only takes presses out of the state (a
+consumed chord, `guide+a`). It stays disarmed, returning at its first
+test, unless a feature key arms it (`[ENHANCE] actions hook=off` in a
+golden run). A title that reads the pad through its own glue rather than
+`xbox_InputGetState` calls `xbox_enhance_pad_filter` itself after its
+merge (cat's `pad_input.c`). When the title stops polling, the flip reads
+the host pad through `xbox_input_backend_read_host` so the actions still
+fire on a loading screen. `tests/input_actions` covers the filter seam
+and the actions.
 
 ### Keyboard → Xbox mapping
 

@@ -1325,6 +1325,13 @@ void nv2a_bump_trace(const struct nv2a_pb_vsh *v, const struct nv2a_stage st[4],
 }
 
 #ifdef XBOXRECOMP_ENHANCE
+nv2a_flip_hook_fn nv2a_flip_hook_installed;
+
+void nv2a_flip_hook_set(nv2a_flip_hook_fn fn)
+{
+    __atomic_store_n(&nv2a_flip_hook_installed, fn, __ATOMIC_RELEASE);
+}
+
 nv2a_batch_filter_fn nv2a_batch_filter_installed;
 
 void nv2a_batch_filter_set(nv2a_batch_filter_fn fn)

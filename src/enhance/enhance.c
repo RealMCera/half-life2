@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "enhance_actions.h"
 #include "enhance_cfg.h"
 #include "enhance_input.h"
 #include "kernel_pacing.h"
@@ -187,9 +188,14 @@ int xbox_enhance_init(const char *root, const char *title)
                 s_movie[o.movie_mode]);
     load_tex_pack(&o);
     enhance_input_init();
+    /* The toolkit's host actions before the mods register theirs. */
+    enhance_actions_init();
     /* Last: a mod's init reads its keys over every file and the [input]
      * keys already applied (mod.h). */
     xbox_mod_init();
+    /* [input.actions] once every action is registered (the key map of
+     * rule 2 is the one enhance_input_init applied), then the hook line. */
+    enhance_actions_start();
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

@@ -44,6 +44,7 @@
 #include <stdint.h>
 
 #include "enhance_input.h"
+#include "host_pad.h"
 #include "nv2a_backend_common.h"
 #include "recomp_env.h"
 
@@ -51,7 +52,7 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 1u
+#define XBOX_MOD_API_VERSION 2u
 
 struct xbox_mod_api;
 
@@ -104,6 +105,33 @@ struct xbox_mod_api {
      * (ack) thread; any filter's non-zero skips the batch. Returns 0 when
      * the table is full (XBOX_MOD_MAX_FILTER). */
     int (*batch_filter)(xbox_mod_batch_fn fn, void *user);
+
+    /* ---- version 2 (check size before using these) ---------------------
+     * Host actions (enhance_actions.h): a named thing the mod does, bound
+     * by [input.actions] "<name>" (or its defaults) to keys, host-only
+     * buttons and pad chords that never take an input the title uses. */
+
+    /* Init only. name "<mod>.<verb>" in lowercase, label for the menu,
+     * defaults a NULL-terminated list ("F6", "guide+y") or NULL. Returns
+     * the id, or -1 with a line (duplicate, bad name, full). */
+    int (*action_register)(const char *name, const char *label,
+                           const char *const *defaults);
+    /* Fires since the last call (any thread); held now past its hold. */
+    int (*action_pressed)(int id);
+    int (*action_down)(int id);
+    /* Reserved for the menu (phase 3D): NULL until then. */
+    void *menu_add;
+    /* Reserved (phase 3D): fn(user) when the mod's enable key changes
+     * live. NULL until then. */
+    void *on_enable;
+    /* A short message on screen; a "[MOD <name>] toast:" line until the
+     * overlay lands (phase 3B). */
+    void (*toast)(const struct xbox_mod *m, const char *fmt, ...);
+    /* Arm the actions hook when the config key (the mod's enable key,
+     * "camera.free") is true; returns whether the hook is armed. Nothing
+     * fires and nothing is filtered unless some feature key arms it.
+     * From init only: a mod left out takes its key with it. */
+    int (*actions_arm)(const char *key);
 };
 
 #define XBOX_MOD_MAX_FRAME   16
@@ -126,6 +154,15 @@ void xbox_mod_frame(void);
 
 /* The title's pad glue: whether a mod has port 0 (enhance_input_captured). */
 int xbox_mod_input_captured(void);
+
+/* The title's pad glue, after its own merge (keyboard, script): the host
+ * pad behind port (host_pad.h; connected = 0 for a script or no pad) and
+ * the state the title is about to use, from which a consumed chord's
+ * buttons are taken out (enhance_actions.h). Returns at its first test
+ * while the hook is disarmed. A title on xbox_InputGetState gets this from
+ * input_core.c and does not call it. */
+void xbox_enhance_pad_filter(DWORD port, const struct xbox_host_pad *host,
+                             XBOX_INPUT_STATE *st);
 
 /* Removes the filter, stops the frame dispatch, then the mods' shutdowns,
  * in reverse order, and the capture released. Runs once; the exit paths

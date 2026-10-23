@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include "xinput_xbox.h"
+#include "host_pad.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,13 @@ typedef struct xbox_input_backend {
     int   (*keyboard)(XBOX_INPUT_STATE *out);
     /* Monotonic milliseconds. */
     uint64_t (*now_ms)(void);
+    /* The host-only buttons (host_pad.h, XBOX_HOST_*) port's last get_state
+     * saw; NULL when the backend has none. */
+    uint32_t (*host_extra)(DWORD port);
+    /* port's pad and host-only buttons, read off the poll thread (the flip
+     * tick, xbox_input_backend_read_host): ERROR_SUCCESS,
+     * ERROR_DEVICE_NOT_CONNECTED or XBOX_INPUT_BUSY. NULL: not connected. */
+    DWORD (*read_host)(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra);
 } xbox_input_backend;
 
 /* The host backend this build uses (xinput_device.c). */

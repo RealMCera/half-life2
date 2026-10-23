@@ -19,6 +19,13 @@ extern "C" {
  * 0. A second call re-reads (tests). */
 int enhance_input_init(void);
 
+/* The same again, live, from any thread (the menu): the mouse options go
+ * through their ring, the key table and the stick options through one
+ * committed snapshot the poll swaps in, then [input.actions] is rebuilt
+ * against the new key map. The window re-grabs for a new mouse_capture at
+ * its next event. Returns 0. */
+int enhance_input_reload(void);
+
 /* ---- a mod's input (src/enhance/mod.h) --------------------------------- */
 
 /* What a mod reads each frame. */

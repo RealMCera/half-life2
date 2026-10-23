@@ -33,18 +33,85 @@ _Static_assert(sizeof(XINPUT_GAMEPAD) == sizeof(XBOX_HOST_XINPUT_GAMEPAD)
                && offsetof(XINPUT_GAMEPAD, sThumbRY) == offsetof(XBOX_HOST_XINPUT_GAMEPAD, sThumbRY),
                "XBOX_HOST_XINPUT_GAMEPAD must match XINPUT_GAMEPAD");
 
-static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
-{
-    XINPUT_STATE xi;
-    XBOX_HOST_XINPUT_GAMEPAD pad;
-    DWORD rc = XInputGetState(port, &xi);
+/* XInputGetState never reports the Guide button; the undocumented
+ * XInputGetStateEx (xinput1_4 ordinal 100, also in Wine's) does, as bit
+ * 0x0400. Resolved once by ordinal, since it has no name; absent, Guide
+ * reads as never pressed and the F10 and chord fallbacks remain. It fills
+ * XINPUT_STATE_EX, 4 bytes longer than XINPUT_STATE (Wine's and SDL's
+ * definition), so it gets that struct, never an XINPUT_STATE. */
+typedef struct {
+    DWORD          dwPacketNumber;
+    XINPUT_GAMEPAD Gamepad;
+    DWORD          dwPaddingReserved;
+} xi_state_ex;
+_Static_assert(sizeof(xi_state_ex) == 20, "XINPUT_STATE_EX is 20 bytes");
+_Static_assert(offsetof(xi_state_ex, Gamepad) == offsetof(XINPUT_STATE, Gamepad),
+               "XINPUT_STATE_EX starts as XINPUT_STATE");
 
+typedef DWORD (WINAPI *xi_get_state_ex_fn)(DWORD, xi_state_ex *);
+#define XI_GUIDE 0x0400u
+static xi_get_state_ex_fn g_xi_ex;     /* atomic */
+static int                g_xi_ex_done;
+
+static xi_get_state_ex_fn xi_reader(void)
+{
+    if (!__atomic_load_n(&g_xi_ex_done, __ATOMIC_ACQUIRE)) {
+        /* Two threads may both resolve it; they find the same address. */
+        HMODULE h = LoadLibraryA("xinput1_4.dll");
+        xi_get_state_ex_fn fn = NULL;
+        if (h)
+            fn = (xi_get_state_ex_fn)(void (*)(void))GetProcAddress(h, (LPCSTR)(uintptr_t)100);
+        __atomic_store_n(&g_xi_ex, fn, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_xi_ex_done, 1, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&g_xi_ex, __ATOMIC_ACQUIRE);
+}
+
+static uint32_t g_xi_extra[XBOX_MAX_CONTROLLERS];   /* atomic */
+
+/* Any thread: XInput is thread safe. */
+static DWORD xi_read(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
+{
+    XBOX_HOST_XINPUT_GAMEPAD pad;
+    XINPUT_GAMEPAD g;
+    DWORD packet, rc;
+    /* Only the armed host actions want Guide; a stock run keeps the
+     * documented call. */
+    xi_get_state_ex_fn ex = xbox_InputPadFilterSet() ? xi_reader() : NULL;
+
+    if (ex) {
+        xi_state_ex xe;
+        rc = ex(port, &xe);
+        g = xe.Gamepad;
+        packet = xe.dwPacketNumber;
+    } else {
+        XINPUT_STATE xi;
+        rc = XInputGetState(port, &xi);
+        g = xi.Gamepad;
+        packet = xi.dwPacketNumber;
+    }
     if (rc != ERROR_SUCCESS)
         return rc;
-    memcpy(&pad, &xi.Gamepad, sizeof pad);
-    out->dwPacketNumber = xi.dwPacketNumber;
+    *extra = (g.wButtons & XI_GUIDE) ? XBOX_HOST_GUIDE : 0u;
+    g.wButtons &= (WORD)~XI_GUIDE;
+    memcpy(&pad, &g, sizeof pad);
+    out->dwPacketNumber = packet;
     xbox_InputMapXInput(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
+}
+
+static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
+{
+    uint32_t extra = 0;
+    DWORD rc = xi_read(port, out, &extra);
+
+    __atomic_store_n(&g_xi_extra[port], extra, __ATOMIC_RELEASE);
+    return rc;
+}
+
+static uint32_t xi_host_extra(DWORD port)
+{
+    return __atomic_load_n(&g_xi_extra[port], __ATOMIC_ACQUIRE);
 }
 
 static DWORD xi_set_state(DWORD port, const XBOX_VIBRATION *v)
@@ -61,7 +128,8 @@ static uint64_t xi_now_ms(void) { return GetTickCount64(); }
  * idle pad for an empty user index. If a Wine/Proton build does that, the
  * connection probe has to move to XInputGetCapabilities. */
 const xbox_input_backend xbox_input_host_backend = {
-    NULL, xi_get_state, xi_set_state, xbox_InputKbmPoll, xi_now_ms
+    NULL, xi_get_state, xi_set_state, xbox_InputKbmPoll, xi_now_ms,
+    xi_host_extra, xi_read
 };
 
 /* ======================================================================== */
@@ -299,6 +367,37 @@ static void sdl_init(void)
     pthread_mutex_unlock(&g_slot_lock);
 }
 
+/* SDL buttons past the guest map (XBOX_SDL_BUTTON_COUNT) and Guide, which
+ * the map leaves out: the host-only buttons (host_pad.h). g_slot_lock held. */
+static uint32_t sdl_extra(SDL_Gamepad *c)
+{
+    static const struct { SDL_GamepadButton b; uint32_t bit; } k_extra[] = {
+        { SDL_GAMEPAD_BUTTON_GUIDE,         XBOX_HOST_GUIDE },
+        { SDL_GAMEPAD_BUTTON_MISC1,         XBOX_HOST_MISC1 },
+        { SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, XBOX_HOST_PADDLE1 },
+        { SDL_GAMEPAD_BUTTON_LEFT_PADDLE1,  XBOX_HOST_PADDLE2 },
+        { SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2, XBOX_HOST_PADDLE3 },
+        { SDL_GAMEPAD_BUTTON_LEFT_PADDLE2,  XBOX_HOST_PADDLE4 },
+        { SDL_GAMEPAD_BUTTON_TOUCHPAD,      XBOX_HOST_TOUCHPAD },
+    };
+    uint32_t extra = 0;
+
+    for (size_t i = 0; i < sizeof k_extra / sizeof k_extra[0]; i++)
+        if (SDL_GetGamepadButton(c, k_extra[i].b))
+            extra |= k_extra[i].bit;
+    return extra;
+}
+
+static uint32_t g_sdl_extra[XBOX_MAX_CONTROLLERS];  /* atomic */
+
+static void sdl_read_pad(SDL_Gamepad *c, XBOX_HOST_SDL_GAMEPAD *pad)
+{
+    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
+        pad->button[b] = SDL_GetGamepadButton(c, (SDL_GamepadButton)b) ? 1 : 0;
+    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
+        pad->axis[a] = SDL_GetGamepadAxis(c, (SDL_GamepadAxis)a);
+}
+
 static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
 {
     SDL_Gamepad *c;
@@ -315,13 +414,12 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
         c = NULL;
     }
     if (!c) {
+        __atomic_store_n(&g_sdl_extra[port], 0u, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&g_slot_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
-        pad.button[b] = SDL_GetGamepadButton(c, (SDL_GamepadButton)b) ? 1 : 0;
-    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
-        pad.axis[a] = SDL_GetGamepadAxis(c, (SDL_GamepadAxis)a);
+    sdl_read_pad(c, &pad);
+    __atomic_store_n(&g_sdl_extra[port], sdl_extra(c), __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_slot_lock);
     out->dwPacketNumber = ++g_packet[port];
     xbox_InputMapSdl(&pad, &out->Gamepad);
@@ -343,8 +441,38 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
     return c ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
+static uint32_t sdl_host_extra(DWORD port)
+{
+    return __atomic_load_n(&g_sdl_extra[port], __ATOMIC_ACQUIRE);
+}
+
+/* The flip tick's read, off the poll thread. Only a try: the window thread
+ * may hold g_slot_lock across a rescan, and the flip must not wait on it.
+ * No SDL_UpdateGamepads here: the pumping thread updates the pads, and a
+ * second updater would race it. */
+static DWORD sdl_read_host(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
+{
+    XBOX_HOST_SDL_GAMEPAD pad;
+    SDL_Gamepad *c;
+
+    if (pthread_mutex_trylock(&g_slot_lock) != 0)
+        return XBOX_INPUT_BUSY;
+    c = g_ready ? g_slot[port].pad : NULL;
+    if (!c || !SDL_GamepadConnected(c)) {
+        pthread_mutex_unlock(&g_slot_lock);
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+    sdl_read_pad(c, &pad);
+    *extra = sdl_extra(c);
+    pthread_mutex_unlock(&g_slot_lock);
+    out->dwPacketNumber = 0;
+    xbox_InputMapSdl(&pad, &out->Gamepad);
+    return ERROR_SUCCESS;
+}
+
 const xbox_input_backend xbox_input_host_backend = {
-    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKbmPoll, sdl_now_ms
+    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKbmPoll, sdl_now_ms,
+    sdl_host_extra, sdl_read_host
 };
 
 #endif /* _WIN32 */
