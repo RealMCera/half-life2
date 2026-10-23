@@ -601,9 +601,21 @@ extern volatile int g_xbox_guest_cpu_waiters;
  * leaves after one pass can miss the arm while the walker misses the store,
  * and the kick waits out the walker's 1 ms tick. */
 extern volatile int g_xbox_kick_armed;
+/* A full barrier, store-load included: what clang and gcc emit for a seq_cst
+ * fence (mfence on x86-64, dmb ish on ARM64). cl.exe has no __atomic
+ * builtins; <intrin.h> is in from the RECOMP_ATOMIC_* block above. */
+#if defined(_MSC_VER)
+#  if defined(_M_ARM64)
+#    define RECOMP_SEQ_CST_FENCE() __dmb(_ARM64_BARRIER_ISH)
+#  else
+#    define RECOMP_SEQ_CST_FENCE() _mm_mfence()
+#  endif
+#else
+#  define RECOMP_SEQ_CST_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
 void xbox_SpinWait(uint32_t va);
 #define RECOMP_SPIN_WAIT(va) \
-    do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
+    do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
 
 /* Every loop back edge in lifted code (tools.recomp, --no-back-edge-yield
  * leaves them bare): the guest CPU's quantum check. A guest thread that has

@@ -57,6 +57,17 @@ void xbox_HostTimerWake(void);
  * variable on the monotonic clock. Never freed. */
 typedef struct XboxHostWaker XboxHostWaker;
 XboxHostWaker *xbox_HostWakerCreate(void);
+/* One form by name, whatever the host: tests/kick_wake runs the native
+ * Windows form under Wine, where xbox_HostWakerCreate picks the condition
+ * variable. NULL where the form does not exist (the event form on POSIX, or
+ * without the high-resolution timer). */
+typedef enum {
+    XBOX_WAKER_AUTO,            /* xbox_HostWakerCreate's choice */
+    XBOX_WAKER_CONDVAR,         /* a lock and a condition variable */
+    XBOX_WAKER_EVENT            /* Windows: an auto-reset event and the
+                                 * high-resolution waitable timer */
+} XboxHostWakerForm;
+XboxHostWaker *xbox_HostWakerCreateForm(XboxHostWakerForm form);
 /* 1 when a wake ended it (or one was kept), 0 on the timeout. ns 0 only
  * consumes a kept wake. */
 int  xbox_HostWakerSleepNs(XboxHostWaker *w, uint64_t ns);

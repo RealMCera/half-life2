@@ -131,6 +131,7 @@ int xbox_KickWakeWatchPut(XboxKickWake *k, uint32_t put_before, uint64_t ns)
 
     for (;;) {
         if (__atomic_load_n(k->put, __ATOMIC_RELAXED) != put_before) {
+            k->watch_missed = 0;
             STAT_ADD(k->watch_hits, 1);
             STAT_ADD(k->watch_ns, (long long)(now - t0));
             return 1;
@@ -144,7 +145,20 @@ int xbox_KickWakeWatchPut(XboxKickWake *k, uint32_t put_before, uint64_t ns)
             now = xbox_HostNowNs();
     }
     STAT_ADD(k->watch_misses, 1);
+    k->watch_missed = 1;
+    k->watch_missed_put = put_before;
+    k->watch_missed_ns = now;
     return 0;
+}
+
+int xbox_KickWakePolling(XboxKickWake *k, uint32_t put)
+{
+    if (!k->watch_missed)
+        return 0;
+    if (put != k->watch_missed_put
+        || xbox_HostNowNs() - k->watch_missed_ns >= XBOX_KICK_WAKE_CARRY_NS)
+        k->watch_missed = 0;
+    return k->watch_missed;
 }
 
 int xbox_KickWakeMiss(XboxKickWake *k)

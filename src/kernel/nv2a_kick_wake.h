@@ -20,7 +20,8 @@
  *   - the PUT store right after an acknowledged kick, which no guest pass
  *     follows: the walker watches PUT for a short spin after each clear
  *     (xbox_KickWakeWatchPut), the guest being one store away, and polls
- *     for the rest of the tick when the store does not come;
+ *     when the store does not come, until PUT moves, at most 16 ms
+ *     (xbox_KickWakePolling);
  *   - a vblank (a held flip releases on the count), and the loop's own 1 ms
  *     tick, the fallback that bounds any wake that never comes. While a
  *     flip is held the walker sleeps for these two only: the flush bit
@@ -58,6 +59,12 @@ extern "C" {
 /* Kicks in a row found by the timeout before the event wait is given up. */
 #define XBOX_KICK_WAKE_MISS_LIMIT 3
 
+/* How long a PUT watch that ran out keeps the walker polling when PUT does
+ * not move (xbox_KickWakePolling): a frame at 60 Hz. A guest thread late by
+ * more than that has missed its frame already, and a KickOff that stores
+ * the PUT it found (nothing new) must not hold the loop at the poll. */
+#define XBOX_KICK_WAKE_CARRY_NS 16000000ull
+
 typedef struct {
     volatile int *armed;             /* the flag RECOMP_SPIN_WAIT reads */
     XboxHostWaker *waker;
@@ -68,6 +75,11 @@ typedef struct {
     uint32_t (*vblank_count)(void);  /* the count a held flip releases on */
     int off;                         /* given up: the loop polls */
     int misses_in_row;
+    /* A PUT watch that ran out (xbox_KickWakeWatchPut): the PUT it waited
+     * to leave, and when, until PUT moves or the carry ends. */
+    int watch_missed;
+    uint32_t watch_missed_put;
+    uint64_t watch_missed_ns;
     /* Statistics, for the [PACING] line; the reader resets them. */
     volatile long pokes, sleeps, poked, timeouts, early, misses;
     volatile long watch_hits, watch_misses, nudges, held_sleeps;
@@ -98,8 +110,18 @@ void xbox_KickWakePoke(XboxKickWake *k);
 void xbox_KickWakeNudge(XboxKickWake *k);
 
 /* The walker, right after acknowledging a kick: spin up to ns for PUT to
- * leave put_before. 1 when it did. */
+ * leave put_before. 1 when it did. A watch that runs out (the guest thread
+ * preempted between its spin and the store) is remembered for
+ * xbox_KickWakePolling: no poke follows that store. */
 int  xbox_KickWakeWatchPut(XboxKickWake *k, uint32_t put_before, uint64_t ns);
+
+/* The walker, before it sleeps: 1 while a PUT watch that ran out is still
+ * waiting for its store, so the loop polls instead. That holds across
+ * ticks: a store that lands during a later tick's sleep would wake nobody
+ * and be found only by that tick's timeout, up to 1 ms late. It ends when
+ * PUT (as the loop read it) leaves the watched value, a later watch hits,
+ * or after XBOX_KICK_WAKE_CARRY_NS. */
+int  xbox_KickWakePolling(XboxKickWake *k, uint32_t put);
 
 /* The walker, after a timeout that found work (the flush bit set, or PUT
  * past done_put) with no flip held: the guest stored it without poking. Returns 1 when that turned the

@@ -1705,8 +1705,9 @@ static void framebuffer_probe_tick(void)
  * is ~110 us) and a quarter on the Mac, so RECOMP_DEBUG=kick_event=1 has
  * the loop sleep between ticks until the guest says it has work
  * (nv2a_kick_wake.h): the KickOff's lowered spin pokes it, it watches PUT
- * for a moment after each ack (and polls as above for the rest of the tick
- * when the store does not come), and a vblank or the tick ends any sleep.
+ * for a moment after each ack (and polls as above when the store does not
+ * come, until PUT moves, at most 16 ms), and a vblank or the tick ends any
+ * sleep.
  * The tick is 1 ms on POSIX and under Wine, and one clock interval later
  * at most on native Windows (the waker's high-resolution timer, 0.5-1 ms).
  * A title whose KickOff spin is not lowered cannot poke; three kicks in a
@@ -2229,8 +2230,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             uint64_t t0 = nv2a_pb_now_ns(), now = t0;
             volatile uint32_t *kr =
                 (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
-            /* A PUT watch that ran out: poll for the rest of this tick. */
-            int watch_missed = 0;
             for (;;) {
                 /* Before the hold's poll, and before PUT: as at the scan. */
                 uint32_t vbl = xbox_VblankCount();
@@ -2262,25 +2261,21 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 }
                 if (now - t0 >= 1000000ull)
                     break;
-                if (g_kick_event && !g_kick_wake.off && !watch_missed) {
-                    /* The KickOff stores PUT right after its spin sees the
-                     * ack, and no pass of a lowered loop follows that store:
-                     * catch it here, or it waits for the next kick. A watch
-                     * that runs out (the guest thread preempted between its
-                     * spin and the store) drops to the ~50 us poll for the
-                     * rest of the tick: no poke follows that store, and a
-                     * walk started up to a tick late can cross a vblank and
-                     * hold the next flip a whole frame. */
-                    if (acked) {
-                        if (xbox_KickWakeWatchPut(&g_kick_wake, put,
-                                                  KICK_WATCH_NS)) {
-                            now = nv2a_pb_now_ns();
-                            continue;
-                        }
-                        watch_missed = 1;
-                        now = nv2a_pb_now_ns();
-                        continue;
-                    }
+                /* The KickOff stores PUT right after its spin sees the ack,
+                 * and no pass of a lowered loop follows that store: catch it
+                 * here, or it waits for the next kick. A watch that runs out
+                 * (the guest thread preempted between its spin and the
+                 * store) drops to the ~50 us poll until PUT moves, across
+                 * ticks (xbox_KickWakePolling): no poke follows that store,
+                 * and a walk started up to a tick late can cross a vblank
+                 * and hold the next flip a whole frame. */
+                if (g_kick_event && !g_kick_wake.off && acked) {
+                    xbox_KickWakeWatchPut(&g_kick_wake, put, KICK_WATCH_NS);
+                    now = nv2a_pb_now_ns();
+                    continue;
+                }
+                if (g_kick_event && !g_kick_wake.off
+                    && !xbox_KickWakePolling(&g_kick_wake, put)) {
                     if (held) {
                         xbox_KickWakeSleepNudge(&g_kick_wake,
                                                 t0 + 1000000ull - now, vbl);

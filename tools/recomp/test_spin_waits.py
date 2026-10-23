@@ -178,6 +178,10 @@ def test_lowered_back_edge_compiles():
     hdr = open(_RUNTIME, encoding="utf-8").read()
     m = re.search(r"#define RECOMP_SPIN_WAIT\(va\)[^\n]*\\\n[^\n]*\n", hdr)
     assert m, "RECOMP_SPIN_WAIT not defined in recomp_types.h"
+    # The macro's fence comes from its own #if block (cl.exe has no __atomic).
+    f = re.search(r"#if defined\(_MSC_VER\)\n#  if defined\(_M_ARM64\)\n"
+                  r"#    define RECOMP_SEQ_CST_FENCE\(\)[^\n]*\n(?:#[^\n]*\n)*?#endif\n", hdr)
+    assert f, "RECOMP_SEQ_CST_FENCE not defined in recomp_types.h"
     code, _ = _translate(CMP_MEM_REG, LISTED)
     stmt = next(l for l in code.splitlines() if "RECOMP_SPIN_WAIT" in l)
     src = ("#include <stdint.h>\n"
@@ -186,7 +190,7 @@ def test_lowered_back_edge_compiles():
            "volatile int g_xbox_guest_cpu_waiters;\n"
            "volatile int g_xbox_kick_armed;\n"
            "void xbox_SpinWait(uint32_t va) { (void)va; }\n"
-           + m.group(0) +
+           + f.group(0) + m.group(0) +
            "#define CMP_L(a, b) ((a) < (b))\n"
            "int f(int32_t _fas, int32_t _fbs) {\n"
            f"loc_{BASE:08X}: ;\n" + stmt + "\n return 0; }\n")

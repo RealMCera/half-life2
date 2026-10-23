@@ -374,14 +374,18 @@ struct XboxHostWaker {
     HANDLE timer;               /* native Windows: high-resolution */
 };
 
-XboxHostWaker *xbox_HostWakerCreate(void)
+XboxHostWaker *xbox_HostWakerCreateForm(XboxHostWakerForm form)
 {
-    XboxHostWaker *w = (XboxHostWaker *)calloc(1, sizeof *w);
+    XboxHostWaker *w;
+
+    if (form == XBOX_WAKER_AUTO)
+        form = xbox_HostUnderWine() ? XBOX_WAKER_CONDVAR : XBOX_WAKER_EVENT;
+    w = (XboxHostWaker *)calloc(1, sizeof *w);
     if (!w)
         return NULL;
     InitializeSRWLock(&w->lock);
     InitializeConditionVariable(&w->cv);
-    if (!xbox_HostUnderWine()) {
+    if (form == XBOX_WAKER_EVENT) {
         w->ev = CreateEventW(NULL, FALSE, FALSE, NULL);
         w->timer = CreateWaitableTimerExW(NULL, NULL,
                                           CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -446,9 +450,13 @@ struct XboxHostWaker {
     int pending;
 };
 
-XboxHostWaker *xbox_HostWakerCreate(void)
+XboxHostWaker *xbox_HostWakerCreateForm(XboxHostWakerForm form)
 {
-    XboxHostWaker *w = (XboxHostWaker *)calloc(1, sizeof *w);
+    XboxHostWaker *w;
+
+    if (form == XBOX_WAKER_EVENT)
+        return NULL;
+    w = (XboxHostWaker *)calloc(1, sizeof *w);
     if (!w)
         return NULL;
     pthread_mutex_init(&w->lock, NULL);
@@ -502,6 +510,11 @@ void xbox_HostWakerWake(XboxHostWaker *w)
     pthread_mutex_unlock(&w->lock);
 }
 #endif
+
+XboxHostWaker *xbox_HostWakerCreate(void)
+{
+    return xbox_HostWakerCreateForm(XBOX_WAKER_AUTO);
+}
 
 void xbox_HostTimerThreadInit(void)
 {
