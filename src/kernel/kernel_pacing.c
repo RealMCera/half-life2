@@ -18,6 +18,7 @@
  */
 #include "kernel.h"
 #include "kernel_pacing.h"
+#include "xbox_memory_layout.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
 #include <stdio.h>
@@ -76,6 +77,7 @@ int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
 #define SPIN_CPU_SAMPLE 64
 
 volatile int g_xbox_spin_sleep;
+volatile int g_xbox_kick_armed;
 
 static CRITICAL_SECTION s_lock;
 static CONDITION_VARIABLE s_cv;
@@ -165,7 +167,21 @@ void xbox_SpinWait(uint32_t va)
      * thread waiting for the guest CPU: the pass hands it over and queues
      * behind it, the console's quantum expiry (kernel_guest_cpu.c). The
      * interrupt first, holding the CPU, as an ISR ran with no thread in
-     * between on the console. */
+     * between on the console.
+     *
+     * Before all that, the walker: a KickOff spinning on the flush bit (or
+     * any lowered loop, with PUT moved) is the guest's word that there is
+     * GPU work, and the walker sleeps until it hears it. The macro also
+     * calls for that alone, at spin pacing, which then ends here. The
+     * fence is the guest half of the handshake (nv2a_kick_wake.h): the
+     * macro has one too, but a caller other than it must not depend on
+     * that. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (g_xbox_kick_armed) {
+        xbox_Nv2aKickPoke();
+        if (!(g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters))
+            return;
+    }
     xbox_IrqSafePoint();
     if (!g_xbox_spin_sleep) {
         /* Not at DISPATCH: there the console's scheduler could not switch
@@ -473,6 +489,7 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches)
             extern void nv2a_pb_exec_flip_report(void);
             nv2a_pb_exec_flip_report();
         }
+        xbox_Nv2aKickReport(window_s);
         xbox_GuestCpuReport();
         fflush(stderr);
         n = 0;

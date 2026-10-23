@@ -594,9 +594,16 @@ extern volatile int g_xbox_irq_pending;
  * (RECOMP_GUEST_LOCK, src/kernel/kernel_guest_cpu.c): the pass then hands
  * it over, the console's quantum expiry, at any pacing. */
 extern volatile int g_xbox_guest_cpu_waiters;
+/* Raised while the NV2A walker sleeps for the next kick: the pass pokes it
+ * (nv2a_kick_wake.h), at any pacing. The fence orders the loop's earlier
+ * stores (the KickOff's flush bit, a PUT) before this read of the flag, the
+ * guest half of the walker's Dekker handshake: without it a loop that
+ * leaves after one pass can miss the arm while the walker misses the store,
+ * and the kick waits out the walker's 1 ms tick. */
+extern volatile int g_xbox_kick_armed;
 void xbox_SpinWait(uint32_t va);
 #define RECOMP_SPIN_WAIT(va) \
-    do { if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters) xbox_SpinWait(va); } while (0)
+    do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
 
 /* Every loop back edge in lifted code (tools.recomp, --no-back-edge-yield
  * leaves them bare): the guest CPU's quantum check. A guest thread that has

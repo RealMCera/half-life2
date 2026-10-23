@@ -184,6 +184,7 @@ def test_lowered_back_edge_compiles():
            "volatile int g_xbox_spin_sleep;\n"
            "volatile int g_xbox_irq_pending;\n"
            "volatile int g_xbox_guest_cpu_waiters;\n"
+           "volatile int g_xbox_kick_armed;\n"
            "void xbox_SpinWait(uint32_t va) { (void)va; }\n"
            + m.group(0) +
            "#define CMP_L(a, b) ((a) < (b))\n"

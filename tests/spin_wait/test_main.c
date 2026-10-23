@@ -36,7 +36,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 /* As templates/runtime/recomp_types.h defines it (that header is the
  * generated code's, and too heavy to pull in here). */
 #define RECOMP_SPIN_WAIT(va) \
-    do { if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters) xbox_SpinWait(va); } while (0)
+    do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
 
 #define MS 1000000ull
 
@@ -74,6 +74,25 @@ static void at_spin(void)
     check(!xbox_SpinSiteStats(0x1000u, &(XboxSpinSiteStats){0}),
           "spin: the macro never calls the wait");
     check(xbox_HostNowNs() - t0 < 50 * MS, "spin: 10^5 passes cost nothing");
+}
+
+/* The walker asleep (g_xbox_kick_armed) at spin pacing: the macro calls the
+ * wait for the poke alone, which returns without sleeping or counting a
+ * wait (no walker here: the poke is a no-op until the ack loop runs). */
+static void kick_armed_at_spin(void)
+{
+    uint64_t t0;
+    int i;
+
+    g_xbox_kick_armed = 1;
+    t0 = xbox_HostNowNs();
+    for (i = 0; i < 100000; i++)
+        RECOMP_SPIN_WAIT(0x1100u);
+    g_xbox_kick_armed = 0;
+    check(!xbox_SpinSiteStats(0x1100u, &(XboxSpinSiteStats){0}),
+          "kick armed at spin: the pass pokes and counts no wait");
+    check(xbox_HostNowNs() - t0 < 100 * MS,
+          "kick armed at spin: 10^5 passes never sleep");
 }
 
 static void timeout_bound(void)
@@ -238,6 +257,7 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("spin_wait:\n");
     at_spin();
+    kick_armed_at_spin();
     xbox_PacingSetMode(XBOX_PACING_SLEEP);
     check(g_xbox_spin_sleep && xbox_PacingMode() == XBOX_PACING_SLEEP,
           "sleep mode set");

@@ -44,6 +44,24 @@ void xbox_HostTimerThreadInit(void);
 void xbox_HostTimerSleepNs(uint64_t ns);
 void xbox_HostTimerWake(void);
 
+/* A wakeable sleep for one sleeper and any number of wakers, with a
+ * nanosecond timeout: the NV2A walker waits on one for the guest's KickOff
+ * (nv2a_kick_wake.h) instead of polling every 50 us. A wake that lands
+ * while nobody sleeps is kept for the next sleep, so a waker that raced the
+ * sleeper's last check is not lost; a sleep may also end early for no
+ * reason, so the caller re-checks what it waits for. Wine: an SRW lock and
+ * a condition variable (in-process futexes), whose timeout is whole
+ * milliseconds, rounded up. Native Windows: an event and the
+ * high-resolution waitable timer, at most one clock interval (0.5-1 ms)
+ * late; NULL where that timer is missing. POSIX: a mutex and a condition
+ * variable on the monotonic clock. Never freed. */
+typedef struct XboxHostWaker XboxHostWaker;
+XboxHostWaker *xbox_HostWakerCreate(void);
+/* 1 when a wake ended it (or one was kept), 0 on the timeout. ns 0 only
+ * consumes a kept wake. */
+int  xbox_HostWakerSleepNs(XboxHostWaker *w, uint64_t ns);
+void xbox_HostWakerWake(XboxHostWaker *w);
+
 /* The Windows build under Wine (ntdll exports wine_get_version); 0 on a
  * native Windows host and on POSIX. Looked up once. */
 int xbox_HostUnderWine(void);

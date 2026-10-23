@@ -57,8 +57,14 @@ int  xbox_PacingMode(void);
  * the wait at any pacing, as the gate holder's safe point. */
 extern volatile int g_xbox_spin_sleep;
 extern volatile int g_xbox_irq_pending;
+/* Raised while the NV2A walker sleeps for the guest's next kick
+ * (nv2a_kick_wake.h): a pass of a lowered loop then calls the wait at any
+ * pacing, and the wait pokes the walker first. */
+extern volatile int g_xbox_kick_armed;
 
-/* One pass of a lowered loop whose condition was still true. First a safe
+/* One pass of a lowered loop whose condition was still true. With the
+ * walker asleep, first a poke (xbox_Nv2aKickPoke), which is all a pass
+ * that came only for that does. Then a safe
  * point (xbox_IrqSafePoint): the gate holder runs what was posted. Mode spin
  * returns there. Mode sleep:
  * return at once if the wake generation moved since this thread last looked,

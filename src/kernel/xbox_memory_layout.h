@@ -185,6 +185,15 @@ uint32_t xbox_Nv2aFrameCountersOwned(void);
 /* KickOff flushes acknowledged since the last call, and (if measured) the
  * total time the title spun waiting for them. Resets both. */
 uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns);
+/* The walker's event wait (nv2a_kick_wake.h). Poke: a lowered guest loop's
+ * pass; wakes the walker when it sleeps and the guest has work for it.
+ * Nudge: a vblank; wakes it when it sleeps (a held flip releases on the
+ * count). Both no-ops until the ack loop starts, and one load while the
+ * walker is awake. */
+void xbox_Nv2aKickPoke(void);
+void xbox_Nv2aKickNudge(void);
+/* The [PACING] window's kick-wait line, then reset (walker thread). */
+void xbox_Nv2aKickReport(double window_s);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);

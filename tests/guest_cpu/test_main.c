@@ -46,7 +46,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 /* As templates/runtime/recomp_types.h defines it (that header is the
  * generated code's, and too heavy to pull in here). */
 #define RECOMP_SPIN_WAIT(va) \
-    do { if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters) xbox_SpinWait(va); } while (0)
+    do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
 
 static int failures;
 

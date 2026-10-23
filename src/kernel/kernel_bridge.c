@@ -3218,6 +3218,7 @@ static void kernel_vblank_count(long long now)
     LARGE_INTEGER q;
 
     InterlockedIncrement(&g_vblank_total);
+    xbox_Nv2aKickNudge();   /* a flip held for this count may go */
     if (!qf.QuadPart)
         QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&q);

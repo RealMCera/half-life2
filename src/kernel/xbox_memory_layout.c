@@ -21,6 +21,7 @@
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
 #include "nv2a_flip_hold.h"
+#include "nv2a_kick_wake.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include "guest_vmem.h"
 #include "platform/host_time.h"
@@ -1699,6 +1700,18 @@ static void framebuffer_probe_tick(void)
  * flip hold, which covers the title's gaps between kicks in a frame, and
  * take the timer beyond it, so a menu or an idle frame does not hold a core.
  *
+ * The polls themselves cost a third of a core on the Deck (Wine's 50 us nap
+ * is ~110 us) and a quarter on the Mac, so RECOMP_DEBUG=kick_event=1 has
+ * the loop sleep between ticks until the guest says it has work
+ * (nv2a_kick_wake.h): the KickOff's lowered spin pokes it, it watches PUT
+ * for a moment after each ack (and polls as above for the rest of the tick
+ * when the store does not come), and a vblank or the tick ends any sleep.
+ * The tick is 1 ms on POSIX and under Wine, and one clock interval later
+ * at most on native Windows (the waker's high-resolution timer, 0.5-1 ms).
+ * A title whose KickOff spin is not lowered cannot poke; three kicks in a
+ * row found by the tick turn the sleep off and the loop polls as above.
+ * Off by default (see kick_wake_init).
+ *
  * With RECOMP_FLIP_LOG an observer thread watches the bit, so the [PB-PERF]
  * line can say how many kicks a frame made and how long they waited. It
  * naps cold: on native Windows it may see a kick up to a clock interval
@@ -1710,12 +1723,92 @@ static HANDLE g_nv2a_kick_thread;
 static int g_kick_fast;                      /* RECOMP_FAST_KICK */
 static uint64_t g_kick_seen_ns;              /* first seen set, 0 = not set */
 static uint32_t g_kick_count;
-static uint32_t g_scanned_put;   /* DMA_PUT the walker has executed up to */
+/* DMA_PUT the walker has executed up to. Written by the walker only; a
+ * guest pass reads it to decide whether to poke. */
+static volatile uint32_t g_scanned_put;
 static uint64_t g_kick_wait_ns;
 
 uint64_t nv2a_pb_now_ns(void);
 
 #define KICK_NAP_SPIN_BUDGET_NS 2000000ull
+
+/* The event wait (nv2a_kick_wake.h). After an ack the guest stores PUT a
+ * few instructions on, or after its wake from a sleeping spin (tens of us
+ * under Wine): the watch spins this long for it before the walker sleeps. */
+#define KICK_WATCH_NS 100000ull
+static int g_kick_event;                     /* RECOMP_DEBUG=kick_event */
+static XboxKickWake g_kick_wake;
+
+void xbox_Nv2aKickPoke(void)
+{
+    if (g_kick_wake.waker)
+        xbox_KickWakePoke(&g_kick_wake);
+}
+
+void xbox_Nv2aKickNudge(void)
+{
+    if (g_kick_wake.waker)
+        xbox_KickWakeNudge(&g_kick_wake);
+}
+
+static void kick_wake_init(void *regs)
+{
+    const char *e = recomp_env(RENV_KICK_EVENT);
+
+    /* Off unless asked for (design.md in openspec pb-event-kick): it waits
+     * on spin-wait coverage of the KickOff waits, a title that gains from it, and a
+     * soak run with no flip-hold slip. */
+    g_kick_event = g_kick_fast && e && *e == '1';
+    if (!g_kick_event)
+        return;
+    g_kick_wake.armed = &g_xbox_kick_armed;
+    g_kick_wake.kick = (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
+    g_kick_wake.kick_bit = NV2A_KICK_BIT;
+    g_kick_wake.put = (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+    g_kick_wake.done_put = &g_scanned_put;
+    g_kick_wake.vblank_count = xbox_VblankCount;
+    g_kick_wake.waker = xbox_HostWakerCreate();
+    if (!g_kick_wake.waker)
+        g_kick_event = 0;
+}
+
+/* The walker's CPU since the last window, and how its waits went. Printed
+ * in poll mode too, so the two modes compare on one line. */
+void xbox_Nv2aKickReport(double window_s)
+{
+    static uint64_t last_cpu;
+    XboxKickWake *k = &g_kick_wake;
+    uint64_t cpu = xbox_ThreadCpuNs();
+    double pct = last_cpu && window_s > 0
+               ? (double)(cpu - last_cpu) / 1e9 / window_s * 100.0 : 0;
+    long hits;
+
+    last_cpu = cpu;
+    if (!g_kick_fast)
+        return;
+    if (!g_kick_event || k->off) {
+        fprintf(stderr, "[PACING]   kick wait: %s; walker cpu %.0f%%\n",
+                !g_kick_event ? "poll" : "poll (event wait off: the KickOff"
+                " spin does not poke)", pct);
+        return;
+    }
+    hits = __atomic_exchange_n(&k->watch_hits, 0, __ATOMIC_RELAXED);
+    fprintf(stderr, "[PACING]   kick wait: event; sleeps %ld poked %ld early %ld"
+            " timeouts %ld held %ld (pokes %ld nudges %ld) misses %ld; put watch hits %ld"
+            " (avg %.1f us) misses %ld; walker cpu %.0f%%\n",
+            __atomic_exchange_n(&k->sleeps, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&k->poked, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&k->early, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&k->timeouts, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&k->held_sleeps, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&k->pokes, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&k->nudges, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&k->misses, 0, __ATOMIC_RELAXED),
+            hits, hits ? (double)__atomic_exchange_n(&k->watch_ns, 0,
+                                                     __ATOMIC_RELAXED)
+                         / (double)hits / 1000.0 : 0.0,
+            __atomic_exchange_n(&k->watch_misses, 0, __ATOMIC_RELAXED), pct);
+}
 
 /* host_time.h says how each host takes a nap this short; `hot` is the
  * caller's "activity within the spin budget". */
@@ -1849,6 +1942,18 @@ static void kick_nap_init(void)
     fprintf(stderr, "  NV2A KickOff flush: %s; %s\n", g_kick_fast
             ? "ack loop polls at ~50 us while kicking (RECOMP_DEBUG=fast_kick=0: Sleep(1))"
             : "ack loop ticks at Sleep(1) (RECOMP_DEBUG=fast_kick=0)", nap);
+}
+
+/* After kick_nap_init (fast_kick decides) and before the ack thread. */
+static void kick_wake_report_start(void)
+{
+    if (g_kick_fast)
+        fprintf(stderr, "  NV2A KickOff flush: %s\n", g_kick_event
+                ? "between polls the ack loop sleeps until the guest's KickOff"
+                  " pokes it (RECOMP_DEBUG=kick_event=1; put watch 100 us,"
+                  " 1 ms tick)"
+                : "the ~50 us poll (RECOMP_DEBUG=kick_event=1: sleep until"
+                  " the guest pokes)");
 }
 
 static void xbox_Nv2aKickStart(void *regs)
@@ -2117,16 +2222,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             uint64_t t0 = nv2a_pb_now_ns(), now = t0;
             volatile uint32_t *kr =
                 (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
-            uint32_t put0 = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            (void)put0;
+            /* A PUT watch that ran out: poll for the rest of this tick. */
+            int watch_missed = 0;
             for (;;) {
                 uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+                uint32_t vbl = xbox_VblankCount();  /* before the hold's poll */
+                int held, acked = 0;
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* as at the scan */
-                if (nv2a_pb_exec_flip_poll()) {
+                held = nv2a_pb_exec_flip_poll();
+                if (held) {
                     /* Held: no walk and no kick ack, even with nothing to
                      * walk, or the title would get a segment ahead and
-                     * reach MakeSpace's notify. Poll at the fine rate so
-                     * the release follows the vblank within ~50 us. */
+                     * reach MakeSpace's notify. Poll at the fine rate (or
+                     * sleep to the vblank's nudge) so the release follows
+                     * the vblank closely. */
                     last_active = now;
                 } else if (put != g_scanned_put) {
                     last_active = now;
@@ -2138,9 +2247,50 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     *kr &= ~NV2A_KICK_BIT;
                     kick_cleared(now);
                     last_active = now;
+                    acked = 1;
                 }
                 if (now - t0 >= 1000000ull)
                     break;
+                if (g_kick_event && !g_kick_wake.off && !watch_missed) {
+                    /* The KickOff stores PUT right after its spin sees the
+                     * ack, and no pass of a lowered loop follows that store:
+                     * catch it here, or it waits for the next kick. A watch
+                     * that runs out (the guest thread preempted between its
+                     * spin and the store) drops to the ~50 us poll for the
+                     * rest of the tick: no poke follows that store, and a
+                     * walk started up to a tick late can cross a vblank and
+                     * hold the next flip a whole frame. */
+                    if (acked) {
+                        if (xbox_KickWakeWatchPut(&g_kick_wake, put,
+                                                  KICK_WATCH_NS)) {
+                            now = nv2a_pb_now_ns();
+                            continue;
+                        }
+                        watch_missed = 1;
+                        now = nv2a_pb_now_ns();
+                        continue;
+                    }
+                    if (held) {
+                        xbox_KickWakeSleepNudge(&g_kick_wake,
+                                                t0 + 1000000ull - now, vbl);
+                    } else if (xbox_KickWakeSleep(&g_kick_wake,
+                                                  t0 + 1000000ull - now)) {
+                        xbox_KickWakeHit(&g_kick_wake);
+                    } else if (((*kr & NV2A_KICK_BIT)
+                                || *(volatile uint32_t *)((char *)regs
+                                       + NV2A_USER_DMA_PUT) != g_scanned_put)
+                               && xbox_KickWakeMiss(&g_kick_wake)) {
+                        /* Not held (that branch is above), and work the
+                         * tick found rather than a poke: a kick or a PUT. */
+                        fprintf(stderr, "  NV2A KickOff flush: %d kicks in a"
+                                " row were found by the 1 ms tick, not a poke"
+                                " (the title's KickOff spin is not a lowered"
+                                " spin-wait site): the ack loop polls from"
+                                " now on\n", XBOX_KICK_WAKE_MISS_LIMIT);
+                    }
+                    now = nv2a_pb_now_ns();
+                    continue;
+                }
                 if (now - last_active > 200000000ull) {
                     Sleep(1);
                     break;
@@ -2159,6 +2309,8 @@ static void xbox_Nv2aAckStart(void)
     poke_init();
     g_nv2a_ack_stop = 0;
     kick_nap_init();
+    kick_wake_init(g_nv2a_memory);
+    kick_wake_report_start();
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     xbox_Nv2aKickStart(g_nv2a_memory);
