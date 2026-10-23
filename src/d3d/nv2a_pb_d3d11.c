@@ -52,6 +52,7 @@
 #include "nv2a_overlay.h"
 #endif
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
+#include "shader_cache.h"
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
 #include "video/window_title.h"
@@ -63,6 +64,10 @@ typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR,
                                      const D3D_SHADER_MACRO *, ID3DInclude *,
                                      LPCSTR, LPCSTR, UINT, UINT,
                                      ID3DBlob **, ID3DBlob **);
+typedef HRESULT (WINAPI *create_blob_fn)(SIZE_T, ID3DBlob **);
+
+/* kernel_path.c: the HDD root, which the shader cache sits under. */
+int xbox_path_hdd_root(char *out, size_t n);
 
 /* ---- device ------------------------------------------------------------ */
 
@@ -94,6 +99,20 @@ static volatile UINT           s_client_w, s_client_h;
 static ID3D11RenderTargetView *s_back_rtv;
 static int                     s_dump_rt;
 static compile_fn              s_compile;
+static create_blob_fn          s_create_blob;  /* a cache hit's blob */
+
+/* The on-disk shader cache (shader_cache.h): D3DCompile under Proton is
+ * Wine's, at tens of ms a shader, and a title's first 3D scene asks for a
+ * few dozen at once (JSRF's title: 24 vertex programs in its load). A hit
+ * is the bytes the same d3dcompiler_47 made from the same source and flags,
+ * so what is drawn does not change. The compiler's identity, its path, size
+ * and write time, is in every key: a new d3dcompiler (a Proton or Windows
+ * update) starts over. RECOMP_DXBC_CACHE=0 turns it off, a path moves it. */
+static shader_cache            s_shc;
+static char                    s_shc_compiler[1100];
+/* Compiles and cache loads since init, with their time, for the log. */
+static unsigned                s_sh_compiled, s_sh_cached;
+static double                  s_sh_compile_ms, s_sh_cached_ms;
 
 static ID3D11Buffer           *s_cb_consts;     /* b1: c[192]            */
 static ID3D11Buffer           *s_cb_vp;         /* b2: viewport, fog, specular */
@@ -358,12 +377,118 @@ static void pump(void)
     xbox_InputMouseWin32Sync(s_hwnd);
 }
 
+static double sh_now_ms(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+/* The DLL's VS_FIXEDFILEINFO file version, read from the loaded module's
+ * own resource (no version.dll): a replacement that keeps the old file's
+ * size and time still changes this. 0 when there is none. */
+static unsigned long long dll_file_version(HMODULE dll)
+{
+    HRSRC r = FindResourceW(dll, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16) /* RT_VERSION */);
+    const BYTE *b;
+    DWORD n, i;
+
+    if (!r || !(n = SizeofResource(dll, r)))
+        return 0;
+    b = (const BYTE *)LockResource(LoadResource(dll, r));
+    if (!b)
+        return 0;
+    /* The fixed block sits after a wide-string header; find its signature. */
+    for (i = 0; i + sizeof(VS_FIXEDFILEINFO) <= n; i += 4) {
+        const VS_FIXEDFILEINFO *v = (const VS_FIXEDFILEINFO *)(b + i);
+        if (v->dwSignature == 0xFEEF04BDu)
+            return (unsigned long long)v->dwFileVersionMS << 32 | v->dwFileVersionLS;
+    }
+    return 0;
+}
+
+/* Opens the cache, after D3DCompile is found. The key's compiler identity is
+ * "<path>|<size>|<write time>|<file version>" of the d3dcompiler_47.dll in
+ * use; when that cannot be asked the cache stays off, since a key without
+ * the compiler could hand one compiler's output to another. */
+static void shader_cache_setup(HMODULE dll)
+{
+    const char *e = recomp_env(RENV_DXBC_CACHE);
+    shader_cache_env_kind kind = shader_cache_env(e);
+    char dir[1024], path[MAX_PATH * 3];
+    wchar_t wpath[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    DWORD n;
+
+    if (kind == SHADER_CACHE_ENV_OFF) {
+        fprintf(stderr, LOGP "shader cache: off (RECOMP_DXBC_CACHE=%s)\n", e);
+        return;
+    }
+    if (kind == SHADER_CACHE_ENV_RELATIVE) {
+        fprintf(stderr, LOGP "shader cache: off (RECOMP_DXBC_CACHE=%s is not an "
+                "absolute directory)\n", e);
+        return;
+    }
+    n = GetModuleFileNameW(dll, wpath, MAX_PATH);
+    if (!s_create_blob || !n || n >= MAX_PATH
+     || !GetFileAttributesExW(wpath, GetFileExInfoStandard, &fa)
+     || !WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, (int)sizeof path, NULL, NULL)) {
+        fprintf(stderr, LOGP "shader cache: off (no compiler identity)\n");
+        return;
+    }
+    snprintf(s_shc_compiler, sizeof s_shc_compiler, "%s|%08lx%08lx|%08lx%08lx|%016llx",
+             path, (unsigned long)fa.nFileSizeHigh, (unsigned long)fa.nFileSizeLow,
+             (unsigned long)fa.ftLastWriteTime.dwHighDateTime,
+             (unsigned long)fa.ftLastWriteTime.dwLowDateTime, dll_file_version(dll));
+    if (kind == SHADER_CACHE_ENV_DIR) {
+        snprintf(dir, sizeof dir, "%s", e);
+    } else if (xbox_path_hdd_root(dir, sizeof dir - 32)) {
+        /* Beside the saves, under no name a guest path maps to. */
+        strcat(dir, "\\ShaderCache\\dxbc");
+    } else {
+        fprintf(stderr, LOGP "shader cache: off (no HDD root yet)\n");
+        return;
+    }
+    if (shader_cache_init(&s_shc, dir)) {
+        unsigned pruned = shader_cache_prune(&s_shc, SHADER_CACHE_DEFAULT_CAP);
+        fprintf(stderr, LOGP "shader cache: %s (%u old files removed)\n", s_shc.dir, pruned);
+    }
+    else
+        fprintf(stderr, LOGP "shader cache: off (cannot make or write %s)\n", dir);
+}
+
 static int compile(const char *what, const char *src, const char *target,
                    ID3DBlob **code)
 {
     ID3DBlob *err = NULL;
-    HRESULT hr = s_compile(src, strlen(src), what, NULL, NULL, "main", target,
-                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code, &err);
+    shader_cache_key key;
+    double t0 = sh_now_ms();
+    HRESULT hr;
+
+    key.compiler = s_shc_compiler;
+    key.target = target;
+    key.entry = "main";
+    key.flags1 = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    key.flags2 = 0;
+    key.src = src;
+    key.src_len = strlen(src);
+    if (s_shc.dir[0]) {
+        size_t n = 0;
+        void *hit = shader_cache_load(&s_shc, &key, &n);
+        if (hit && SUCCEEDED(s_create_blob(n, code))) {
+            memcpy(ID3D10Blob_GetBufferPointer(*code), hit, n);
+            free(hit);
+            s_sh_cached++;
+            s_sh_cached_ms += sh_now_ms() - t0;
+            return 1;
+        }
+        free(hit);
+    }
+    hr = s_compile(src, key.src_len, what, NULL, NULL, key.entry, target,
+                   key.flags1, key.flags2, code, &err);
     if (FAILED(hr)) {
         fprintf(stderr, LOGP "compile %s failed hr=0x%08lX\n%s\n", what,
                 (unsigned long)hr,
@@ -374,6 +499,11 @@ static int compile(const char *what, const char *src, const char *target,
         return 0;
     }
     if (err) ID3D10Blob_Release(err);
+    s_sh_compiled++;
+    s_sh_compile_ms += sh_now_ms() - t0;
+    if (s_shc.dir[0])
+        shader_cache_store(&s_shc, &key, ID3D10Blob_GetBufferPointer(*code),
+                           ID3D10Blob_GetBufferSize(*code));
     return 1;
 }
 
@@ -496,6 +626,8 @@ static int init(void)
         fprintf(stderr, LOGP "no D3DCompile in d3dcompiler_47.dll\n");
         return 0;
     }
+    s_create_blob = (create_blob_fn)(void (*)(void))GetProcAddress(dll, "D3DCreateBlob");
+    shader_cache_setup(dll);
 
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wnd_proc;
@@ -4403,6 +4535,11 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops,
                 (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
                 (unsigned long long)s_partial_clears);
+    if (s_presents == 1 || (s_presents % 300) == 0)
+        fprintf(stderr, LOGP "shaders: %u compiled (%.1f ms), %u from the cache (%.1f ms),"
+                " %u cache misses, %u damaged entries, %u failed stores\n",
+                s_sh_compiled, s_sh_compile_ms, s_sh_cached, s_sh_cached_ms,
+                s_shc.misses, s_shc.corrupt, s_shc.store_fails);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "blend: %llu draws with a constant factor,"
                 " %u SET_BLEND_COLOR writes (last 0x%08X)\n",

@@ -187,6 +187,14 @@ static void test_default_root(void)
     check(!under(host("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin"), g_game),
           "Partition1\\CACHE is not under the game dir");
 
+    /* The host-side root the D3D11 shader cache sits under. */
+    {
+        char root[1200];
+        check(xbox_path_hdd_root(root, sizeof root) && same(root, g_save),
+              "xbox_path_hdd_root is the save dir");
+        check(!xbox_path_hdd_root(root, 2), "xbox_path_hdd_root refuses a short buffer");
+    }
+
     /* E:\CACHE and the utility-drive caches share the save root here, so
      * they must differ by more than case: <save>/CACHE was <save>/Cache on
      * a case-insensitive host, and the title's files mixed with Z:'s. */

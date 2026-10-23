@@ -578,6 +578,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir, s_user_dir);
 }
 
+int xbox_path_hdd_root(char *out, size_t n)
+{
+    if (!s_initialized || !n)
+        return 0;
+    return WideCharToMultiByte(CP_UTF8, 0, s_save_dir, -1, out, (int)n,
+                               NULL, NULL) > 0;
+}
+
 /* The host path the last translation produced.
  *
  * A caller that wants to act on the file a title just opened -- playing an FMV
@@ -918,6 +926,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s, user data=%s",
              s_game_dir, s_save_dir, s_user_dir);
+}
+
+int xbox_path_hdd_root(char *out, size_t n)
+{
+    if (!s_initialized || !n || strlen(s_save_dir) >= n)
+        return 0;
+    memcpy(out, s_save_dir, strlen(s_save_dir) + 1);
+    return 1;
 }
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)

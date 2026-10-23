@@ -549,6 +549,12 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
 
+/* The HDD root xbox_path_init settled on (its save_dir, or the toolkit
+ * default), in UTF-8: where host-side files that belong with the title's
+ * saves go, such as the D3D11 shader cache. 0 before xbox_path_init or when
+ * it does not fit in n. */
+int xbox_path_hdd_root(char *out, size_t n);
+
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on

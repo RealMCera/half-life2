@@ -22,6 +22,7 @@ if(WIN32)
         d3d8_vsh_msl.c
         d3d8_combiners_msl.c
         nv2a_pb_d3d11.c
+        shader_cache.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
     # nv2a_pb_d3d11.c's window records keys in src/input's key table.
@@ -49,6 +50,7 @@ else()
         d3d8_combiners_hlsl.c
         d3d8_vsh_msl.c
         d3d8_combiners_msl.c
+        shader_cache.c
     )
     find_package(SDL3 3.2 CONFIG REQUIRED)
     find_package(PkgConfig REQUIRED)
@@ -107,6 +109,9 @@ if(MSVC)
 else()
     target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
+# The D3D11 backend's on-disk shader cache (every host: plain file I/O).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/shader_cache
+                 ${CMAKE_CURRENT_BINARY_DIR}/shader_cache)
 # The MSL emitters' (d3d8_msl.h) hash test; it builds on every host, and on
 # macOS also compiles each case with Metal.
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_msl_split
