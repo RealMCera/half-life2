@@ -599,7 +599,7 @@ state (a consumed chord). Remapping the game's own controls stays with
 
 ```toml
 [input.actions]
-menu.open = ["F10", "guide+a", "back+lthumb@400"]
+menu.open = ["F10", "guide+a", "paddle1", "back+lthumb@400"]
 camera.free.toggle = "F6"
 overlay.stats = []                  # unbound
 ```
@@ -618,7 +618,7 @@ The toolkit's actions:
 
 | Action | Default bindings | Does |
 |---|---|---|
-| `menu.open` | `F10`, `guide+a` | opens and closes the menu (a log line until the menu lands) |
+| `menu.open` | `F10`, `guide+a`, `paddle1` | opens and closes the menu (until the menu lands, a toast: "Menu: not in this build yet") |
 | `overlay.stats` | none | toggles the stats strip |
 | `shot.window` | none | a window shot (a log line for now) |
 
@@ -634,8 +634,10 @@ registers its own actions, named after the mod (`camera.free.toggle`).
   are not bindings.
 - **A host-only button** alone: `guide`, `misc1` (share, capture),
   `paddle1` .. `paddle4` (upper right, upper left, lower right, lower
-  left: the Elite's P1, P3, P2, P4 and the Deck's R4, L4, R5, L5), and
-  `touchpad`. The Duke has none of them, so the game never sees one.
+  left: the Elite's P1, P3, P2, P4, the Deck's R4, L4, R5, L5, and the
+  DualSense Edge's right back button, left back button, right Fn button
+  and left Fn button), and `touchpad`. The Duke has none of them, so the
+  game never sees one.
 - **A pad chord**: two to eight buttons joined by `+`, from `a b x y
   white black ltrigger rtrigger start back lthumb rthumb dpad_up
   dpad_down dpad_left dpad_right` and the host-only names, with an
@@ -723,7 +725,7 @@ the game. Where it does not, F10 and the game's fallback chord still work.
 |---|---|---|---|
 | macOS | SDL3 (GameController or HIDAPI) | Usually. macOS may keep the Home button: System Settings > Game Controllers > the controller, then let apps use the Home button. | the setting; F10; the fallback chord |
 | Linux desktop, native | SDL3 (evdev or HIDAPI) | Yes, unless Steam runs with Steam Input on for the pad, which keeps Guide for its overlay | Steam Input off for the title; F10; the fallback chord |
-| Steam Deck | XInput through Steam's virtual pad (Proton), or SDL3 | No: SteamOS always keeps the Steam button | a back grip bound to F10 in Steam Input (below); the fallback chord |
+| Steam Deck | XInput through Steam's virtual pad (Proton), or SDL3 | No: SteamOS keeps the Steam button and its chords for itself | R4: bound to F10 in Steam Input under Proton (below), `paddle1` where SDL3 reads the pad; the fallback chord |
 | Windows, native | XInput (`XInputGetStateEx`) | Yes, unless the Xbox Game Bar takes the Xbox button: Windows 11: Settings > Gaming > Game Bar, "Allow your controller to open Game Bar", off | the setting; F10; the fallback chord |
 | Windows build under Proton (desktop Linux) | XInput through Wine | Only with Steam Input off for the title | Steam Input off; F10; the fallback chord |
 
@@ -731,17 +733,35 @@ Only Guide reaches a Windows build: XInput has no paddles, share button or
 touchpad. A chord with Guide stays incomplete where Guide is not seen, and
 its guest member then reaches the game as usual.
 
-**The Steam Deck and Steam Input.** Under Proton, Steam Input is on by
-default and the game sees Steam's virtual pad: the back grips (L4, L5, R4,
-R5) are not on it, and the Steam button opens Steam. Bind a grip to a key
-in Steam Input instead: in the game's controller settings, pick a grip and
-set it to the keyboard key `F10` (the menu) or `F6` (BLiNX 2's free
-camera). The key then fires the action like a real key. A native Linux
-build sees the grips as `paddle1` .. `paddle4` only with Steam Input off
-for the title, through SDL's HIDAPI Steam Deck driver. Elite and
-DualSense Edge paddles show as `paddle1` .. `paddle4` only where the
-firmware and SDL's HIDAPI driver report them; in some firmware modes they
-copy face buttons instead, and those are guest buttons.
+**The Steam Deck and Steam Input.** On the Deck the menu goes on R4, the
+upper right back grip. SteamOS keeps the Steam button and its chords for
+itself, so `guide+a` never reaches the game there. Under Proton, Steam Input is on by default and the game
+sees Steam's virtual pad, an XInput pad with no grips (L4, L5, R4, R5).
+So bind R4 to a key once, in Steam Input:
+
+1. With the game selected in the library (or from the in-game Steam
+   menu), open the controller settings: the controller icon, then *Edit
+   Layout* (*Controller Settings* in Desktop mode).
+2. Pick *Back Grip Buttons*, then *R4*, then *Keyboard* and the key
+   `F10`.
+3. Back out; Steam saves the layout for that game.
+
+R4 then sends F10, which fires `menu.open` like a real key (the log shows
+`[ACTION] menu.open via F10`); a second press closes the menu. Another
+grip can carry another action's key the same way, for example R5 to `F6`
+for BLiNX 2's free camera. Leave L4 and L5 unbound for now: they are kept
+for quick save and quick load (F5 and F9), and save states have not
+landed yet. F9 frees the cursor today (`input.mouse_release_key`).
+
+A build that reads the pad through SDL3 sees R4 as `paddle1`, which
+`menu.open` has by default, so there it needs no Steam Input binding.
+That will be a native Linux build, once there is one, with Steam Input
+off for the title (SDL's HIDAPI Steam Deck driver). Today the SDL3 case
+is macOS, where an Elite's P1 opens the menu by default. An Elite's
+paddles and the DualSense Edge's back and Fn buttons show as `paddle1`
+.. `paddle4` only where the firmware and SDL report them. An Elite
+profile that copies a face button reports the face button instead,
+which is a guest button.
 
 ### Naming rule
 

@@ -24,6 +24,7 @@
 #include "recomp_env.h"
 
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,7 +75,16 @@ int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
 }
 void nv2a_overlay_set_stats(int on) { s_ovl_stats = on; }
 int nv2a_overlay_stats(void) { return s_ovl_stats; }
-void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
+static int s_toasts;
+static char s_toast[128];
+void nv2a_overlay_toast(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_toast, sizeof s_toast, fmt, ap);
+    va_end(ap);
+    s_toasts++;
+}
 
 /* ---- the fake pad backend --------------------------------------------- */
 
@@ -344,7 +354,7 @@ static void test_hold_chord(void)
 static void test_guide_a(void)
 {
     XBOX_INPUT_STATE st;
-    const char *out = start(ARMED);     /* menu.open's defaults: F10, guide+a */
+    const char *out = start(ARMED);     /* menu.open's defaults: F10, guide+a, paddle1 */
 
     CHECK(strstr(out, "[ENHANCE] actions hook=on (menu.enabled)\n") != NULL);
     /* Guide, then A: fires on A's press; the title never sees A, and the
@@ -631,6 +641,7 @@ static void test_disarmed(void)
     static const struct xbox_mod *const mods[] = { &k_probe, NULL };
     XBOX_INPUT_STATE st;
     const char *out;
+    int toasts;
 
     set_env("RECOMP_CONFIG", "none");
     out = start_with(ARMED, &k_fake, mods);
@@ -641,6 +652,7 @@ static void test_disarmed(void)
     CHECK(s_probe_id >= 0);
     CHECK(nv2a_flip_hook_installed == NULL);
     /* The mod's bindings, guide+a and F10: nothing fires, A passes. */
+    toasts = s_toasts;
     xbox_InputKeyEvent(VK_F6, 1);
     xbox_InputKeyEvent(VK_F10, 1);
     hold_extra(XBOX_HOST_GUIDE | XBOX_HOST_PADDLE1, 1);
@@ -653,6 +665,7 @@ static void test_disarmed(void)
     nv2a_flip_hook_run();
     CHECK(enhance_action_pressed(s_probe_id) == 0);
     CHECK(menu_fires() == 0);
+    CHECK(s_toasts == toasts);
     xbox_InputKeysClear();
 
     /* No config file at all: off too. */
@@ -712,6 +725,63 @@ static void test_paddle_and_log(void)
     CHECK(fired == 13);
     CHECK(count(out, "[ACTION] menu.open via paddle1\n") == 11);
     CHECK(strstr(out, "[ACTION] 2 more fires not logged\n") != NULL);
+}
+
+/* ---- menu.open's paddle1 default (the Deck's R4) ----------------------- */
+
+static void test_paddle_default(void)
+{
+    XBOX_INPUT_STATE st;
+    const char *out = start(ARMED);     /* no [input.actions]: the defaults */
+    int toasts;
+
+    CHECK(strstr(out, "refused") == NULL);
+    toasts = s_toasts;
+    capture_begin();
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    hold_a(1);
+    st = poll0();
+    out = capture_end();
+    CHECK(menu_fires() == 1);
+    CHECK(strstr(out, "[ACTION] menu.open via paddle1\n") != NULL);
+    /* Until the menu lands, each fire is a toast. */
+    CHECK(s_toasts == toasts + 1);
+    CHECK(strcmp(s_toast, "Menu: not in this build yet") == 0);
+    /* Nothing of the game's is taken: A, held with it, still passes. */
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    advance(16);
+    poll0();
+    CHECK(menu_fires() == 0);
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    hold_a(0);
+    poll0();
+    advance(16);
+    /* A second press is a second fire: the menu closes as it opened. */
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    CHECK(menu_fires() == 1);
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    poll0();
+
+    /* A loading screen (no guest poll): the flip tick reads the paddle. */
+    start_with(ARMED, &k_fake, NULL);
+    xbox_InputInit();
+    nv2a_flip_hook_run();
+    advance(16);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 1);
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    advance(16);
+    nv2a_flip_hook_run();
+
+    /* A player's list replaces the defaults, paddle1 with them. */
+    start(ARMED "[input.actions]\nmenu.open = [\"F10\"]\n");
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    CHECK(menu_fires() == 0);
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    poll0();
 }
 
 /* ---- the overlay.stats action toggles the strip ------------------------ */
@@ -1138,6 +1208,7 @@ int main(void)
     test_scripts();
     test_disarmed();
     test_paddle_and_log();
+    test_paddle_default();
     test_stats_toggle();
     test_tick();
     test_tick_race();

@@ -184,16 +184,22 @@ static void disarm_where(int all_mods, int owner);
 static uint64_t s_log_sec;
 static int s_log_n, s_log_dropped;
 
-/* The toolkit's actions that act at the fire (menu.open is the menu's,
- * 3D). Fires run under s_step_lock, so the strip's read-then-set never
- * races another fire. */
+/* The toolkit's actions that act at the fire (menu.open toasts until the
+ * menu, 3D, takes it over). Fires run under s_step_lock, so the strip's
+ * read-then-set never races another fire. */
 static int s_stats_act = -1;
+static int s_menu_act = -1;
 
 static void toolkit_fire(int action)
 {
 #ifdef XBOXRECOMP_ENHANCE
     if (action == s_stats_act)
         nv2a_overlay_set_stats(!nv2a_overlay_stats());
+    /* Until the menu lands, a toast shows that the binding reached us: on
+     * the Deck a grip goes through Steam Input to a key, and a log line
+     * alone cannot be checked from the couch. Fires only while armed. */
+    else if (action == s_menu_act)
+        nv2a_overlay_toast("Menu: not in this build yet");
 #else
     (void)action;
 #endif
@@ -1123,10 +1129,15 @@ static void disarm_where(int all_mods, int owner)
 
 void enhance_actions_init(void)
 {
-    static const char *const menu_open[] = { "F10", "guide+a", NULL };
+    /* paddle1 is the Deck's R4 (an Elite's P1). Steam keeps the Steam
+     * button and Steam+A is its screen recording, so guide+a is no use on
+     * the Deck. The SDL3 backend reads the paddle; XInput has none, so
+     * under Proton Steam Input maps R4 to F10 instead (config.md, "Host
+     * actions"). Host-only, so it never takes a press from the game. */
+    static const char *const menu_open[] = { "F10", "guide+a", "paddle1", NULL };
 
     enhance_actions_reset();
-    enhance_action_register("menu.open", "Open the menu", menu_open);
+    s_menu_act = enhance_action_register("menu.open", "Open the menu", menu_open);
     s_stats_act = enhance_action_register("overlay.stats", "Stats strip", NULL);
     enhance_action_register("shot.window", "Window screenshot", NULL);
 }
