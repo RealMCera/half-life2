@@ -1592,6 +1592,7 @@ static void voice_process(MCPXAPUState *d,
     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS) != 0;
     dbg->multipass = multipass;
+    int sample_count = 0;
 
     if (multipass) {
         /* Read from multipass bin */
@@ -1609,10 +1610,10 @@ static void voice_process(MCPXAPUState *d,
         }
     } else {
         int empty = 0;
-        for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
+        while (sample_count < NUM_SAMPLES_PER_FRAME) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-            if (!active) return;
+            if (!active) break;
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
             if (count < 0) break;
@@ -1625,9 +1626,18 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /* A voice that ended during the fetch (a one-shot past EBO, a
+     * non-persist stream out of packets, a VOICE_OFF from the title) still
+     * mixes what it fetched before it ended; the rest of the frame stays
+     * silent. Returning here, as this did, threw away the frame a voice
+     * ended in after fetching it: up to a frame of a one-shot's tail, sample
+     * ebo always among it, and the end of each non-persist stream were never
+     * heard. A multipass voice has no EBO and never ends during its own
+     * fetch (sample_count stays 0), so one the title turns off mid-frame
+     * still returns here, as before. */
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-    if (!active) return;
+    if (!active && sample_count == 0) return;
 
     /* Get volume bins */
     int bin[8];

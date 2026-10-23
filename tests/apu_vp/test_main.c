@@ -19,6 +19,13 @@
  *     next stream segment when a fetch stopped at cbo == ebo, before reading
  *     sample ebo, so that sample was never played (and a segment was
  *     signalled done a fetch early).
+ *   - one_shot_final_frame_reaches_mix_bins: voice_process returned without
+ *     mixing when the voice was off after its fetch loop, so the frame in
+ *     which a one-shot ended (its last samples, sample ebo among them) was
+ *     fetched and thrown away. The *_final_frame_* checks pin it for a
+ *     one-shot at rate 1, a one-shot at rate 0.5 (the resampler returns a
+ *     short count, then the voice is off) and a non-persist stream that runs
+ *     out of packets.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -429,6 +436,140 @@ static void stream_fetch_ending_before_ebo_plays_ebo(void)
           s_ram[done_at], d.vp.ssl[0].ssl_index);
 }
 
+/* A 40-sample one-shot (EBO 39) at rate 1 ends 8 samples into its second
+ * frame. Those 8 samples, sample ebo last, must reach the mix bins; the
+ * frame after, with the voice off, adds nothing. Voice 0 is a 3D voice with
+ * every bin on mix bin 0, unit volume and envelope, so bin 0 gets 8 times
+ * each sample. */
+static void one_shot_final_frame_reaches_mix_bins(void)
+{
+    static MCPXAPUState d;
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    static float sample_buf[NUM_SAMPLES_PER_FRAME][2];
+    const unsigned len = 40;
+
+    setup_pcm_loop_voice(&d, len);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
+                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28));
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_HRTF_TARGET, HRTF_NULL_HANDLE);
+    for (unsigned i = 0; i < len; i++)
+        put_s16(i, (int16_t)(i * 100 + 1));
+
+    for (int frame = 0; frame < 3; frame++) {
+        memset(mixbins, 0, sizeof(mixbins));
+        voice_process(&d, mixbins, sample_buf, 0, 0);
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            unsigned at = (unsigned)(frame * NUM_SAMPLES_PER_FRAME + i);
+            float want = at < len ? 8.0f * int16_to_float((int16_t)(at * 100 + 1))
+                                  : 0.0f;
+            if (fabsf(mixbins[0][i] - want) > 1e-6f) {
+                CHECK(0, "frame %d: mix bin 0 sample %d is %f, expected %f "
+                      "(voice sample %u of %u)", frame, i, mixbins[0][i], want,
+                      at, len);
+                break;
+            }
+        }
+    }
+    CHECK(!voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_STATE,
+                          NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+          "voice still on after its last sample");
+}
+
+/* Rate 0.5: each output takes two source samples, so a 40-sample one-shot
+ * ends 20 outputs into its first frame, the resampler returning those 20
+ * before the voice is off. They must reach the mix bins (source 0, 2, ..
+ * 38, each on a whole position). */
+static void one_shot_half_rate_final_frame_reaches_mix_bins(void)
+{
+    static MCPXAPUState d;
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    static float sample_buf[NUM_SAMPLES_PER_FRAME][2];
+    const unsigned len = 40;
+
+    setup_pcm_loop_voice(&d, len);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
+                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28));
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_HRTF_TARGET, HRTF_NULL_HANDLE);
+    voice_set_mask(&d, 0, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                   NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH, 4096);  /* rate 0.5 */
+    for (unsigned i = 0; i < len; i++)
+        put_s16(i, (int16_t)(i * 100 + 1));
+
+    memset(mixbins, 0, sizeof(mixbins));
+    voice_process(&d, mixbins, sample_buf, 0, 0);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        unsigned at = 2u * (unsigned)i;
+        float want = at < len ? 8.0f * int16_to_float((int16_t)(at * 100 + 1))
+                              : 0.0f;
+        if (fabsf(mixbins[0][i] - want) > 1e-6f) {
+            CHECK(0, "mix bin 0 sample %d is %f, expected %f (source %u of %u)",
+                  i, mixbins[0][i], want, at, len);
+            break;
+        }
+    }
+    CHECK(!voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_STATE,
+                          NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+          "voice still on after its last sample");
+}
+
+/* A non-persist stream with one 8-sample packet and nothing queued after
+ * it: the frame plays the packet, then the empty next SSL turns the voice
+ * off. The 8 samples must reach the mix bins. A non-persist stream plays
+ * only in its release phase (voice_get_samples turns it off before that),
+ * so the envelope sits early in a long release: one gain g for the frame,
+ * close to 1, and bin 0 holds 8 * g * each sample. */
+static void stream_end_final_frame_reaches_mix_bins(void)
+{
+    static MCPXAPUState d;
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    static float sample_buf[NUM_SAMPLES_PER_FRAME][2];
+    uint32_t ssl[2] = { DATA_BASE,
+                        8u | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16) };
+
+    setup_pcm_loop_voice(&d, 8);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
+                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
+                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_HRTF_TARGET, HRTF_NULL_HANDLE);
+    voice_set_mask(&d, 0, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_EACUR,
+                   NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE);
+    voice_set_mask(&d, 0, NV_PAVS_VOICE_CUR_ECNT, NV_PAVS_VOICE_CUR_ECNT_EACOUNT,
+                   0xFFF0);
+    voice_set_mask(&d, 0, NV_PAVS_VOICE_TAR_LFO_ENV,
+                   NV_PAVS_VOICE_TAR_LFO_ENV_EA_RELEASERATE, 0xFFF);
+    voice_set_mask(&d, 0, NV_PAVS_VOICE_PAR_OFFSET,
+                   NV_PAVS_VOICE_PAR_OFFSET_EALVL, 0xFF);
+    d.regs[NV_PAPU_VPSSLADDR] = SSL_BASE;
+    d.regs[NV_PAPU_FENADDR] = FEN_BASE;
+    memcpy(s_ram + SSL_BASE, ssl, sizeof(ssl));
+    d.vp.ssl[0].base[0] = 0;
+    d.vp.ssl[0].count[0] = 1;
+    d.vp.ssl[0].count[1] = 0;
+    for (unsigned i = 0; i < 8; i++)
+        put_s16(i, (int16_t)(i * 100 + 1));
+
+    memset(mixbins, 0, sizeof(mixbins));
+    voice_process(&d, mixbins, sample_buf, 0, 0);
+    float g = mixbins[0][0] / (8.0f * int16_to_float(1));
+    CHECK(g > 0.99f && g <= 1.0f, "stream's frame mixed at gain %f, expected "
+          "its release envelope near 1", g);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float want = i < 8 ? 8.0f * g * int16_to_float((int16_t)(i * 100 + 1))
+                           : 0.0f;
+        if (fabsf(mixbins[0][i] - want) > 1e-5f) {
+            CHECK(0, "mix bin 0 sample %d is %f, expected %f (packet has 8)",
+                  i, mixbins[0][i], want);
+            break;
+        }
+    }
+    CHECK(!voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_STATE,
+                          NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+          "stream still on with no packet left");
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -445,6 +586,9 @@ int main(void)
     loop_fetch_ending_before_ebo_plays_ebo();
     one_shot_fetch_ending_before_ebo_plays_ebo();
     stream_fetch_ending_before_ebo_plays_ebo();
+    one_shot_final_frame_reaches_mix_bins();
+    one_shot_half_rate_final_frame_reaches_mix_bins();
+    stream_end_final_frame_reaches_mix_bins();
 
     free(s_ram);
     if (s_failures) {
@@ -454,6 +598,7 @@ int main(void)
     puts("PASS: ADPCM blocks up to the hardware limit decode, wider ones are "
          "refused; output buffer SGE entries go to the GP FIFO table; the "
          "resampler plays each frame's source, no sample held back; a fetch "
-         "ending before EBO still plays sample EBO.");
+         "ending before EBO still plays sample EBO; the frame a voice ends in "
+         "is mixed (one-shot at rate 1 and 0.5, stream end).");
     return 0;
 }
