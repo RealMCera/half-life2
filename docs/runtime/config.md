@@ -403,6 +403,9 @@ presenters read them at start.
   kernel stays at `spin`. The frames are the
   guest's own either way; what can move is when the loop sees its exit,
   by up to the wake latency. Without lowered loops the key changes nothing.
+  A site lowered with `"sleep": "kick_event"` (`RECOMP_SPIN_WAIT_KICK`)
+  sleeps only while the walker's kick event wait is on as well, and spins
+  otherwise, so with `kick_event` off it is `spin` at either value.
   `RECOMP_TRACE=pacing` prints the flip intervals, process CPU and, per
   site, how its waits ended and how its loops left: on a wake, or on the
   1 ms timeout. A site whose loops keep leaving on the timeout (more than

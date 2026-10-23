@@ -522,6 +522,16 @@ The file is JSON:
 
 - `"auto": false` lowers only the listed `sites`; `true` lowers every
   candidate except those in `exclude`.
+- A site with `"sleep": "kick_event"` lowers to `RECOMP_SPIN_WAIT_KICK`,
+  which sleeps at `present.pacing = "sleep"` only while the NV2A walker's
+  kick event wait is on (`RECOMP_DEBUG=kick_event=1`, and not given up), and
+  otherwise passes as at `spin`. It is for a D3D KickOff flush wait: while
+  the walker polls for the kick, the bit clears within tens of microseconds,
+  and sleeping on it costs frames under Wine (about 3 fps on the Steam Deck
+  in JSRF's title, which the event wait wins back). No other value is
+  accepted.
+- A site takes only `va`, `note` and `sleep`. Any other key is an error
+  naming the VA, so a misspelt `sleep` cannot lower the site ungated.
 - A listed site that fails the matcher in any body that contains it, or that
   no body has as a self-loop, is an error naming the VA, the body and the
   rule. The run finishes and then exits 1; a refused shape is never forced

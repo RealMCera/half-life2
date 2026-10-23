@@ -165,31 +165,69 @@ def test_config_file_parsing(tmp_path):
         SpinWaitConfig.load(str(p))
 
 
+def test_kick_gated_site_lowers_to_the_kick_macro(tmp_path):
+    """"sleep": "kick_event" emits RECOMP_SPIN_WAIT_KICK, the rest of the
+    lowering unchanged; the report names the gate."""
+    p = tmp_path / "spin.json"
+    p.write_text(json.dumps({"sites": [{"va": f"0x{BASE:08X}",
+                                        "sleep": "kick_event"}]}))
+    cfg = SpinWaitConfig.load(str(p))
+    code, report = _translate(CMP_MEM_REG, cfg)
+    assert (f"RECOMP_SPIN_WAIT_KICK(0x{BASE:08X}u); goto loc_{BASE:08X}; }}"
+            in code), code
+    assert code.count("RECOMP_SPIN_WAIT") == 1
+    site = report.to_json()["sites"][0]
+    assert site["state"] == "lowered" and site["sleep"] == "kick_event"
+    plain, _ = _translate(CMP_MEM_REG, LISTED)
+    assert plain.replace("RECOMP_SPIN_WAIT(", "RECOMP_SPIN_WAIT_KICK(") == code
+
+
+def test_unknown_sleep_gate_is_an_error(tmp_path):
+    p = tmp_path / "spin.json"
+    p.write_text(json.dumps({"sites": [{"va": "0x00012340",
+                                        "sleep": "always"}]}))
+    with pytest.raises(ValueError, match="sleep"):
+        SpinWaitConfig.load(str(p))
+
+
+def test_unknown_site_key_is_an_error(tmp_path):
+    p = tmp_path / "spin.json"
+    p.write_text(json.dumps({"sites": [{"va": "0x00012340",
+                                        "slep": "kick_event"}]}))
+    with pytest.raises(ValueError, match=r"0x00012340.*'slep'"):
+        SpinWaitConfig.load(str(p))
+
+
 _RUNTIME = os.path.join(os.path.dirname(__file__), "..", "..", "templates",
                         "runtime", "recomp_types.h")
 
 
-def test_lowered_back_edge_compiles():
+@pytest.mark.parametrize("macro,fn,sleep", [
+    ("RECOMP_SPIN_WAIT", "xbox_SpinWait", None),
+    ("RECOMP_SPIN_WAIT_KICK", "xbox_SpinWaitKick", "kick_event"),
+], ids=["plain", "kick-gated"])
+def test_lowered_back_edge_compiles(macro, fn, sleep):
     """The macro as the runtime header defines it, around the statement the
     lowering emits, is valid C11."""
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if not cc:
         pytest.skip("no C compiler")
     hdr = open(_RUNTIME, encoding="utf-8").read()
-    m = re.search(r"#define RECOMP_SPIN_WAIT\(va\)[^\n]*\\\n[^\n]*\n", hdr)
-    assert m, "RECOMP_SPIN_WAIT not defined in recomp_types.h"
+    m = re.search(r"#define %s\(va\)[^\n]*\\\n[^\n]*\n" % macro, hdr)
+    assert m, f"{macro} not defined in recomp_types.h"
     # The macro's fence comes from its own #if block (cl.exe has no __atomic).
     f = re.search(r"#if defined\(_MSC_VER\)\n#  if defined\(_M_ARM64\)\n"
                   r"#    define RECOMP_SEQ_CST_FENCE\(\)[^\n]*\n(?:#[^\n]*\n)*?#endif\n", hdr)
     assert f, "RECOMP_SEQ_CST_FENCE not defined in recomp_types.h"
-    code, _ = _translate(CMP_MEM_REG, LISTED)
-    stmt = next(l for l in code.splitlines() if "RECOMP_SPIN_WAIT" in l)
+    cfg = SpinWaitConfig(sites={BASE}, sleep={BASE: sleep} if sleep else None)
+    code, _ = _translate(CMP_MEM_REG, cfg)
+    stmt = next(l for l in code.splitlines() if macro + "(" in l)
     src = ("#include <stdint.h>\n"
            "volatile int g_xbox_spin_sleep;\n"
            "volatile int g_xbox_irq_pending;\n"
            "volatile int g_xbox_guest_cpu_waiters;\n"
            "volatile int g_xbox_kick_armed;\n"
-           "void xbox_SpinWait(uint32_t va) { (void)va; }\n"
+           f"void {fn}(uint32_t va) {{ (void)va; }}\n"
            + f.group(0) + m.group(0) +
            "#define CMP_L(a, b) ((a) < (b))\n"
            "int f(int32_t _fas, int32_t _fbs) {\n"

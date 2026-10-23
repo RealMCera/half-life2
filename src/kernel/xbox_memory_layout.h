@@ -192,6 +192,10 @@ uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns);
  * walker is awake. */
 void xbox_Nv2aKickPoke(void);
 void xbox_Nv2aKickNudge(void);
+/* Non-zero while the event wait is on: RECOMP_DEBUG=kick_event=1, the ack
+ * loop started, and it has not given up and gone back to polling. A
+ * kick-gated spin-wait site sleeps only then (xbox_SpinWaitKick). */
+int xbox_Nv2aKickEventOn(void);
 /* The [PACING] window's kick-wait line, then reset (walker thread). */
 void xbox_Nv2aKickReport(double window_s);
 

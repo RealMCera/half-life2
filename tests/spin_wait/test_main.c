@@ -16,7 +16,13 @@
  *  - a loop's exit is counted by how its last pass returned: a burst of
  *    passes, a pause longer than 0.5 ms, and the next wait counts the burst
  *    as one exit on a wake or on the timeout; passes back to back are not
- *    exits.
+ *    exits;
+ *  - a kick-gated site (RECOMP_SPIN_WAIT_KICK) never sleeps while the
+ *    walker's kick event wait is off, at "sleep" pacing too: its passes cost
+ *    what they cost at "spin" and count no waits, armed for a poke or not.
+ * The gated site's sleep with the event wait on is not checked here: the
+ * wait is on only once the ack loop runs with RECOMP_DEBUG=kick_event=1.
+ * Bench runs under Proton and on macOS with kick_event=1 cover it.
  */
 #include "kernel.h"
 #include "kernel_pacing.h"
@@ -37,6 +43,9 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
  * generated code's, and too heavy to pull in here). */
 #define RECOMP_SPIN_WAIT(va) \
     do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
+
+#define RECOMP_SPIN_WAIT_KICK(va) \
+    do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWaitKick(va); } while (0)
 
 #define MS 1000000ull
 
@@ -252,6 +261,45 @@ static void exits(void)
           "exits: mid-loop timeouts stay counted as timeouts");
 }
 
+/* No ack loop runs here, so the event wait is off, as in a stock run
+ * (RECOMP_DEBUG=kick_event unset): the gated site must spin. */
+static void kick_gate_off(void)
+{
+    XboxSpinSiteStats s;
+    uint64_t t0, gated, plain;
+    int i;
+
+    check(!xbox_Nv2aKickEventOn(), "kick gate: the event wait is off");
+    xbox_SpinStatsReset();
+    t0 = xbox_HostNowNs();
+    for (i = 0; i < 200; i++)
+        RECOMP_SPIN_WAIT_KICK(0x9000u);
+    gated = xbox_HostNowNs() - t0;
+    check(gated < 20 * MS, "kick gate: 200 passes at sleep pacing do not sleep");
+    check(!xbox_SpinSiteStats(0x9000u, &s), "kick gate: no wait counted");
+    RECOMP_SPIN_WAIT(0x9004u);          /* takes any wake left from before */
+    t0 = xbox_HostNowNs();
+    RECOMP_SPIN_WAIT(0x9004u);
+    plain = xbox_HostNowNs() - t0;
+    check(stats(0x9004u).waits == 2 && plain >= MS / 2,
+          "kick gate: an ungated site beside it still sleeps");
+    printf("    (200 gated passes %.3f ms, one plain wait %.3f ms)\n",
+           gated / 1e6, plain / 1e6);
+
+    /* Armed, as while the walker waits for a poke: the pass still pokes,
+     * then passes as at spin (no waker here, so the poke is a no-op). */
+    xbox_SpinStatsReset();
+    g_xbox_kick_armed = 1;
+    t0 = xbox_HostNowNs();
+    for (i = 0; i < 100000; i++)
+        RECOMP_SPIN_WAIT_KICK(0x9008u);
+    gated = xbox_HostNowNs() - t0;
+    g_xbox_kick_armed = 0;
+    check(!xbox_SpinSiteStats(0x9008u, &s),
+          "kick gate armed: the pass pokes and counts no wait");
+    check(gated < 100 * MS, "kick gate armed: 10^5 passes never sleep");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -267,6 +315,7 @@ int main(void)
     counters();
     exits();
     two_waiters();
+    kick_gate_off();
     printf(failures ? "FAILED (%d)\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }

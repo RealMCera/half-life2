@@ -34,11 +34,21 @@ The file (JSON):
      "sites": [{"va": "0x00012340", "note": "..."}],
      "exclude": []}
 "auto": true lowers every candidate not excluded; false lowers only "sites".
+A site with "sleep": "kick_event" lowers to RECOMP_SPIN_WAIT_KICK instead:
+it sleeps only while the NV2A walker's kick event wait is on
+(RECOMP_DEBUG=kick_event=1, and not given up) and spins as at "spin"
+pacing otherwise. That is for a KickOff flush wait, whose sleep costs
+frames when the walker still polls for the kick (under Wine).
 A listed site that fails the matcher in any body that contains it is an
 error: a shape the matcher rejects is never forced through.
 """
 
 import json
+
+# A site's "sleep" values: when RECOMP_SPIN_WAIT may sleep at "sleep" pacing.
+_SLEEP_GATES = {"kick_event": "RECOMP_SPIN_WAIT_KICK"}
+_MACRO = "RECOMP_SPIN_WAIT"
+_SITE_KEYS = {"va", "note", "sleep"}
 
 _COMPARE = frozenset({"cmp", "test"})
 _LOADS = frozenset({"mov", "movzx", "movsx"})
@@ -67,11 +77,13 @@ def _parse_va(v):
 class SpinWaitConfig:
     """The parsed spin-wait file."""
 
-    def __init__(self, auto=False, sites=(), exclude=(), notes=None):
+    def __init__(self, auto=False, sites=(), exclude=(), notes=None,
+                 sleep=None):
         self.auto = bool(auto)
         self.sites = set(sites)
         self.exclude = set(exclude)
         self.notes = dict(notes or {})
+        self.sleep = dict(sleep or {})     # va -> a _SLEEP_GATES key
 
     @classmethod
     def load(cls, path):
@@ -82,15 +94,33 @@ class SpinWaitConfig:
         unknown = set(doc) - {"auto", "sites", "exclude", "about"}
         if unknown:
             raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
-        sites, notes = set(), {}
+        sites, notes, sleep = set(), {}, {}
         for s in doc.get("sites", []):
             va = _parse_va(s["va"] if isinstance(s, dict) else s)
             sites.add(va)
+            # A misspelt or newer key would otherwise lower the site with the
+            # ungated macro, which sleeps at "sleep" pacing.
+            extra = set(s) - _SITE_KEYS if isinstance(s, dict) else ()
+            if extra:
+                raise ValueError(f"{path}: site 0x{va:08X}: unknown keys "
+                                 f"{sorted(extra)}, expected "
+                                 f"{sorted(_SITE_KEYS)}")
             if isinstance(s, dict) and s.get("note"):
                 notes[va] = s["note"]
+            if isinstance(s, dict) and "sleep" in s:
+                if s["sleep"] not in _SLEEP_GATES:
+                    raise ValueError(
+                        f"{path}: site 0x{va:08X}: \"sleep\" is "
+                        f"{s['sleep']!r}, expected one of "
+                        f"{sorted(_SLEEP_GATES)}")
+                sleep[va] = s["sleep"]
         exclude = {_parse_va(s["va"] if isinstance(s, dict) else s)
                    for s in doc.get("exclude", [])}
-        return cls(doc.get("auto", False), sites, exclude, notes)
+        return cls(doc.get("auto", False), sites, exclude, notes, sleep)
+
+    def macro(self, va):
+        gate = self.sleep.get(va)
+        return _SLEEP_GATES[gate] if gate else _MACRO
 
     def wants(self, va):
         if va in self.exclude:
@@ -160,16 +190,17 @@ def match(bb):
 _GOTO_RE = "goto loc_{:08X};"
 
 
-def lower(stmts, va):
-    """The block's statements with the back edge to va calling
-    RECOMP_SPIN_WAIT first. Raises ValueError if the branch is not found."""
+def lower(stmts, va, macro=_MACRO):
+    """The block's statements with the back edge to va calling macro
+    (RECOMP_SPIN_WAIT) first. Raises ValueError if the branch is not
+    found."""
     goto = _GOTO_RE.format(va)
     for i in range(len(stmts) - 1, -1, -1):
         s = stmts[i]
         if goto in s and s.lstrip().startswith("if ("):
             out = list(stmts)
             out[i] = s.replace(
-                goto, "{ RECOMP_SPIN_WAIT(0x%08Xu); %s }" % (va, goto), 1)
+                goto, "{ %s(0x%08Xu); %s }" % (macro, va, goto), 1)
             return out
     raise ValueError(f"no conditional back edge to loc_{va:08X} in the "
                      f"lifted block")
@@ -205,7 +236,7 @@ class SpinWaitReport:
         if not self.config.wants(va):
             return stmts
         try:
-            stmts = lower(stmts, va)
+            stmts = lower(stmts, va, self.config.macro(va))
         except ValueError as e:
             self.errors.append(f"spin-wait site 0x{va:08X} in "
                                f"sub_{func_addr:08X}: {e}")
@@ -241,6 +272,8 @@ class SpinWaitReport:
                 entry["reasons"] = reasons
             if va in self.config.notes:
                 entry["note"] = self.config.notes[va]
+            if va in self.config.sleep:
+                entry["sleep"] = self.config.sleep[va]
             out.append(entry)
         return {"auto": self.config.auto,
                 "candidates": sum(1 for e in out if e["state"] != "rejected"),

@@ -616,6 +616,13 @@ extern volatile int g_xbox_kick_armed;
 void xbox_SpinWait(uint32_t va);
 #define RECOMP_SPIN_WAIT(va) \
     do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
+/* A site with "sleep": "kick_event" (a KickOff flush wait): as above, but it
+ * sleeps only while the walker's kick event wait is on, and otherwise passes
+ * as at "spin" pacing. Sleeping on a flush bit that a polling walker clears
+ * costs frames under Wine. */
+void xbox_SpinWaitKick(uint32_t va);
+#define RECOMP_SPIN_WAIT_KICK(va) \
+    do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWaitKick(va); } while (0)
 
 /* Every loop back edge in lifted code (tools.recomp, --no-back-edge-yield
  * leaves them bare): the guest CPU's quantum check. A guest thread that has

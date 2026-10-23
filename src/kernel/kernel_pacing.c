@@ -160,7 +160,9 @@ static SpinSite *site_for(uint32_t va)
     return &s_sites[SITE_SLOTS];
 }
 
-void xbox_SpinWait(uint32_t va)
+/* sleep: this pass may block, g_xbox_spin_sleep for a plain site; a
+ * kick-gated one asks the walker too (xbox_SpinWaitKick). */
+static void spin_wait(uint32_t va, int sleep)
 {
     SpinSite *site;
     int sample, woke = 0, immediate = 0, held;
@@ -184,11 +186,11 @@ void xbox_SpinWait(uint32_t va)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (g_xbox_kick_armed) {
         xbox_Nv2aKickPoke();
-        if (!(g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters))
+        if (!(sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters))
             return;
     }
     xbox_IrqSafePoint();
-    if (!g_xbox_spin_sleep) {
+    if (!sleep) {
         /* Not at DISPATCH: there the console's scheduler could not switch
          * threads either, and the loop's DPC is held off by this thread's
          * own IRQL, not by the CPU. */
@@ -264,6 +266,22 @@ void xbox_SpinWait(uint32_t va)
         site->cpu1_ns = (LONGLONG)c1;
         site->wall1_ns = (LONGLONG)w;
     }
+}
+
+void xbox_SpinWait(uint32_t va)
+{
+    spin_wait(va, g_xbox_spin_sleep);
+}
+
+void xbox_SpinWaitKick(uint32_t va)
+{
+    /* A KickOff flush wait: the walker clears the bit. While it polls
+     * (kick_event off, or given up) the bit clears tens of us after the
+     * set, and a sleep that wakes through Wine's condition variable and the
+     * guest CPU hand-off costs frames: 56 against 59.4 fps on the Deck.
+     * With the event wait on, the pass pokes the walker awake,
+     * its ack wakes this sleep, and the frames stay. */
+    spin_wait(va, g_xbox_spin_sleep && xbox_Nv2aKickEventOn());
 }
 
 void xbox_SpinWake(void)

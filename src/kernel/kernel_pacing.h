@@ -76,6 +76,10 @@ extern volatile int g_xbox_kick_armed;
  * or above, or with the one-CPU gate held: the DPC the loop waits for could
  * not run. */
 void xbox_SpinWait(uint32_t va);
+/* The same pass for a site lowered with "sleep": "kick_event"
+ * (RECOMP_SPIN_WAIT_KICK): it sleeps only while the walker's kick event
+ * wait is on (xbox_Nv2aKickEventOn), and passes as at "spin" otherwise. */
+void xbox_SpinWaitKick(uint32_t va);
 
 /* Guest-visible state may have changed: wake every xbox_SpinWait. One load
  * when the mode is spin. */

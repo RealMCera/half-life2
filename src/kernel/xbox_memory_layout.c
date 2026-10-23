@@ -1710,8 +1710,9 @@ static void framebuffer_probe_tick(void)
  * sleep.
  * The tick is 1 ms on POSIX and under Wine, and one clock interval later
  * at most on native Windows (the waker's high-resolution timer, 0.5-1 ms).
- * A title whose KickOff spin is not lowered cannot poke; three kicks in a
- * row found by the tick turn the sleep off and the loop polls as above.
+ * Three kicks in a row found by the tick rather than a poke (a KickOff
+ * spin that is not lowered, or one whose poke came too late) turn the sleep
+ * off and the loop polls as above.
  * Off by default (see kick_wake_init).
  *
  * With RECOMP_FLIP_LOG an observer thread watches the bit, so the [PB-PERF]
@@ -1745,6 +1746,11 @@ void xbox_Nv2aKickPoke(void)
 {
     if (g_kick_wake.waker)
         xbox_KickWakePoke(&g_kick_wake);
+}
+
+int xbox_Nv2aKickEventOn(void)
+{
+    return g_kick_event && !__atomic_load_n(&g_kick_wake.off, __ATOMIC_RELAXED);
 }
 
 void xbox_Nv2aKickNudge(void)
@@ -2290,9 +2296,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * tick found rather than a poke: a kick or a PUT. */
                         fprintf(stderr, "  NV2A KickOff flush: %d kicks in a"
                                 " row were found by the 1 ms tick, not a poke"
-                                " (the title's KickOff spin is not a lowered"
-                                " spin-wait site): the ack loop polls from"
-                                " now on\n", XBOX_KICK_WAKE_MISS_LIMIT);
+                                " (the title's KickOff spin did not poke):"
+                                " the ack loop polls from now on\n", XBOX_KICK_WAKE_MISS_LIMIT);
                     }
                     now = nv2a_pb_now_ns();
                     continue;
