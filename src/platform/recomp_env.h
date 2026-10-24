@@ -52,6 +52,10 @@ extern "C" {
  * #ifndef RECOMP_ENV_HAVE_FOLDER_ROWS until its pin is past this change.
  * Defined before the game header is included, for that test. */
 #define RECOMP_ENV_HAVE_FOLDER_ROWS 1
+/* RUMBLE (RECOMP_RUMBLE) is a toolkit row since v0.16, read by the OHCI pad
+ * model; a game that defined it as its own key keeps that row under
+ * #ifndef RECOMP_ENV_HAVE_RUMBLE_ROW, as above. */
+#define RECOMP_ENV_HAVE_RUMBLE_ROW 1
 
 #ifdef RECOMP_ENV_HAVE_GAME_KEYS
 #include "recomp_env_game.h"
