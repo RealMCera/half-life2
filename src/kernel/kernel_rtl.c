@@ -246,9 +246,14 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
-/* Direct-mapped memo over the CS shadow table (see the comment inside). */
+/* Direct-mapped memo over the CS shadow table (see the comment inside).
+ * The entry is the table slot's address, one aligned pointer: slots are
+ * never re-keyed, so the key check after loading it is the whole
+ * validation. An earlier design memoised {key, cs} as two stores and the
+ * reader could pair a fresh key with the previous entry's lock -- which
+ * breaks mutual exclusion, the one thing this table exists to provide. */
 #define CS_MEMO_SIZE 1024u
-static struct { uintptr_t key; CRITICAL_SECTION* cs; } g_cs_memo[CS_MEMO_SIZE];
+static XBOX_CS_SLOT* g_cs_memo[CS_MEMO_SIZE];
 
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
@@ -281,9 +286,10 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
      * Guest critical sections live on 4-byte alignment at least, so the
      * low bits of the VA spread the slots. */
     {
-        uint32_t slot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
-        if (g_cs_memo[slot].key == key)
-            return g_cs_memo[slot].cs;
+        uint32_t mslot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
+        XBOX_CS_SLOT* m = g_cs_memo[mslot];   /* one aligned pointer */
+        if (m && m->key == key)
+            return &m->cs;
     }
 
     home = (size_t)((key >> 4) % XBOX_CS_TABLE_SIZE);
@@ -291,18 +297,20 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
     /* Shared pass first: after start-up almost every call finds an existing
      * entry, and taking the table exclusively for each of those would put a
      * global serialisation point in front of the title's own locks. */
-    AcquireSRWLockShared(&g_cs_table_lock);
-    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
-        XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
-        if (slot->key == key) { found = &slot->cs; break; }
-        if (slot->key == 0) break;
-    }
-    ReleaseSRWLockShared(&g_cs_table_lock);
-    if (found) {
-        uint32_t mslot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
-        g_cs_memo[mslot].key = key;
-        g_cs_memo[mslot].cs  = found;
-        return found;
+    {
+        XBOX_CS_SLOT* hit = NULL;
+        AcquireSRWLockShared(&g_cs_table_lock);
+        for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+            XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+            if (slot->key == key) { hit = slot; break; }
+            if (slot->key == 0) break;
+        }
+        ReleaseSRWLockShared(&g_cs_table_lock);
+        if (hit) {
+            uint32_t mslot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
+            g_cs_memo[mslot] = hit;      /* one store; slots are not re-keyed */
+            return &hit->cs;
+        }
     }
 
     AcquireSRWLockExclusive(&g_cs_table_lock);
@@ -317,8 +325,7 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
             found = &slot->cs;
             {
                 uint32_t mslot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
-                g_cs_memo[mslot].key = key;
-                g_cs_memo[mslot].cs  = found;
+                g_cs_memo[mslot] = slot; /* one store, published after the key */
             }
             break;
         }
