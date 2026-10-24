@@ -1120,7 +1120,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              && !(control & 0x24u)) {                    /* no periodic, no bulk */
                 if (++waited > 1500)          /* 30 s and it never started */
                     break;
-                goto deliver;                 /* frames and SF still tick */
+                /* The jump below bypasses the MIE check that guards the
+                 * normal path, and a driver that has the master enable off
+                 * is one the controller must not interrupt yet -- the boot
+                 * flow that parks here counts SF ticks it asked for, not
+                 * ones delivered with the master masked. */
+                if (enable & INTR_MIE)
+                    goto deliver;             /* frames and SF still tick */
+                continue;
             }
             control |= 0x80u;                 /* operational for this pass */
         }
