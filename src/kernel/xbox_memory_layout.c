@@ -5524,6 +5524,7 @@ static void heap_report_exhaustion(void)
 }
 
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
+static int heap_quarantine_drain(void);
 
 static uint32_t heap_alloc(uint32_t size, uint32_t alignment)
 {
@@ -5590,6 +5591,9 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {
+        /* Held blocks are free memory the title already gave back. */
+        if (heap_quarantine_drain())
+            return heap_alloc_locked(size, alignment);
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
                 (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
@@ -5658,14 +5662,11 @@ static uint32_t heap_block_size(uint32_t xbox_va)
     return r;
 }
 
-static void heap_free(uint32_t xbox_va)
+/* Caller holds g_heap_lock. */
+static void heap_free_locked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
-    if (!xbox_va) {
-        return;
-    }
-    AcquireSRWLockExclusive(&g_heap_lock);
     frees++;
     if (frees <= 8) {
         fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
@@ -5721,9 +5722,114 @@ static void heap_free(uint32_t xbox_va)
              * reused at once is named afresh after this, not wiped by it. */
             heap_forget_ram_names(m);
         }
-        ReleaseSRWLockExclusive(&g_heap_lock);
         return;
     }
+}
+
+/* RECOMP_HEAP_QUARANTINE=<KiB>: hold freed blocks back from reuse, oldest
+ * first out, until that much is held.
+ *
+ * Reclaim hands a freed block to the next request at once, so a title that
+ * reads through a pointer it has already freed reads whatever was loaded over
+ * it. JSRF does that with an event record: it frees the record, the
+ * next stage load lands se_pple.dat on top of it, and the record's stale word
+ * sends the game to the wrong stage. Holding freed blocks a while keeps the
+ * old contents in place for such a read. Bounded, because a heap that never
+ * reuses drains (JSRF's "problem with the disc" at New Game), and drained in
+ * full before the heap reports exhaustion. Every later address moves, so it is
+ * off unless asked for. */
+#define HEAP_QUARANTINE_SLOTS 1024
+static uint32_t g_quar_va[HEAP_QUARANTINE_SLOTS];
+static uint32_t g_quar_size[HEAP_QUARANTINE_SLOTS];
+static int g_quar_head, g_quar_n;
+static uint32_t g_quar_bytes;
+
+static uint32_t heap_quarantine_limit(void)
+{
+    static int init;
+    static uint32_t limit;
+    if (!init) {
+        const char *v = recomp_env(RENV_HEAP_QUARANTINE);
+        unsigned long kib = v ? strtoul(v, NULL, 0) : 0;
+        limit = kib > 0x3FFFFFul ? 0xFFFFFC00u : (uint32_t)kib * 1024u;
+        if (limit) {
+            fprintf(stderr, "  [HEAP] quarantine on: up to %u KiB of freed "
+                    "blocks held back from reuse\n", limit / 1024);
+            fflush(stderr);
+        }
+        init = 1;
+    }
+    return limit;
+}
+
+/* Gives the oldest held block back to the heap. Caller holds g_heap_lock. */
+static void heap_quarantine_pop(void)
+{
+    uint32_t va = g_quar_va[g_quar_head];
+    g_quar_bytes -= g_quar_size[g_quar_head];
+    g_quar_head = (g_quar_head + 1) % HEAP_QUARANTINE_SLOTS;
+    g_quar_n--;
+    heap_free_locked(va);
+}
+
+/* Empties the quarantine; returns how many blocks it gave back. Caller holds
+ * g_heap_lock. */
+static int heap_quarantine_drain(void)
+{
+    int n = g_quar_n;
+    while (g_quar_n)
+        heap_quarantine_pop();
+    return n;
+}
+
+/* Holds a live block instead of freeing it. A block already held stays held
+ * once: freeing it twice must not give back whatever reuses it later. */
+static void heap_quarantine_push(uint32_t xbox_va, uint32_t limit)
+{
+    int i, live = -1;
+
+    for (i = 0; i < g_quar_n; i++)
+        if (g_quar_va[(g_quar_head + i) % HEAP_QUARANTINE_SLOTS] == xbox_va)
+            return;
+    for (i = 0; i < g_heap_block_count; i++) {
+        if (g_heap_blocks[i].addr == xbox_va && !g_heap_blocks[i].free &&
+            g_heap_blocks[i].size) {
+            live = i;
+            break;
+        }
+    }
+    if (live < 0)
+        return;     /* not one of ours: heap_free would ignore it too */
+    if (g_heap_blocks[live].size > limit) {
+        /* Holding it would evict every older block, the stale one among
+         * them: a scene teardown frees its big buffers next to the small
+         * record the quarantine is there to keep. */
+        heap_free_locked(xbox_va);
+        return;
+    }
+    if (g_quar_n == HEAP_QUARANTINE_SLOTS)
+        heap_quarantine_pop();
+    i = (g_quar_head + g_quar_n) % HEAP_QUARANTINE_SLOTS;
+    g_quar_va[i] = xbox_va;
+    g_quar_size[i] = g_heap_blocks[live].size;
+    g_quar_n++;
+    g_quar_bytes += g_heap_blocks[live].size;
+    while (g_quar_bytes > limit && g_quar_n)
+        heap_quarantine_pop();
+}
+
+static void heap_free(uint32_t xbox_va)
+{
+    uint32_t limit;
+
+    if (!xbox_va)
+        return;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    limit = heap_quarantine_limit();
+    if (limit)
+        heap_quarantine_push(xbox_va, limit);
+    else
+        heap_free_locked(xbox_va);
     ReleaseSRWLockExclusive(&g_heap_lock);
 }
 

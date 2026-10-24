@@ -43,6 +43,13 @@
  *      0x46500-byte buffer read-only, the next block it zeroed faulted on
  *      4 KB host pages (Proton).
  *
+ *   heap-quarantine  RECOMP_HEAP_RECLAIM=1 with RECOMP_HEAP_QUARANTINE=64
+ *                 (KiB). Freed blocks wait before reuse, so a title that reads
+ *                 a record it has freed reads the record, not the next load
+ *                 (JSRF's DJ scene). The held amount is bounded, the oldest
+ *                 block goes back first, a block freed twice is held once, and
+ *                 the heap empties the quarantine before it runs out.
+ *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
  *                 the memory, is told the truth when it asks, and is refused
@@ -196,6 +203,7 @@ int main(int argc, char **argv)
     const char *mode = argc > 1 ? argv[1] : "default";
     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
     int reclaim = !strcmp(mode, "heap-reclaim");
+    int quar = !strcmp(mode, "heap-quarantine");
     int zero = !strcmp(mode, "reclaim-zero");
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
@@ -205,7 +213,7 @@ int main(int argc, char **argv)
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !zero && !ext && strcmp(mode, "default")) {
+    if (!reclaim && !zero && !ext && !quar && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -215,6 +223,10 @@ int main(int argc, char **argv)
         set_env("RECOMP_HEAP_RECLAIM", "0");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
+    if (quar) {
+        set_env("RECOMP_HEAP_RECLAIM", "1");
+        set_env("RECOMP_HEAP_QUARANTINE", "64");
+    }
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
 
@@ -241,6 +253,73 @@ int main(int argc, char **argv)
         }
     }
     printf("mode: %s\n", mode);
+
+    /* The quarantine runs on a heap nothing else has freed into yet, so where
+     * each request lands is known. 64 KiB held at most. */
+    if (quar) {
+        const uint32_t K = 1024;
+        uint32_t x, y, z, x2, a, b, c, o, p, fill, r;
+
+        /* A block freed twice is held once. Held twice, its second entry
+         * would leave the quarantine after the heap had handed the block out
+         * again (x2 below) and free the new owner's memory. */
+        x = xbox_HeapAlloc(16 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(x);
+        xbox_HeapFree(x);
+        y = xbox_HeapAlloc(40 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(y);
+        x2 = xbox_HeapAlloc(16 * K, 4096);
+        z = xbox_HeapAlloc(16 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(z);
+        snprintf(d, sizeof d, "x 0x%08X, x2 0x%08X size %u", x, x2, xbox_HeapBlockSize(x2));
+        check(xbox_HeapBlockSize(x2) == 16 * K,
+              "a block freed twice is held once; its next owner keeps it", d);
+
+        /* A freed block keeps its contents and is not handed out. */
+        a = xbox_HeapAlloc(16 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        *G(a) = 0x5A5A5A5Au;
+        xbox_HeapFree(a);
+        b = xbox_HeapAlloc(16 * K, 4096);
+        snprintf(d, sizeof d, "freed 0x%08X, next 0x%08X, word 0x%08X", a, b, *G(a));
+        check(b != a && *G(a) == 0x5A5A5A5Au,
+              "a freed block is held: not reused, its contents kept", d);
+
+        /* Past the limit the oldest goes back first. */
+        c = xbox_HeapAlloc(64 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(c);
+        snprintf(d, sizeof d, "older 0x%08X size %u, newest 0x%08X size %u",
+                 a, xbox_HeapBlockSize(a), c, xbox_HeapBlockSize(c));
+        check(xbox_HeapBlockSize(a) == 0 && xbox_HeapBlockSize(c) == 64 * K,
+              "over 64 KiB the oldest blocks go back, the newest stays held", d);
+
+        /* A block larger than the limit is freed at once and the queue is
+         * left alone. Held, it would evict every older block first: one big
+         * teardown free would flush the record the quarantine keeps. 96 KiB,
+         * so the 128 KiB request below still cannot fit in it. */
+        o = xbox_HeapAlloc(96 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(o);
+        snprintf(d, sizeof d, "big 0x%08X size %u, held 0x%08X size %u",
+                 o, xbox_HeapBlockSize(o), c, xbox_HeapBlockSize(c));
+        check(xbox_HeapBlockSize(o) == 0 && xbox_HeapBlockSize(c) == 64 * K,
+              "a block over the limit is freed at once, the held ones stay", d);
+        (void)xbox_HeapAlloc(96 * K, 4096);    /* its room, so only c can fit 64 KiB below */
+
+        /* Out of heap, the quarantine is emptied before the request fails:
+         * fill the heap to 32 KiB short of the top, then ask for 64. */
+        p = xbox_HeapAlloc(128 * K, 4096);  /* larger than any free block: the top */
+        fill = (XBOX_HEAP_TOP - (p + 128 * K) - 32 * K) & ~4095u;
+        (void)xbox_HeapAlloc(fill, 4096);
+        r = xbox_HeapAlloc(64 * K, 4096);
+        snprintf(d, sizeof d, "got 0x%08X, held block 0x%08X", r, c);
+        check(r == c, "out of heap, the held blocks are given back and reused", d);
+        goto done;
+    }
 
     /* 1. A small request after a large free. */
     if (!ext) {
@@ -514,6 +593,7 @@ int main(int argc, char **argv)
         }
     }
 
+done:
     xbox_MemoryLayoutShutdown();
     free(xbe);
     printf("\n%d failure(s)\n", failures);
