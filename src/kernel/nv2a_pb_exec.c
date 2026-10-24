@@ -204,7 +204,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  * ack loop holds the next walk until the guest's vblank count allows the
  * flip (nv2a_flip_hold.h). The swap's interval comes from the NO_OPERATION
  * D3D pushes before it, software method 1. */
+#ifndef NV097_NO_OPERATION
 #define NV097_NO_OPERATION                0x0100
+#endif
 #define NV097_SET_FLIP_READ               0x0120
 #define NV097_SET_FLIP_WRITE              0x0124
 #define NV097_SET_FLIP_MODULO             0x0128
@@ -370,10 +372,6 @@ static struct {
     uint32_t wclip_h_slots, wclip_v_slots;
     int      wclip_scissor;            /* slot 0 narrows the surface clip */
     uint32_t wclip_fx, wclip_fw, wclip_fy, wclip_fh;
-    /* SET_CLEAR_RECT_*: what CLEAR_SURFACE fills, as sent; the max side is
-     * inclusive (the title clears 640x480 with xmax 639). */
-    int      clear_rect_set;
-    uint32_t clear_rx, clear_rw, clear_ry, clear_rh;
     /* SET_TEXGEN_{S,T,R,Q} per stage, GL enum as sent. Only DISABLE so far;
      * a non-disable mode silently sampling garbage is exactly the kind of
      * wrong that should say so in the report. */
@@ -1066,7 +1064,6 @@ static void clear_surface(uint32_t param)
                     p[x - x0] = v;
             }
         }
-    }        }
     }
     s_gpu.clears++;
     /* Progress markers, interleaved with everything else in the log. The
@@ -4176,16 +4173,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x02B4:                           /* SET_WINDOW_CLIP_TYPE */
         s_gpu.wclip_type = param;
         break;
-    case 0x1D98:                           /* SET_CLEAR_RECT_HORIZONTAL */
-        s_gpu.clear_rx = param & 0xFFFF;
-        s_gpu.clear_rw = (param >> 16) & 0xFFFF;
-        s_gpu.clear_rect_set |= 1;
-        break;
-    case 0x1D9C:                           /* SET_CLEAR_RECT_VERTICAL */
-        s_gpu.clear_ry = param & 0xFFFF;
-        s_gpu.clear_rh = (param >> 16) & 0xFFFF;
-        s_gpu.clear_rect_set |= 2;
-        break;
     case NV097_SET_SURFACE_FORMAT:
         s_gpu.format = param;
         surface_apply_clip();
@@ -4254,10 +4241,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * (s_reg) holds all of these already, and the report's job is to rank
      * what is actually missing, not to repeat state a title re-sends every
      * kick. Each is named for the next title that needs it modelled. */
-    case 0x0100: break;                    /* NO_OPERATION; also the "wake me"
-                                              software method D3D patches in,
-                                              whose value is the fence it
-                                              waits on */
     case 0x0110: break;                    /* WAIT_FOR_IDLE */
     case 0x0294: break;                    /* SET_LIGHT_CONTROL */
     case 0x0308: break;                    /* SET_CULL_FACE_ENABLE: the CPU
