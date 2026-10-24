@@ -200,6 +200,7 @@ extern "C" {
     X(PB_INJECT_STOP,    DEBUG, "pb_inject_stop",  "RECOMP_PB_INJECT_STOP",    "=n: stop every nth walk (test hook)") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
+    X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N: the walker publishes GET as it walks and acks the KickOff flush with up to N segments (1 for any other value but 0) submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt (default off; docs/env.md)") \
     X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \

@@ -945,6 +945,7 @@ enum {
     XBOX_IRQ_VBLANK,
     XBOX_IRQ_APU,
     XBOX_IRQ_OHCI,
+    XBOX_IRQ_NV2A_GR,   /* PGRAPH's notify, vector 3 like the vblank (run_ahead) */
     XBOX_IRQ_LINES
 };
 /* What xbox_IrqPost tells the device model to do. */

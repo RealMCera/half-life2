@@ -3404,6 +3404,78 @@ static void kernel_vblank_raise(void)
     }
 }
 
+/* PGRAPH's notify interrupt (RECOMP_DEBUG=run_ahead; nv2a_gr_notify.h).
+ *
+ * The walker latches the trap and the status bits and stalls; the ISR
+ * needs a guest stack and a TIB, which the timer thread has, so the walker
+ * wakes it and its pass delivers on vector 3, the line the vblank shares.
+ * The XDK ISR claims any interrupt while PMC_INTR_EN_0 is on and its DPC
+ * services every PMC_INTR_0 source it finds, the vblank's DPC included.
+ * Delivered again each pass (1 ms) while the notify stays pending and the
+ * enable is back on: a DPC that ran before the bits went up, or an ISR
+ * that declined, leaves it to the next. */
+int xbox_Nv2aGrPending(void);          /* xbox_memory_layout.c */
+int xbox_Nv2aGrServicedPoll(void);
+int xbox_Nv2aGrDeliverable(void);
+static volatile LONG g_gr_delivered, g_gr_claimed;
+
+void xbox_Nv2aGrRequest(void)
+{
+    xbox_HostTimerWake();
+}
+
+static void kernel_gr_deliver(void)
+{
+    InterlockedIncrement(&g_gr_delivered);
+    if (kernel_call_isr(NV2A_VECTOR) > 0)
+        InterlockedIncrement(&g_gr_claimed);
+}
+
+static void kernel_gr_on_holder(void)
+{
+    kernel_gr_deliver();
+}
+
+/* 1 while a notify is pending, so the pass comes back within 1 ms. */
+static int kernel_gr_tick(void)
+{
+    if (!xbox_Nv2aGrPending() || xbox_Nv2aGrServicedPoll())
+        return 0;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return 1;
+    /* Masked, or being taken down: the ISR and DPC in flight see the
+     * latched bit. */
+    if (!xbox_Nv2aGrDeliverable())
+        return 1;
+    xbox_IrqSetHandler(XBOX_IRQ_NV2A_GR, kernel_gr_on_holder);
+    switch (xbox_IrqSafePointsOn() ? xbox_IrqPost(XBOX_IRQ_NV2A_GR)
+                                   : XBOX_IRQ_UNGATED) {
+    case XBOX_IRQ_GATED:
+        kernel_gr_deliver();
+        xbox_DispatchGateLeave();
+        break;
+    case XBOX_IRQ_UNGATED: {
+        int gated = xbox_DispatchGateTryEnter();
+        if (!gated)
+            xbox_IrqNoteUngated(XBOX_IRQ_NV2A_GR);
+        kernel_gr_deliver();
+        if (gated)
+            xbox_DispatchGateLeave();
+        break;
+    }
+    default:
+        break;                          /* the holder runs it */
+    }
+    return 1;
+}
+
+/* The [PACING] run-ahead line's delivery half. */
+void xbox_Nv2aGrDeliveryStats(long *delivered, long *claimed)
+{
+    *delivered = InterlockedExchange(&g_gr_delivered, 0);
+    *claimed = InterlockedExchange(&g_gr_claimed, 0);
+}
+
 /* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
  * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
  * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
@@ -3851,6 +3923,8 @@ static void kernel_timer_loop_ms(void)
         wait = kernel_vblank_tick();  /* the GPU's frame clock */
         if (wait > 10)
             wait = 10;
+        if (kernel_gr_tick())
+            wait = 1;
         kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
         now = kernel_clock_ms();
         kernel_fire_timers(now, &next_due);
@@ -3877,7 +3951,7 @@ static void kernel_timer_loop_ns(void)
     for (;;) {
         uint64_t now, vbl_next, target;
         long long now_ms, timer_due;
-        int raised, ran, busy, fired;
+        int raised, ran, busy, fired, gr;
 
         /* Wakeable: KeInsertQueueDpc ends it, so a DPC that no guest thread
          * drains at a raise runs now rather than at the next edge. */
@@ -3891,6 +3965,7 @@ static void kernel_timer_loop_ns(void)
             xbox_HostTimerSleepNs(wait);
         }
         raised = kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
+        gr = kernel_gr_tick();             /* before the drain runs its DPC */
         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
         now_ms = kernel_clock_ms();
         fired = kernel_fire_timers(now_ms, &timer_due);
@@ -3914,7 +3989,7 @@ static void kernel_timer_loop_ns(void)
             if (t < target)
                 target = t;
         }
-        if (busy && now + ms < target)
+        if ((busy || gr) && now + ms < target)
             target = now + ms;
         wait = target > now ? target - now : 0;
     }

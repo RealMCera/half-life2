@@ -339,7 +339,7 @@ static int s_dpc_on;                           /* dpc_on_raise */
 static XBOX_THREAD_LOCAL int t_guest_thread;
 static XBOX_THREAD_LOCAL int t_in_dpc;
 static uint64_t s_irq_wait_ns;
-static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci" };
+static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci", "nv2a-gr" };
 
 static struct {
     volatile LONG posted[XBOX_IRQ_LINES], on_holder[XBOX_IRQ_LINES],
@@ -750,7 +750,13 @@ void xbox_IrqReport(void)
 
     xbox_IrqStatsGet(&s, 1);
     if (!xbox_IrqSafePointsOn()) {
-        if (s.ungated[0] | s.ungated[1] | s.ungated[2]) {
+        /* nv2a-gr only once used (run_ahead): the stock line as it was. */
+        if (s.ungated[3]) {
+            fprintf(stderr, "  [IRQ] ungated ISRs beside the gate holder"
+                    " vbl/apu/ohci/nv2a-gr %ld/%ld/%ld/%ld\n",
+                    s.ungated[0], s.ungated[1], s.ungated[2], s.ungated[3]);
+            fflush(stderr);
+        } else if (s.ungated[0] | s.ungated[1] | s.ungated[2]) {
             fprintf(stderr, "  [IRQ] ungated ISRs beside the gate holder"
                     " vbl/apu/ohci %ld/%ld/%ld\n",
                     s.ungated[0], s.ungated[1], s.ungated[2]);
@@ -773,6 +779,13 @@ void xbox_IrqReport(void)
             s.ungated[0], s.ungated[1], s.ungated[2],
             s.max_wait_us[0] / 1000.0, s.max_wait_us[1] / 1000.0,
             s.max_wait_us[2] / 1000.0, s.wait_logs, s.refused);
+    /* The run-ahead's notify line (RECOMP_DEBUG=run_ahead), on its own line
+     * so the three-line one keeps its shape; only once it has been used. */
+    if (s.posted[3] | s.on_holder[3] | s.forced[3] | s.ungated[3])
+        fprintf(stderr, "  [IRQ] nv2a-gr posted %ld, run on holder %ld,"
+                " poster's retry %ld, forced %ld, ungated %ld, longest wait"
+                " %.2f ms\n", s.posted[3], s.on_holder[3], s.second_try[3],
+                s.forced[3], s.ungated[3], s.max_wait_us[3] / 1000.0);
     fflush(stderr);
 }
 

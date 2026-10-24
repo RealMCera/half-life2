@@ -297,11 +297,21 @@ static int s_noninc;
 static int s_in_call;
 int nv2a_pb_scan_in_call(void) { return s_in_call; }
 
+/* RECOMP_DEBUG=run_ahead (xbox_memory_layout.c): called at a method header
+ * of the top level every NV2A_PB_CHECKPOINT_WORDS words or more, with the
+ * header's address. Everything before it has been executed, so GET may say
+ * so and the title may reuse that part of the ring. 4 KB, under the 8 KB
+ * at which BlockOnTime stops spinning and sleeps on the notify (1 KB cost
+ * one host's walk ~0.5 ms more a heavy frame for no fewer notifies). */
+#define NV2A_PB_CHECKPOINT_WORDS 1024u
+static void (*s_checkpoint)(uint32_t va);
+void nv2a_pb_scan_set_checkpoint(void (*fn)(uint32_t va)) { s_checkpoint = fn; }
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t va = start_va, ret_va = 0, at = start_va, w = 0;
-    uint32_t words = 0, jumps = 0, unknown = 0;
+    uint32_t words = 0, jumps = 0, unknown = 0, ckpt_words = 0;
     static int inject = -1;
     const char *why = NULL;
     int in_call = 0;
@@ -376,6 +386,13 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             continue;
         }
         if ((w & 0xE0030003u) == 0u || (w & 0xE0030003u) == 0x40000000u) {
+            /* Only when the walk executes: a survey (RECOMP_PB_SCAN alone)
+             * has drawn nothing for GET or an ack to stand for. */
+            if (s_checkpoint && s_exec_enabled > 0 && !in_call
+                && words - ckpt_words >= NV2A_PB_CHECKPOINT_WORDS) {
+                ckpt_words = words;
+                s_checkpoint(at);
+            }
             s_left   = (w >> 18) & 0x7FFu;
             s_subch  = (w >> 13) & 7u;
             s_method =  w & 0x1FFCu;
