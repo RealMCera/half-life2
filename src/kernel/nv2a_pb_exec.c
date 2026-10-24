@@ -812,6 +812,18 @@ static void window_clip_fold(void)
      * and the first surface write keep the old behaviour. */
     if (!s_gpu.clip_w || !s_gpu.clip_h || s_gpu.aa_sx == 0.0f)
         return;
+    /* Type 1 is exclusive -- a pixel passes OUTSIDE the rectangles -- which
+     * is the complement of what a bounds fold can express. Folding it
+     * anyway drew exactly the inverse of the title's intent; not folding
+     * leaves the surface clip, which is wrong the other way but never
+     * inside-out. */
+    if (s_gpu.wclip_type & 1u) {
+        static int shown;
+        if (!shown++)
+            fprintf(stderr, "  [GPU] exclusive window clip not modelled;"
+                            " using the surface clip\n");
+        return;
+    }
     if (s_gpu.wclip_h_slots != 1 || s_gpu.wclip_v_slots != 1)
         return;
     sx = (uint32_t)s_gpu.aa_sx;
@@ -2376,7 +2388,11 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
  * under its D3D name; xemu reads the packing above, so this does too. */
 static void dotmap_vec(int st, const float texel[4], float out[3])
 {
-    uint32_t map = (s_reg[0x1E78 / 4] >> (4 * (st - 1))) & 0xFu;
+    /* The dot-map nibble for stage st sits at 4*(st-1); stage 0 has none
+     * (its mode field is what says "normal map"), and a title that sets a
+     * dot mode there anyway would otherwise shift by -4. */
+    uint32_t map = st >= 1
+        ? (s_reg[0x1E78 / 4] >> (4 * (st - 1))) & 0xFu : 0u;
     int i;
 
     for (i = 0; i < 3; i++) {
@@ -2407,6 +2423,11 @@ static int rc_stage_fetch(int st, const float c[4], float out[4],
     if (st == 1)
         in_st = 0;                       /* input_tex[1] is fixed at stage 0 */
     if (in_st > 3)
+        in_st = 0;
+    /* Stages fill tin[] in order, so an input selector naming this stage or
+     * a later one reads a texel nobody has written yet; take stage 0, which
+     * the first fetch always fills. */
+    if (in_st >= st)
         in_st = 0;
 
     switch (mode) {
@@ -2506,7 +2527,19 @@ static int rc_stage_fetch(int st, const float c[4], float out[4],
         dotmap_vec(st, tin[in_st], n);
         dots[st] = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
         n[0] = dots[1]; n[1] = dots[2]; n[2] = dots[3];
-        e[0] = e[1] = e[2] = c[3];             /* pT.w, the eye vector path */
+        /* The eye vector is the w of the three stages' input texels (xemu:
+         * e_3 = vec3(pT1.w, pT2.w, pT3.w)), not a splat of this stage's
+         * own coordinate. pTk is what stage k's selector names -- stage 1
+         * reads stage 0, stage 2 its nibble at bit 16 of the osi word --
+         * and each is a completed stage's output. */
+        {
+            int i2 = (int)((osi >> 16) & 0xFu);   /* stage 2's input */
+            if (i2 > 3 || i2 >= 2)
+                i2 = 0;
+            e[0] = tin[0][3];                      /* pT1.w -> stage 0 */
+            e[1] = tin[i2][3];                     /* pT2.w */
+            e[2] = tin[in_st][3];                  /* pT3.w */
+        }
         nde = n[0] * e[0] + n[1] * e[1] + n[2] * e[2];
         nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
         if (nn == 0.0f)
