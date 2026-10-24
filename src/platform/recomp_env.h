@@ -141,6 +141,7 @@ extern "C" {
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
+    X(METAL_SHADERS,     TRACE, "metal_shaders",   NULL,                       "Metal shader and pipeline builds: each MSL library and pipeline state with its ms, and a [metal] build line for every flip that built one or uploaded textures for 5 ms or more") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
     X(ASPECT_TRACE,      TRACE, "aspect",          NULL,                       "display.aspect: the 2D batches of each vertex program, texture and placement, once each ([aspect.program]), and the padded target per flip") \
     X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
@@ -209,6 +210,7 @@ extern "C" {
     X(PB_INJECT_STOP,    DEBUG, "pb_inject_stop",  "RECOMP_PB_INJECT_STOP",    "=n: stop every nth walk (test hook)") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
+    X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N: the walker publishes GET as it walks and acks the KickOff flush with up to N segments (1 for any other value but 0) submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt (default off; docs/env.md)") \
     X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \
@@ -244,6 +246,9 @@ extern "C" {
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \
     X(METAL_FB_GUARD,    DEBUG, "metal_fb_guard",  NULL,                       "trap title reads of the last Metal present surface; a read switches to metal_writeback=always") \
     X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \
+    X(METAL_SHADER_NONCE, DEBUG, "metal_shader_nonce", NULL, "=text: Metal renames each runtime shader's entry point with this suffix and the PID, so macOS's shader caches miss (cold-cache timing)") \
+    X(METAL_MSL_VERSION, DEBUG, "metal_msl_version", NULL, "=major.minor: Metal compiles its shaders at this MSL version instead of 3.0; 0 takes the OS default (much slower on macOS 27); an unknown version is ignored with a warning") \
+    X(METAL_SHADER_DUMP, DEBUG, "metal_shader_dump", NULL, "=prefix: Metal writes each runtime shader's MSL to <prefix><kind>_<hash>.metal") \
     X(OCC_DELAY_US,      DEBUG, "occ_delay_us",    NULL,                       "=us: hold every visibility result back this long (test hook)") \
     X(OCC_SETTLE_US,     DEBUG, "occ_settle_us",   NULL,                       "=us: per-frame wait for pending visibility results before settling them at a walk end, semaphore release or flip (8000; 0 none)") \
     X(RT_ALIAS_CHECK,    DEBUG, "rt_alias_check",  NULL,                       "=0: Metal and D3D11 keep render targets whose guest memory the title rewrote (before rt-stale-alias)") \

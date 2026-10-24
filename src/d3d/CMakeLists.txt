@@ -66,7 +66,9 @@ else()
         # The pushbuffer executor's Metal backend (RECOMP_PB_BACKEND=metal).
         # Manual retain/release (no -fobjc-arc); shaders are MSL compiled at
         # runtime, so no metallib build step.
-        target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m)
+        # metal_compile.m: the compile options it shares with the window's
+        # present shaders (src/video/fb_present_metal.m).
+        target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m metal_compile.m)
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC

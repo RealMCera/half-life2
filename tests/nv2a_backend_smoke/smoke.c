@@ -92,6 +92,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 #ifdef __APPLE__
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void);
 uint64_t nv2a_pb_metal_writebacks(void);
+unsigned nv2a_pb_metal_msl_version(void);
 const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh);
 int nv2a_pb_metal_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
@@ -2035,6 +2036,15 @@ int main(int argc, char **argv)
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d border colour cases\n", f);
         failures += f;
+        /* The scenes above compiled their combiners at the pinned MSL 3.0:
+         * at the OS default (4.1 on macOS 27) each costs about 100 ms more
+         * and a new view stalls for it (first-sight shader stalls). Before
+         * macOS 13 the options carry no version (0) and there is no pin. */
+        if (nv2a_pb_metal_msl_version() && nv2a_pb_metal_msl_version() != 0x30000) {
+            fprintf(stderr, "[backend-smoke] FAIL: Metal shaders compile at MSL 0x%x,"
+                    " not the pinned 3.0\n", nv2a_pb_metal_msl_version());
+            failures++;
+        }
         /* The basic shader's CLIPPLANE stage-0 kill: probes only (see
          * scene_clipplane). */
         if (!run(gpu, SC_CLIPBASIC, gpu_px, k++) || !probes_ok(SC_CLIPBASIC, "gpu", gpu_px)) {

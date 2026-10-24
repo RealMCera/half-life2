@@ -86,6 +86,7 @@
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "d3d8_msl.h"
+#include "metal_compile.h"
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -252,7 +253,6 @@ static id<MTLCommandQueue>         s_queue;
 static id<MTLFunction>             s_vs_pass, s_fs_basic;
 static id<MTLFunction>             s_vs_clear, s_fs_clear;
 static id<MTLRenderPipelineState>  s_clear_pso[2];   /* partial clears: without, with depth */
-static MTLCompileOptions          *s_opts;     /* fast math off, kept for M2's shaders */
 static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
@@ -373,6 +373,19 @@ static void prof_add(uint64_t *acc, uint64_t t0)
         *acc += prof_now() - t0;
 }
 
+/* metal_shaders: what the first use of a shader, pipeline or texture costs
+ * the ack thread, per flip. The clocks are read always: a build is
+ * rare and costs milliseconds, so two clock reads around it are noise. */
+static int s_sh_trace = -1;
+static struct { uint64_t lib_ns, pso_ns, tex_ns; unsigned lib, pso, tex; } s_sh_flip;
+
+static int sh_trace(void)
+{
+    if (s_sh_trace < 0)
+        s_sh_trace = recomp_env(RENV_METAL_SHADERS) != NULL;
+    return s_sh_trace;
+}
+
 static void end_encoder(void)
 {
     if (s_enc) {
@@ -477,7 +490,6 @@ static int init(void)
 {
     static int tried;
     NSError *err = nil;
-    MTLCompileOptions *opts;
     id<MTLLibrary> lib;
 
     if (tried)
@@ -512,20 +524,10 @@ static int init(void)
         if (@available(macOS 11.0, iOS 16.4, *))
             s_bc = [s_dev supportsBCTextureCompression] ? 1 : 0;
 
-        opts = [[MTLCompileOptions alloc] init];
-        /* Fast math off: the CPU path is IEEE; reassociation and flushed
-         * denormals would move pixels across the golden tolerance. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        opts.fastMathEnabled = NO;
-#pragma clang diagnostic pop
-        if (@available(macOS 15.0, *)) {
-            opts.mathMode = MTLMathModeSafe;
-            opts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
-        }
-        s_opts = opts;
-        lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:s_msl]
-                                  options:opts error:&err];
+        /* The shared options (metal_compile.h): fast math off, safe math,
+         * the MSL 3.0 pin. */
+        lib = metal_compile_library(s_dev, [NSString stringWithUTF8String:s_msl],
+                                    "the base library", &err);
         if (!lib) {
             fprintf(stderr, LOGP "MSL compile failed: %s\n",
                     err ? [[err localizedDescription] UTF8String] : "?");
@@ -1203,7 +1205,16 @@ static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> f
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
         pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     }
-    pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    {
+        uint64_t t0 = prof_now(), ns;
+        pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        ns = prof_now() - t0;
+        s_sh_flip.pso_ns += ns;
+        s_sh_flip.pso++;
+        if (sh_trace())
+            fprintf(stderr, LOGP "shader: pipeline %.2f ms (blend %u, depth %u), flip %llu\n",
+                    ns / 1e6, key[0], key[5], (unsigned long long)s_presents);
+    }
     [pd release];
     if (!pso) {
         static int said;
@@ -1370,7 +1381,18 @@ static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
  * pack's texels at the pack's size instead of the guest's. If the device
  * refuses a texture of the entry's size, the guest texels go up instead:
  * the pack only ever adds detail, never a black texture. */
+static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash);
+
 static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash)
+{
+    uint64_t t0 = prof_now();
+    id<MTLTexture> tex = tex_upload_body(t, hash);
+    s_sh_flip.tex_ns += prof_now() - t0;
+    s_sh_flip.tex++;
+    return tex;
+}
+
+static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
@@ -1639,7 +1661,7 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
  * (d3d8_vsh_generate_msl, screen-space epilogue), keyed by
  * nv2a_vsh_program_hash; the combiner registers become NV2ACombinerState
  * (d3d8_combiners_from_regs) and MSL (d3d8_combiners_generate_msl), keyed by
- * the state's bytes. Each compiles once, with s_opts (fast math off). A
+ * the state's bytes. Each compiles once, with the shared options (metal_compile.h). A
  * source that fails to compile is logged with its text, counted
  * (s_compile_errors, in the present log) and remembered as bad. */
 
@@ -1647,12 +1669,56 @@ static uint64_t s_compile_errors, s_vs_compiled, s_fs_compiled;
 
 static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *what)
 {
+    static int nonce_read;
+    static const char *nonce, *dump;
     NSError *err = nil;
+    NSString *text = [NSString stringWithUTF8String:src];
     id<MTLLibrary> lib;
     id<MTLFunction> fn;
+    uint64_t t0, ns;
 
-    lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:src]
-                              options:s_opts error:&err];
+    if (!nonce_read) {
+        nonce_read = 1;
+        nonce = recomp_env(RENV_METAL_SHADER_NONCE);
+        dump = recomp_env(RENV_METAL_SHADER_DUMP);
+    }
+    if (dump) {
+        static int dump_said;
+        char path[1024];
+        FILE *f = NULL;
+        int n = snprintf(path, sizeof path, "%s%s.metal", dump, what);
+        if (n > 0 && (size_t)n < sizeof path) {
+            for (char *c = path + strlen(dump); *c; c++)
+                if (*c == ' ')
+                    *c = '_';
+            f = fopen(path, "w");
+        }
+        if (f) {
+            fputs(src, f);
+            fclose(f);
+        } else if (!dump_said++) {
+            fprintf(stderr, LOGP "metal_shader_dump: cannot write %s (missing directory or"
+                    " path too long); no more dump warnings\n", n > 0 && (size_t)n < sizeof path
+                    ? path : dump);
+        }
+    }
+    /* A new entry name is new AIR: both the source and the function caches
+     * of macOS miss, as on a player's first launch. */
+    if (nonce && *nonce) {
+        NSString *nn = [NSString stringWithFormat:@"%@_%s_%d", name, nonce, (int)getpid()];
+        text = [text stringByReplacingOccurrencesOfString:
+                     [NSString stringWithFormat:@" %@(", name]
+                 withString:[NSString stringWithFormat:@" %@(", nn]];
+        name = nn;
+    }
+    t0 = prof_now();
+    lib = metal_compile_library(s_dev, text, what, &err);
+    ns = prof_now() - t0;
+    s_sh_flip.lib_ns += ns;
+    s_sh_flip.lib++;
+    if (sh_trace())
+        fprintf(stderr, LOGP "shader: %s library %.2f ms (%zu bytes), flip %llu\n",
+                what, ns / 1e6, strlen(src), (unsigned long long)s_presents);
     if (!lib) {
         s_compile_errors++;
         if (s_compile_errors <= 4)
@@ -2655,6 +2721,19 @@ static void metal_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32
  * back now, so a test can box-filter them itself. */
 uint64_t nv2a_pb_metal_writebacks(void) { return s_writebacks; }
 
+/* For tests/nv2a_backend_smoke: the MSL version the runtime shaders
+ * compile at (major << 16 | minor), as the compile options report it: with
+ * metal_msl_version=0 that is the OS default (0x40001 on macOS 27). 0 before
+ * init and before macOS 13, where the options have no version. */
+unsigned nv2a_pb_metal_msl_version(void)
+{
+    if (!s_dev)
+        return 0;
+    if (@available(macOS 13.0, iOS 16.0, *))
+        return (unsigned)metal_compile_options().languageVersion;
+    return 0;
+}
+
 /* For tests/nv2a_backend_smoke: the size of the target at a colour offset
  * and the part of it the last flip showed, 0 when there is none (the shape
  * of nv2a_pb_d3d11_shown). */
@@ -3130,6 +3209,12 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
                     p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf,
                     p_set, p_stale, p_first;
     static int zt = -1;
+    if (sh_trace() && (s_sh_flip.lib || s_sh_flip.pso || s_sh_flip.tex_ns >= 5000000))
+        fprintf(stderr, LOGP "build flip %llu: %u libraries %.1f ms, %u pipelines %.1f ms,"
+                " %u texture uploads %.1f ms\n", (unsigned long long)s_presents,
+                s_sh_flip.lib, s_sh_flip.lib_ns / 1e6, s_sh_flip.pso, s_sh_flip.pso_ns / 1e6,
+                s_sh_flip.tex, s_sh_flip.tex_ns / 1e6);
+    memset(&s_sh_flip, 0, sizeof s_sh_flip);
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
         fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",

@@ -22,6 +22,7 @@
 #include "kernel_pacing.h"
 #include "nv2a_flip_hold.h"
 #include "nv2a_kick_wake.h"
+#include "nv2a_gr_notify.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include "guest_vmem.h"
 #include "platform/host_time.h"
@@ -1779,6 +1780,8 @@ static void kick_wake_init(void *regs)
         g_kick_event = 0;
 }
 
+static void run_ahead_report(void);
+
 /* The walker's CPU since the last window, and how its waits went. Printed
  * in poll mode too, so the two modes compare on one line. */
 void xbox_Nv2aKickReport(double window_s)
@@ -1791,6 +1794,7 @@ void xbox_Nv2aKickReport(double window_s)
     long hits;
 
     last_cpu = cpu;
+    run_ahead_report();
     if (!g_kick_fast)
         return;
     if (!g_kick_event || k->off) {
@@ -1835,6 +1839,313 @@ static void kick_cleared(uint64_t now)
      * under present.pacing=sleep it is asleep, and behind a flip hold it
      * waits up to a vblank. Wake it now rather than at its 1 ms timeout. */
     xbox_SpinWake();
+}
+
+/*
+ * RECOMP_DEBUG=run_ahead: the walker no longer holds the title to the
+ * segment it is executing.
+ *
+ * The flush ack above is what serialises the frame: the title waits at each
+ * KickOff until the walker has finished the segment before it, so a frame
+ * costs the title's time plus the walker's. On the console the GPU acks the
+ * flush at once (xemu pfb.c and Cxbx-Reloaded EmuNV2A_PFB.cpp read
+ * NV_PFB_WBC as 0) and the two overlap; what bounds the CPU is D3D's own
+ * MakeSpace and BlockOnTime, reading GET and the fence.
+ *
+ * So, with the key on:
+ *   - every ~4 KB of a walk (nv2a_pb_scan's checkpoint, at a top-level
+ *     method header) GET says how far it has got, so the title's ring and
+ *     fence waits see the walk's progress rather than its end;
+ *   - at the same checkpoint the flush is acked when the title is waiting
+ *     to submit another segment and fewer than N (run_ahead=N, default 1)
+ *     are already submitted past this walk (nv2a_run_ahead_may_ack), so the
+ *     title fills them while the walker draws this one, and never past a
+ *     held flip;
+ *   - BlockOnTime, finding the walker more than 8 KB behind its fence,
+ *     sleeps on an event its NOP-with-notify sets through the PGRAPH
+ *     interrupt: xbox_Nv2aGrNotify raises it (nv2a_gr_notify.h) and the
+ *     walk stalls, as PFIFO does, until the handler has run or for at most
+ *     GR_NOTIFY_STALL_NS; one that finds another still pending is queued
+ *     behind it, and the ack thread watches a pending one to its end.
+ * Off, nothing here runs and the walk acks only when caught up.
+ */
+static int g_run_ahead;                       /* RECOMP_DEBUG=run_ahead */
+static uint32_t g_gr_notify_mask = NV2A_GR_NOTIFY_DEFAULT_MASK;
+/* Segments the title may submit past the walk in progress (run_ahead=N),
+ * and the acks this walk has given so far. The walker's alone. */
+static uint32_t g_run_ahead_depth = 1, g_walk_acks;
+/* The notify raised and not yet serviced, and those queued behind it
+ * (nv2a_gr_notify.h). */
+static Nv2aGrState g_gr;
+/* Trace counters: the walker's thread adds, the report reads and resets. */
+static struct {
+    long checkpoints, early_acks, notifies, serviced, timeouts, relatched,
+         late;
+    uint64_t stall_ns;
+} g_ra;
+#define RA_ADD(f, n) __atomic_fetch_add(&g_ra.f, (n), __ATOMIC_RELAXED)
+#define RA_TAKE(f) __atomic_exchange_n(&g_ra.f, 0, __ATOMIC_RELAXED)
+
+/* A stalled walk waits this long for the handler, then goes on with the
+ * notify still pending: the timer thread keeps delivering it and the ack
+ * thread keeps watching for its end. Long enough for a DPC behind the
+ * one-CPU gate, short of a hang. */
+#define GR_NOTIFY_STALL_NS 50000000ull
+/* How long the ack thread's pass watches a handler that has started
+ * (PGRAPH_FIFO no longer the raise's value) for its exit. */
+#define GR_WATCH_NS 200000ull
+
+int xbox_Nv2aRunAheadOn(void) { return g_run_ahead; }
+
+int xbox_Nv2aGrPending(void)
+{
+    return nv2a_gr_pending(&g_gr);
+}
+
+/* Take a serviced notify down: 1 when this call did. The timer thread's,
+ * by the plain level. */
+int xbox_Nv2aGrServicedPoll(void)
+{
+    if (!g_nv2a_memory || !nv2a_gr_poll(&g_gr, g_nv2a_memory, 0))
+        return 0;
+    RA_ADD(serviced, 1);
+    return 1;
+}
+
+/* The walker's thread's (the ack thread's), by the edge. */
+static int gr_poll_watch(void)
+{
+    if (!g_nv2a_memory || !nv2a_gr_poll(&g_gr, g_nv2a_memory, 1))
+        return 0;
+    RA_ADD(serviced, 1);
+    return 1;
+}
+
+/* Whether the ISR would take a delivery now (kernel_gr_tick): raised, not
+ * being taken down by another thread, and the enable on. */
+int xbox_Nv2aGrDeliverable(void)
+{
+    return g_nv2a_memory
+        && __atomic_load_n(&g_gr.pending, __ATOMIC_ACQUIRE) == 1
+        && nv2a_gr_notify_deliverable(g_nv2a_memory);
+}
+
+/* The handler writes back the status it read, which plain RAM keeps: a DPC
+ * pass that read it before the clear sets it again after, and its DPC
+ * calls it again. Watch a moment and take it down; the ack table does it
+ * later otherwise. */
+static void gr_relatch_watch(void)
+{
+    volatile uint32_t *intr =
+        (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_GR_PGRAPH_INTR);
+    uint64_t t0 = nv2a_pb_now_ns();
+
+    while (!xbox_Nv2aGrPending() && nv2a_pb_now_ns() - t0 < GR_WATCH_NS) {
+        if (*intr & NV2A_GR_PGRAPH_INTR_ERROR) {
+            nv2a_gr_notify_clear(g_nv2a_memory);
+            RA_ADD(relatched, 1);
+        }
+    }
+}
+
+/* Raise the next queued notify once the line is free. The walker's thread:
+ * between walks or at a stalled walk's NOP, so what it has drawn is
+ * settled first, as for a notify raised in line. */
+static int gr_raise_due(void)
+{
+    extern void xbox_Nv2aGrRequest(void);
+    extern void nv2a_pb_exec_checkpoint(void);
+
+    if (!nv2a_gr_due(&g_gr))
+        return 0;
+    nv2a_pb_exec_checkpoint();
+    xbox_Nv2aPgraphFenceTick();
+    nv2a_gr_raise_next(&g_gr, g_nv2a_memory);
+    RA_ADD(notifies, 1);
+    xbox_Nv2aGrRequest();
+    return 1;
+}
+
+/* Every pass of the ack thread, walking or not. The walk gives up on a
+ * handler after GR_NOTIFY_STALL_NS; a DPC that runs after that (the timer
+ * thread behind the gate) loops on the latched bits until a clear lands
+ * between its write-back and its re-read, and the thread running it cannot
+ * poll. This thread never runs guest code, so it is the one that always
+ * can: once the handler has started, watch for its exit a moment, and on
+ * every later pass until it is seen (with nothing watching after the walk
+ * gave up, a late DPC looped for good). */
+static void gr_ack_tick(void)
+{
+    if (!g_run_ahead || !g_nv2a_memory)
+        return;
+    if (xbox_Nv2aGrPending()) {
+        uint64_t t0 = nv2a_pb_now_ns();
+        do {
+            if (gr_poll_watch()) {
+                RA_ADD(late, 1);
+                gr_relatch_watch();
+                break;
+            }
+        } while (NV2A_GR_REG(g_nv2a_memory, NV2A_GR_PGRAPH_FIFO)
+                     != NV2A_GR_FIFO_RAISED
+                 && nv2a_pb_now_ns() - t0 < GR_WATCH_NS);
+    } else if (NV2A_GR_REG(g_nv2a_memory, NV2A_GR_PGRAPH_INTR)
+               & NV2A_GR_PGRAPH_INTR_ERROR) {
+        /* Serviced, and a pass's write-back put the bits up again: its DPC
+         * goes round once more, and a clear that lands before that pass's
+         * write-back is undone by it. Only this runtime's notify raises
+         * ERROR, so a watch spanning many passes ends it here rather than
+         * by the ack table's once-a-pass clear landing in the window. */
+        gr_relatch_watch();
+    }
+    gr_raise_due();
+}
+
+static void run_ahead_checkpoint(uint32_t va)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+    volatile uint32_t *kr = (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
+    extern void nv2a_pb_exec_checkpoint(void);
+    extern int nv2a_pb_exec_flip_held(void);
+
+    RA_ADD(checkpoints, 1);
+    /* The walk's reports first, as at its end: the title may read them
+     * once GET passes them. */
+    nv2a_pb_exec_checkpoint();
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) = va & 0x0FFFFFFFu;
+    xbox_Nv2aPgraphFenceTick();
+    (void)gr_poll_watch();
+    gr_raise_due();
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (nv2a_run_ahead_may_ack((*kr & NV2A_KICK_BIT) != 0,
+                               nv2a_pb_exec_flip_held(), g_walk_acks,
+                               g_run_ahead_depth)) {
+        g_walk_acks++;
+        InterlockedAnd((volatile LONG *)kr, (LONG)~NV2A_KICK_BIT);
+        kick_cleared(nv2a_pb_now_ns());
+        RA_ADD(early_acks, 1);
+    }
+}
+
+/* Wait for the notify pending (and any queued before this one) to be
+ * serviced, up to GR_NOTIFY_STALL_NS from now: 1 when the line is free. */
+static int gr_wait_free(void)
+{
+    uint64_t t0 = nv2a_pb_now_ns();
+
+    for (;;) {
+        if (!xbox_Nv2aGrPending() || gr_poll_watch()) {
+            if (!gr_raise_due())
+                return 1;
+        }
+        if (nv2a_pb_now_ns() - t0 >= GR_NOTIFY_STALL_NS)
+            return 0;
+        kick_nap_us(20, 1);
+    }
+}
+
+int xbox_Nv2aGrNotify(uint32_t subch, uint32_t param)
+{
+    extern void xbox_Nv2aGrRequest(void);
+    extern void nv2a_pb_exec_checkpoint(void);
+    uint64_t t0;
+    int r;
+
+    if (!g_run_ahead || !g_nv2a_memory
+        || !nv2a_gr_notify_wanted(param, g_gr_notify_mask))
+        return 0;
+    t0 = nv2a_pb_now_ns();
+    /* One trap at a time, as on the console: PFIFO stops at the first. A
+     * walk that gave up on the last one waits for it here first, and past
+     * that queues this one behind it: each far-path BlockOnTime waits on
+     * its own notify, so one dropped is a title asleep for good. */
+    if (!gr_wait_free())
+        RA_ADD(timeouts, 1);
+    /* The title wakes into a fence spin: the reports and the fence mirror
+     * the walk owes it, before it can run. */
+    nv2a_pb_exec_checkpoint();
+    xbox_Nv2aPgraphFenceTick();
+    r = nv2a_gr_post(&g_gr, g_nv2a_memory, subch, param);
+    if (r != NV2A_GR_RAISED) {
+        /* Its own count each: a drop is a waiter that never wakes, so
+         * the queued lines must not use up its lines. */
+        static volatile LONG said_queued, said_dropped;
+        if (r == NV2A_GR_QUEUED
+            ? InterlockedIncrement(&said_queued) <= 4
+            : InterlockedIncrement(&said_dropped) <= 4)
+            fprintf(stderr, "  [NV2A] notify 0x%08X: %s\n", param,
+                    r == NV2A_GR_QUEUED
+                    ? "queued behind one not yet serviced; raised after it"
+                    : "dropped, the queue behind an unserviced one is full");
+        RA_ADD(stall_ns, nv2a_pb_now_ns() - t0);
+        return 1;
+    }
+    RA_ADD(notifies, 1);
+    xbox_Nv2aGrRequest();
+    {
+        /* Its own bound, not what the wait above used up. */
+        uint64_t t1 = nv2a_pb_now_ns();
+        while (!gr_poll_watch() && xbox_Nv2aGrPending()) {
+            if (nv2a_pb_now_ns() - t1 >= GR_NOTIFY_STALL_NS) {
+                static int said;
+                RA_ADD(timeouts, 1);
+                if (said++ < 4)
+                    fprintf(stderr, "  [NV2A] notify 0x%08X: no handler in"
+                            " %llu ms; the walk goes on, the timer keeps"
+                            " raising it and the ack thread watches for"
+                            " it\n", param, GR_NOTIFY_STALL_NS / 1000000ull);
+                break;
+            }
+            kick_nap_us(20, 1);
+        }
+    }
+    RA_ADD(stall_ns, nv2a_pb_now_ns() - t0);
+    gr_relatch_watch();
+    return 1;
+}
+
+static void run_ahead_init(void)
+{
+    const char *e = recomp_env(RENV_RUN_AHEAD);
+
+    /* =N: up to N segments past the walk; any other value but 0 (=1,
+     * =on) one. */
+    g_run_ahead = e && *e && strcmp(e, "0") != 0;
+    if (!g_run_ahead)
+        return;
+    {
+        unsigned long n = strtoul(e, NULL, 10);
+        g_run_ahead_depth = n > 1 ? (n > 1024 ? 1024u : (uint32_t)n) : 1u;
+    }
+    {
+        extern void nv2a_pb_scan_set_checkpoint(void (*fn)(uint32_t));
+        nv2a_pb_scan_set_checkpoint(run_ahead_checkpoint);
+    }
+    fprintf(stderr, "  [NV2A] run ahead: GET at ~4 KB checkpoints, flush acked"
+            " with up to %u segment(s) outstanding, notify methods 0x%08X\n",
+            g_run_ahead_depth, g_gr_notify_mask);
+}
+
+static void run_ahead_report(void)
+{
+    extern void xbox_Nv2aGrDeliveryStats(long *delivered, long *claimed);
+    long delivered, claimed;
+
+    if (!g_run_ahead)
+        return;
+    xbox_Nv2aGrDeliveryStats(&delivered, &claimed);
+    fprintf(stderr, "[PACING]   run ahead: checkpoints %ld early_acks %ld"
+            " notifies %ld delivered %ld claimed %ld serviced %ld (late %ld)"
+            " timeouts %ld queued %ld dropped %ld relatched %ld stall_ms %.1f"
+            " pending %d\n",
+            RA_TAKE(checkpoints), RA_TAKE(early_acks), RA_TAKE(notifies),
+            delivered, claimed, RA_TAKE(serviced), RA_TAKE(late),
+            RA_TAKE(timeouts),
+            __atomic_exchange_n(&g_gr.queued, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&g_gr.dropped, 0, __ATOMIC_RELAXED),
+            RA_TAKE(relatched), RA_TAKE(stall_ns) / 1e6,
+            xbox_Nv2aGrPending());
 }
 
 uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns)
@@ -1986,6 +2297,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * release depends only on the vblank count and the clock. */
         extern int nv2a_pb_exec_flip_poll(void);
         int flip_held = nv2a_pb_exec_flip_poll();
+        gr_ack_tick();                  /* run_ahead's notify, before its mask */
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -1998,6 +2310,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              * vblank and the DPC's read of PMC_INTR_0 took the vblank away
              * from the DPC: no ack, no count, and the title's present at
              * vblank slipped a frame. */
+            /* A notify in flight (run_ahead) owns its two bits until its
+             * handler has run. */
+            if (xbox_Nv2aGrPending()) {
+                if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
+                    mask &= ~NV2A_GR_PMC_INTR_PGRAPH;
+                else if (NV2A_ACK[i].offset == NV2A_GR_PGRAPH_INTR)
+                    mask &= ~NV2A_GR_PGRAPH_INTR_ERROR;
+            }
             if (xbox_VblankAckHeld()) {
                 if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
                     mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
@@ -2109,6 +2429,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * never leaves there; whether it happened went with
                      * timing. */
                     if (g_scanned_put && put != g_scanned_put) {
+                        g_walk_acks = 0;
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (g_scanned_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                         if (put < g_scanned_put && recomp_env(RENV_PB_WRAP_TRACE)) {
@@ -2245,6 +2566,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* as at the scan */
                 nv2a_pb_exec_put_read(vbl, put);
                 held = nv2a_pb_exec_flip_poll();
+                gr_ack_tick();
                 if (held) {
                     /* Held: no walk and no kick ack, even with nothing to
                      * walk, or the title would get a segment ahead and
@@ -2320,6 +2642,7 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     kick_nap_init();
     kick_wake_init(g_nv2a_memory);
+    run_ahead_init();
     kick_wake_report_start();
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);

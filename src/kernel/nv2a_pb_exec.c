@@ -5936,6 +5936,19 @@ void nv2a_pb_exec_walk_end(void)
     reports_settle();
 }
 
+/* The same before a run-ahead checkpoint stores GET mid-walk
+ * (RECOMP_DEBUG=run_ahead), and whether a flip is held, which stops its
+ * early acks. */
+void nv2a_pb_exec_checkpoint(void)
+{
+    reports_settle();
+}
+
+int nv2a_pb_exec_flip_held(void)
+{
+    return s_flip_hold.held != 0;
+}
+
 static void get_report(uint32_t param)
 {
     static int fixed_set = -1;
@@ -7008,8 +7021,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* Non-zero, it is one of D3D's software methods, which the GPU traps
          * to D3D's interrupt handler on the console. Only the swap's interval
          * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
-        if (param)
+        if (param) {
+            extern int xbox_Nv2aGrNotify(uint32_t subch, uint32_t param);
             xbox_FlipHoldSwap(&s_flip_hold, param);
+            /* RECOMP_DEBUG=run_ahead: the trap BlockOnTime's sleep waits
+             * on (nv2a_gr_notify.h). The walk stalls in it, as PFIFO does
+             * on the console, until the handler has run. */
+            (void)xbox_Nv2aGrNotify(subch, param);
+        }
         return;
 
     case NV097_SET_FLIP_READ:

@@ -55,6 +55,7 @@
 #include "kernel/nv2a_overlay.h"
 #endif
 #include "fb_present_metal.h"
+#include "metal_compile.h"
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -147,7 +148,6 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
 {
     NSError *e = nil;
     id<MTLLibrary> lib;
-    MTLCompileOptions *opts;
     MTLRenderPipelineDescriptor *pd;
     MTLSamplerDescriptor *sd;
     int w = 0, h = 0, k;
@@ -160,14 +160,11 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         if (!s_queue)
             return fail(err, errn, "no command queue");
         s_unified = [s_dev hasUnifiedMemory] ? 1 : 0;
-        opts = [[MTLCompileOptions alloc] init];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        opts.fastMathEnabled = NO;
-#pragma clang diagnostic pop
-        lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:s_blit_msl]
-                                  options:opts error:&e];
-        [opts release];
+        /* The backend's options (metal_compile.h): one language version and
+         * math mode per process, and fs_blit's texture arguments compile in
+         * milliseconds at the pin instead of about 100 ms more. */
+        lib = metal_compile_library(s_dev, [NSString stringWithUTF8String:s_blit_msl],
+                                    "the present library", &e);
         if (!lib)
             return fail(err, errn, "present shader failed to compile");
         pd = [[MTLRenderPipelineDescriptor alloc] init];
