@@ -13,6 +13,9 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 - POSIX hosts link SDL3 (3.2 or newer) instead of SDL2 or sdl2-compat:
   window, input, gamepad hot-plug and audio. SDL2's `SDL_AUDIODRIVER` and
   `SDL_VIDEODRIVER` are still accepted.
+- `RECOMP_VBLANK` set to `0` or empty is off, like every other switch.
+  Upstream v0.16 reads any set value as its plain tick; other values keep
+  that meaning and `paced` is unchanged.
 
 ## [blinx2-v0.6.0] - 2026-10-21
 
