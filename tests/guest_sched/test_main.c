@@ -54,6 +54,19 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 
 static int failures;
 
+/* The flag is only ever accessed atomically (kernel.h): a plain load in a
+ * polling loop may be hoisted now that it is no longer volatile. */
+static int32_t preempt_flag(void)
+{
+    return (int32_t)InterlockedCompareExchange(
+        (volatile LONG *)&g_xbox_guest_cpu_preempt, 0, 0);
+}
+
+static void preempt_flag_set(int32_t v)
+{
+    InterlockedExchange((volatile LONG *)&g_xbox_guest_cpu_preempt, (LONG)v);
+}
+
 static void check(int ok, const char *what)
 {
     printf("  %-66s %s\n", what, ok ? "PASS" : "FAIL");
@@ -205,7 +218,7 @@ static void highest_first(void)
     t[3] = spawn(4, 2, 0);
     q &= wait_waiters(4, 5000);
     check(q, "order: four waiters queued (8, 10, 15, 10)");
-    check(g_xbox_guest_cpu_preempt, "order: a waiter above the holder asked for the CPU at once");
+    check(preempt_flag(), "order: a waiter above the holder asked for the CPU at once");
     check(xbox_GuestCpuYield(0x1000) == 1, "order: the holder at 8 yields to them");
     s_order[InterlockedIncrement(&s_seq) - 1] = 9;
     check(s_order[0] == 3 && s_order[1] == 2 && s_order[2] == 4 && s_order[3] == 1
@@ -221,7 +234,7 @@ static void highest_first(void)
         t[i] = spawn(i + 1, 0, 0);
         wait_waiters(i + 1, 5000);
     }
-    check(!g_xbox_guest_cpu_preempt, "fifo: equal waiters do not ask before the quantum");
+    check(!preempt_flag(), "fifo: equal waiters do not ask before the quantum");
     xbox_GuestCpuYield(0x1000);
     s_order[InterlockedIncrement(&s_seq) - 1] = 9;
     check(s_order[0] == 1 && s_order[1] == 2 && s_order[2] == 3 && s_order[3] == 9,
@@ -247,9 +260,9 @@ static void time_critical(void)
     check(wait_waiters(1, 5000), "lock: a waiter at 8 queues behind the holder at 15");
     check(xbox_GuestCpuYield(0x2000) == 0 && xbox_GuestCpuHeld(),
           "lock: a spin-wait pass keeps the CPU");
-    g_xbox_guest_cpu_preempt = 1;
+    preempt_flag_set(1);
     xbox_GuestCpuPreempt(0x2004);
-    check(xbox_GuestCpuHeld() && !g_xbox_guest_cpu_preempt,
+    check(xbox_GuestCpuHeld() && !preempt_flag(),
           "lock: a back edge keeps it and lowers the flag");
     xbox_GuestSchedTestWindows(10000000000ull, 0);
     for (int i = 0; i < 20; i++) {
@@ -290,7 +303,7 @@ static void preempt_higher(void)
     check(wait_waiters(1, 5000), "preempt: a waiter at 10 queues behind the holder at 8");
     t0 = xbox_HostNowNs();
     while (!s_ran[1] && xbox_HostNowNs() - t0 < 2000000000ull) {
-        if (g_xbox_guest_cpu_preempt) {
+        if (preempt_flag()) {
             xbox_GuestCpuPreempt(0x3000);
             handed = 1;
         }
@@ -313,7 +326,7 @@ static DWORD WINAPI soft_waiter(LPVOID p)
     InterlockedExchange(&s_sr_ran, 1);
     /* Guest code: loop until told, checking the back edge. */
     while (!s_sr_go) {
-        if (g_xbox_guest_cpu_preempt) {
+        if (preempt_flag()) {
             /* Before the call: it returns only once the holder lets go. */
             InterlockedExchange(&s_sr_preempted, 1);
             xbox_GuestCpuPreempt(0x4000);
@@ -449,7 +462,7 @@ static void suspended(void)
     xbox_GuestCpuYield(0x5000);
     check(s_ran[2] && !s_ran[1], "suspend: the pass skips the suspended waiter");
     check(xbox_GuestSchedSuspend(OBJ(1), -1, &prev) && prev == 1, "suspend: the resume counts down");
-    check(g_xbox_guest_cpu_preempt, "suspend: resumed above the holder, it asks for the CPU");
+    check(preempt_flag(), "suspend: resumed above the holder, it asks for the CPU");
     xbox_GuestCpuPreempt(0x5004);
     check(s_ran[1], "suspend: and runs at the next back edge");
     xbox_GuestCpuPart();
@@ -463,7 +476,7 @@ static void suspended(void)
     h = CreateThread(NULL, 0, suspender, NULL, 0, NULL);
     InterlockedExchange(&s_hs_stage, 1);
     t0 = xbox_HostNowNs();
-    while (!g_xbox_guest_cpu_preempt && xbox_HostNowNs() - t0 < 2000000000ull)
+    while (!preempt_flag() && xbox_HostNowNs() - t0 < 2000000000ull)
         ;
     xbox_GuestCpuPreempt(0x5008);
     check(s_hs_stage == 2 && xbox_GuestCpuHeld(),
@@ -483,7 +496,7 @@ static DWORD WINAPI turn_waiter(LPVOID p)
     xbox_GuestCpuJoin();
     InterlockedIncrement(&s_wt_turns);
     while (!s_wt_go) {
-        if (g_xbox_guest_cpu_preempt) {
+        if (preempt_flag()) {
             xbox_GuestCpuPreempt(0x4100);
             InterlockedIncrement(&s_wt_turns);
         }
@@ -579,12 +592,12 @@ static int barge_asks(LONG inc)
     xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 219);  /* the joiner runs */
     wait_for(&s_bg_stage, 1, 5000);
     xbox_GuestCpuAcquire();                            /* after its block */
-    g_xbox_guest_cpu_preempt = 0;
+    preempt_flag_set(0);
     InterlockedExchange(&s_bg_go, 1);
     wait_waiters(1, 5000);
     /* The waiter raises the flag at its queueing or a 2 ms poll; give it
      * 50 polls before calling a no. */
-    for (int i = 0; i < 100 && !(asked = g_xbox_guest_cpu_preempt); i++)
+    for (int i = 0; i < 100 && !(asked = preempt_flag()); i++)
         Sleep(1);
     xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 219);  /* let it finish */
     wait_for(&s_bg_stage, 2, 5000);
@@ -647,7 +660,7 @@ static void gone_and_valve(void)
     /* A back-edge spinner (no kernel call, no spin pass): the generated
      * code calls xbox_GuestCpuPreempt only when the flag is up. */
     t0 = xbox_HostNowNs();
-    while (!g_xbox_guest_cpu_preempt && xbox_HostNowNs() - t0 < 3000000000ull)
+    while (!preempt_flag() && xbox_HostNowNs() - t0 < 3000000000ull)
         ;
     check(xbox_HostNowNs() - t0 >= 150000000ull && xbox_GuestSchedValves() == v0 + 1,
           "valve: past the window it fires, raises the flag and is counted");
