@@ -50,6 +50,7 @@
 #include "nv2a_zbuf_cache.h"
 #include "../video/video_player.h"   /* xbox_FramebufferWindowFrameStats */
 #include "nv2a_stats.h"
+#include "usb_gamepad.h"   /* usb_gamepad_flip: flip-timed pad scripts */
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -7048,6 +7049,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        usb_gamepad_flip(s_gpu.flips);
         vsh_const_dump_flip();
         return;
 
