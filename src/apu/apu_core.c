@@ -218,6 +218,7 @@ extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
+extern int  xbox_DispatchGateOn(void);
 extern int  xbox_DispatchGateTryEnter(void);
 extern void xbox_DispatchGateLeave(void);
 /* kernel/kernel.h's xbox_Irq* (the device-interrupt post), declared here as
@@ -356,8 +357,8 @@ static void apu_deliver_irq(MCPXAPUState *d)
     /* The one-CPU gate (xbox_DispatchGateTryEnter): with it, no thread at
      * DISPATCH_LEVEL, no DPC and no KeSynchronizeExecution routine runs
      * alongside the routine. Held: posted, and this thread goes on with its
-     * frame. It must never wait for the gate: a DSOUND DPC holding it can be
-     * waiting on this thread to clear a trapped FE method (Burnout 3's
+     * frame. It must never wait for the gate: a DirectSound DPC holding it
+     * can be waiting on this thread to clear a trapped FE method (a title's
      * vehicle select froze on that pair). The post happens without d->lock,
      * since the release of the gate it may take runs other lines' routines
      * here. */
@@ -371,8 +372,21 @@ static void apu_deliver_irq(MCPXAPUState *d)
         }
         if (how == XBOX_IRQ_UNGATED)
             apu_irq_stats.forced++;
+    } else if (!xbox_DispatchGateOn()) {
+        /* No gate (the default): a hold-off while a guest thread sits at
+         * raised IRQL, which is when the single-CPU console could not have
+         * taken the interrupt, then delivered anyway. */
+        if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+            apu_irq_stats.held_frames++;
+            apu_lockstat_lock(d, APU_LOCK_FRAME);
+            return;
+        }
+        if (held_off > 50)
+            apu_irq_stats.forced++;
+        held_off = 0;
+        how = XBOX_IRQ_GATED;   /* an absent gate's leave takes nothing */
     } else {
-        /* irq_safe_points=0: the old bounded hold-off, then beside the
+        /* RECOMP_IRQ_SAFE_POINTS=0: the bounded hold-off, then beside the
          * holder. */
         how = xbox_DispatchGateTryEnter() ? XBOX_IRQ_GATED : XBOX_IRQ_UNGATED;
         if (how == XBOX_IRQ_UNGATED && ++held_off <= 50) {

@@ -249,29 +249,27 @@ extern RECOMP_TLS uint32_t g_ebp;
  * memmove's overlapping case is the same instruction and the same bug.
  */
 extern RECOMP_TLS int g_df;
+extern RECOMP_TLS uint32_t g_eflags; /* EFLAGS image: pushfd, popfd */
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* EFLAGS as pushfd and popfd see it.
  *
  * The arithmetic flags are lazy: a jcc rebuilds them from the instruction
- * that set them, so no EFLAGS word exists until pushfd needs one. g_eflags is
- * the last image popfd loaded, masked to the bits a P3 lets ring 0 write
- * (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID), with bit 1 always set. The ID
- * bit (21) round-trips, which is how code learns the CPU has cpuid; a jcc
- * right after popfd reads its flags from here.
+ * that set them, and the lifter writes them into g_eflags only right before
+ * a pushfd (publish_flags in lifter.py), so code without one pays nothing.
+ * The rest of the word lives in g_eflags too: popfd loads it, masked to the
+ * bits a P3 lets ring 0 write (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID),
+ * with bit 1 always set. The ID bit (21) round-trips, which is how code
+ * learns the CPU has cpuid; a jcc right after popfd reads its flags from
+ * here.
  *
- * recomp_pushfd(known, bits) builds the word: the flags in `known` from
- * `bits` (what the lifter rebuilt from the tracked setter), DF from g_df, the
- * rest from g_eflags. Thread-local like g_df.
- *
- * Only popfd writes g_eflags. cli and sti do not update its IF bit (they
- * have no lift that touches it), so a pushfd after them reports the IF of
- * the last popfd image -- set, unless the guest popped it clear. */
-extern RECOMP_TLS uint32_t g_eflags;
+ * recomp_pushfd builds the pushed word from g_eflags, with DF from g_df,
+ * which std/cld keep. cli and sti do not update IF (they have no lift that
+ * touches it), so a pushfd after them reports the IF of the last popfd image:
+ * set, unless the guest popped it clear. */
 #define RECOMP_EFL_WRITABLE 0x00247FD5u
-static inline uint32_t recomp_pushfd(uint32_t known, uint32_t bits) {
-    return (g_eflags & ~(known | 0x400u)) | (bits & known) | 0x2u
-         | (g_df ? 0x400u : 0u);
+static inline uint32_t recomp_pushfd(void) {
+    return (g_eflags & ~0x400u) | 0x2u | (g_df ? 0x400u : 0u);
 }
 static inline void recomp_popfd(uint32_t v) {
     g_eflags = (v & RECOMP_EFL_WRITABLE) | 0x2u;
@@ -468,6 +466,73 @@ static inline int recomp_fp_trig_in_range(double value) {
     return 1;
 }
 
+/* x87 FSIN, FCOS, FSINCOS and FPTAN values, for an operand that
+ * recomp_fp_trig_in_range has let through.
+ *
+ * The x87 reduces the operand modulo pi/4 with a 66-bit pi,
+ * 0xC90FDAA22168C234C * 2^-66, not the true pi libm reduces with. The
+ * reduced argument is off by k * (pi - pi66) / 4 for k eighth-turns removed,
+ * so the hardware returns f(x * (1 + D)), D = (pi - pi66) / pi66, where libm
+ * returns f(x). At x = 1e10 the two cosines differ in the 11th digit, and the
+ * x87's fsin(pi) is 1.2246063538223773e-16, not 1.2246467991473532e-16. A
+ * title that runs sin() on an accumulated, never-wrapped angle drifts from
+ * libm that way on a Pentium III, so the recompiled one has to drift too.
+ *
+ * 1 + D rounds to 1, so the shift is applied as a correction to libm's s and
+ * c by angle addition, in the versine form (v = 1 - cos e = 2 sin^2(e/2)):
+ * the correction stays small next to s and the sum rounds once, which keeps a
+ * result near a zero of the function accurate. Below |e| = 2^-26 (|x| under
+ * about 1.16e13) sin e is e and v is below half an ulp, so that costs no
+ * libm call beyond the other one of the pair. tests/x87_trig/model.py derives
+ * the vectors and the error budget (a third of the conformance tolerance).
+ * tan = sin/cos loses relative accuracy as cos(x * (1 + D)) nears 0, as the
+ * hardware's own tan does there; the budget sweep leaves out |cos| < 1e-2.
+ *
+ * For |x| <= pi/4 the hardware does no reduction and libm's value is
+ * returned as it is. No precision-control rounding: PC only narrows FADD,
+ * FSUB, FMUL, FDIV and FSQRT, and the transcendentals always deliver 64 bits.
+ * Inf and NaN give NaN (invalid is masked), as libm's do. */
+#define RECOMP_X87_PI66_D 1.2874146789751208e-21 /* 0x1.8518e2da2e893p-70 */
+static inline int recomp_x87_reduces(double x) {
+    return isfinite(x) && fabs(x) > 0.78539816339744830962;
+}
+static inline void recomp_x87_sincos_pi66(double x, double *s, double *c) {
+    double e = x * RECOMP_X87_PI66_D, se, v, sx = sin(x), cx = cos(x);
+    if (fabs(e) < 1.4901161193847656e-08) { /* 2^-26 */
+        se = e; v = 0.0;
+    } else {
+        double h = sin(0.5 * e);
+        se = sin(e); v = 2.0 * h * h;
+    }
+    *s = sx + (cx * se - sx * v);
+    *c = cx - (sx * se + cx * v);
+}
+static inline double recomp_x87_sin(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return sin(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s;
+}
+static inline double recomp_x87_cos(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return cos(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return c;
+}
+/* Returns the sine; *c is the cosine FSINCOS then pushes. */
+static inline double recomp_x87_sincos(double x, double *c) {
+    double s;
+    if (!recomp_x87_reduces(x)) { *c = cos(x); return sin(x); }
+    recomp_x87_sincos_pi66(x, &s, c);
+    return s;
+}
+static inline double recomp_x87_tan(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return tan(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s / c;
+}
+
 static inline double recomp_fscale(double value, double scale) {
     if (isnan(value) || isnan(scale)) return value + scale;
     if (scale == INFINITY)
@@ -623,18 +688,6 @@ void xbox_SpinWait(uint32_t va);
 void xbox_SpinWaitKick(uint32_t va);
 #define RECOMP_SPIN_WAIT_KICK(va) \
     do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWaitKick(va); } while (0)
-
-/* Every loop back edge in lifted code (tools.recomp, --no-back-edge-yield
- * leaves them bare): the guest CPU's quantum check. A guest thread that has
- * waited its quantum for the CPU (RECOMP_GUEST_LOCK) sets the flag, and the
- * holder hands over at its next back edge, as the console's timer tick
- * preempted it wherever it was; a kernel call checks the quantum too, but a
- * frame of lifted code can go without one. With the lock off the flag is
- * never set: one relaxed load and a branch not taken per back edge. */
-extern volatile int g_xbox_guest_cpu_preempt;
-void xbox_GuestCpuPreempt(uint32_t va);
-#define RECOMP_BACK_EDGE(va) \
-    do { if (g_xbox_guest_cpu_preempt) xbox_GuestCpuPreempt(va); } while (0)
 
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the
@@ -1250,6 +1303,27 @@ extern volatile uint64_t g_icall_guard_misses;
 #define RECOMP_ICALL_GUARD_HIT()  ((void)0)
 #define RECOMP_ICALL_GUARD_MISS() ((void)0)
 #endif
+
+/* Every loop back edge in code lifted with --back-edge-yield (tools.recomp;
+ * off by default, so a title lifted without it has none): the guest CPU's
+ * quantum check. A guest thread that has waited its quantum for the CPU
+ * (RECOMP_GUEST_LOCK) sets the flag, and the holder hands over at its next
+ * back edge, as the console's timer tick preempted it wherever it was; a
+ * kernel call checks the quantum too, but a frame of lifted code can go
+ * without one. With the lock off the flag is never set: one relaxed atomic
+ * load and a branch not taken per back edge. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_LOAD_RELAXED32(p) \
+    ((int32_t)__iso_volatile_load32((const volatile __int32 *)(p)))
+#else
+#define RECOMP_LOAD_RELAXED32(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+#endif
+extern int32_t g_xbox_guest_cpu_preempt;
+void xbox_GuestCpuPreempt(uint32_t va);
+#define RECOMP_BACK_EDGE(va) \
+    do { if (RECOMP_LOAD_RELAXED32(&g_xbox_guest_cpu_preempt)) \
+             xbox_GuestCpuPreempt(va); } while (0)
 
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.

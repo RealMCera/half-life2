@@ -33,6 +33,9 @@
 #include "platform/host_time.h"
 
 #include <stdio.h>
+#ifdef _WIN32
+#include <mmsystem.h>   /* timeBeginPeriod */
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -710,6 +713,12 @@ int main(void)
 {
     HANDLE wd;
     XboxGuestCpuStats st;
+
+#ifdef _WIN32
+    /* The waits here are 1-2 ms; at the default 15.6 ms tick a turn
+     * outlives its quantum and a late DPC looks late. */
+    timeBeginPeriod(1);
+#endif
 
     wd = CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
     CloseHandle(wd);

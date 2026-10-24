@@ -480,18 +480,26 @@ void nv2a_pb_exec_walk_begin(void)
     xbox_FlipHoldWalk(&s_flip_hold, xbox_VblankBehindNs());
 }
 
-/* RECOMP_DEBUG=flip_pacing: 0 off (flips complete at once, frame counters
- * bumped unconditionally, as before), edge (D3D's quantising rule), else on. */
+/* RECOMP_FLIP_PACING: unset or 0 off (flips complete at once and frame
+ * counters are bumped on every flip, as before), edge (D3D's rule: a late
+ * frame waits for the next vblank), anything else on. Opt-in: it holds the
+ * title's GPU on the guest vblank clock, and a held flip is a stall a
+ * title's own pacing has never seen here. The first caller can be the timer
+ * thread, a KeSetTimer caller (through the vblank mode) or the ack thread;
+ * two first callers store the same values, the edge flag before the mode,
+ * so the race costs at most a second log line. */
 int nv2a_pb_exec_flip_pacing(void)
 {
-    static int mode = -1;
+    static volatile int mode = -1;
     if (mode < 0) {
         const char *e = recomp_env(RENV_FLIP_PACING);
-        mode = !e ? 1 : !strcmp(e, "0") ? 0 : !strcmp(e, "edge") ? 2 : 1;
-        s_flip_hold.edge = mode == 2;
+        int m = (!e || !*e || !strcmp(e, "0")) ? 0
+                : !strcmp(e, "edge") ? 2 : 1;
+        s_flip_hold.edge = m == 2;
+        mode = m;
         if (e)
-            fprintf(stderr, "  [GPU] flip pacing %s (RECOMP_DEBUG=flip_pacing=%s)\n",
-                    mode == 0 ? "off" : mode == 2 ? "edge" : "on", e);
+            fprintf(stderr, "  [GPU] flip pacing %s (RECOMP_FLIP_PACING=%s)\n",
+                    m == 0 ? "off" : m == 2 ? "edge" : "on", e);
     }
     return mode;
 }
@@ -1856,11 +1864,19 @@ static void clear_surface(uint32_t param)
  */
 static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 {
+    /* Coordinates are signed: a bilinear tap one texel left of or above
+     * texel 0 is -1, which must wrap to the far edge or clamp to 0 -- as an
+     * unsigned value it clamped to the far edge instead. */
+    int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
     if (mode == 1)                         /* wrap */
-        return c % size;
-    return c >= size ? size - 1 : c;       /* clamp, and everything else */
+        return (uint32_t)(((sc % n) + n) % n);
+    if (mode == 2) {                       /* mirror */
+        int32_t m = ((sc % (2 * n)) + 2 * n) % (2 * n);
+        return (uint32_t)(m < n ? m : 2 * n - 1 - m);
+    }
+    return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
 /* BORDER on an axis whose coordinate is off the texture: the tap is the
@@ -3226,6 +3242,10 @@ static int wrap_signed(int c, uint32_t size, uint32_t mode)
     if (mode == 1) {                       /* wrap */
         int m = c % (int)size;
         return m < 0 ? m + (int)size : m;
+    }
+    if (mode == 2) {                       /* mirror */
+        int n = (int)size, m = ((c % (2 * n)) + 2 * n) % (2 * n);
+        return m < n ? m : 2 * n - 1 - m;
     }
     if (mode == NV2A_ADDR_BORDER && (c < 0 || c >= (int)size))
         return -1;
@@ -6777,11 +6797,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_CLEAR_RECT_HORIZONTAL:
         s_gpu.clear_rect_h = param;
-        s_gpu.clear_rect_set = 1;
+        s_gpu.clear_rect_set |= 1;
         break;
     case NV097_SET_CLEAR_RECT_VERTICAL:
         s_gpu.clear_rect_v = param;
-        s_gpu.clear_rect_set = 1;
+        s_gpu.clear_rect_set |= 2;
         break;
     case NV097_SET_BLEND_ENABLE:
         s_gpu.blend_enable = param;

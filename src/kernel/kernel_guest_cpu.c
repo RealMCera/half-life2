@@ -74,7 +74,18 @@ volatile int g_xbox_guest_cpu_waiters;
  * has waited its quantum, so the holder hands over at the edge. Set by the
  * waiter at its poll, cleared by the hand-off; the one relaxed load the
  * check costs is the price of a turn bounded without a kernel call. */
-volatile int g_xbox_guest_cpu_preempt;
+int32_t g_xbox_guest_cpu_preempt;
+
+static int32_t preempt_get(void)
+{
+    return (int32_t)InterlockedCompareExchange(
+        (volatile LONG *)&g_xbox_guest_cpu_preempt, 0, 0);
+}
+
+static void preempt_set(int32_t v)
+{
+    InterlockedExchange((volatile LONG *)&g_xbox_guest_cpu_preempt, (LONG)v);
+}
 
 #define GUEST_CPU_POLL_MS 2             /* a waiter's own look at a free CPU */
 
@@ -465,7 +476,7 @@ static void sched_kick(void)
         GuestSchedWaiter *b = sched_best();
         if (sched_suspended(s_holder)
             || (b && sched_level(b->t) > sched_level(s_holder)))
-            g_xbox_guest_cpu_preempt = 1;
+            preempt_set(1);
     }
     if (s_waiting)
         WakeAllConditionVariable(&s_cv);
@@ -487,7 +498,7 @@ static int sched_should_yield(int kind, uint32_t where)
         yield = sched_suspended(t_sched) || (s_valve && !sched_suspended(s_valve->t))
                 || sched_best_level() >= sched_level(t_sched);
     if (!yield) {
-        g_xbox_guest_cpu_preempt = 0;
+        preempt_set(0);
         s_site_kind = kind;
         s_site_where = where;
         if (s_waiting)
@@ -572,14 +583,14 @@ static uint64_t sched_take(int barge)
     s_waiting++;
     g_xbox_guest_cpu_waiters = (int)s_waiting;
     if (!s_free && sched_wants_cpu(&w, now))
-        g_xbox_guest_cpu_preempt = 1;
+        preempt_set(1);
     while (!(s_free && sched_best() == &w
              && (s_valve == &w || sched_soft_ok(sched_level(t_sched), now)))) {
         SleepConditionVariableCS(&s_cv, &s_lock, GUEST_CPU_POLL_MS);
         now = xbox_HostNowNs();
-        if (!s_free && !g_xbox_guest_cpu_preempt
+        if (!s_free && !preempt_get()
             && (s_valve == &w || sched_wants_cpu(&w, now)))
-            g_xbox_guest_cpu_preempt = 1;  /* a refusal or hand-off cleared it */
+            preempt_set(1);  /* a refusal or hand-off cleared it */
         /* Suspended time is not waiting for the CPU: the starvation line,
          * the quantum and the wait statistics count from the resume. */
         if (sched_suspended(t_sched)) {
@@ -627,7 +638,7 @@ static uint64_t sched_take(int barge)
             s_valve = &w;
             InterlockedIncrement(&s_valves);
             InterlockedIncrement(&s_valves_total);
-            g_xbox_guest_cpu_preempt = 1;
+            preempt_set(1);
             if (s_waiting)
                 WakeAllConditionVariable(&s_cv);
             snprintf(t_note, sizeof t_note, "  [GUEST] valve: tid %lu (level %d)"
@@ -942,7 +953,7 @@ static void guest_cpu_acquire(int barge)
         g_xbox_guest_cpu_waiters = (int)s_waiting;
         t0 = xbox_HostNowNs();
         if (barge && !s_free)
-            g_xbox_guest_cpu_preempt = 1;
+            preempt_set(1);
         while (!(s_free && my == s_head)) {
             SleepConditionVariableCS(&s_cv, &s_lock, GUEST_CPU_POLL_MS);
             /* Ask the holder to hand over at its next loop back edge
@@ -950,9 +961,9 @@ static void guest_cpu_acquire(int barge)
              * a queued one past the quantum (the console's timer tick).
              * The holder clears the flag when it cannot (at DISPATCH),
              * and the waiter raises it again at its next poll. */
-            if (!g_xbox_guest_cpu_preempt && !(s_free && my == s_head)
+            if (!preempt_get() && !(s_free && my == s_head)
                 && (barge || xbox_HostNowNs() - t0 >= s_quantum_ns))
-                g_xbox_guest_cpu_preempt = 1;
+                preempt_set(1);
         }
         s_free = 0;
         s_granted = 0;
@@ -1030,7 +1041,7 @@ static void guest_cpu_handoff(int kind, uint32_t where)
     run_ended(r, now, where);
     turn_ended(now, kind, where);
     EnterCriticalSection(&s_lock);
-    g_xbox_guest_cpu_preempt = 0;       /* the waiter's turn comes now */
+    preempt_set(0);       /* the waiter's turn comes now */
     s_free = 1;
     s_last_tid = (unsigned long)GetCurrentThreadId();
     s_last_level = sched_level(t_sched);
@@ -1182,7 +1193,7 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
                            && where != 231 && where != 99;
             if ((where == 238
                  || (s_waiting && !xbox_IrqlThisThreadBlocksDpcs()
-                     && (g_xbox_guest_cpu_preempt
+                     && (preempt_get()
                          || xbox_HostNowNs() - t_turn_ns >= s_quantum_ns)))
                 && sched_should_yield(kind, where))
                 guest_cpu_handoff(kind, where);
@@ -1197,7 +1208,7 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
          * the back edge and the spin-wait pass refuse to hand over there. */
         else if (where == 238 /* NtYieldExecution */
             || (s_waiting && !xbox_IrqlThisThreadBlocksDpcs()
-                && (g_xbox_guest_cpu_preempt
+                && (preempt_get()
                     || xbox_HostNowNs() - t_turn_ns >= s_quantum_ns)))
             guest_cpu_handoff(kind, where);
         else
@@ -1279,7 +1290,7 @@ void xbox_GuestCpuPreempt(uint32_t va)
         return;
     if (s_sched ? xbox_IrqlThisThreadBlocksDpcs()
                 : (!s_waiting || xbox_IrqlThisThreadBlocksDpcs())) {
-        g_xbox_guest_cpu_preempt = 0;
+        preempt_set(0);
         return;
     }
     /* guest_sched: a suspended holder stops here even with nobody waiting. */
@@ -1313,6 +1324,18 @@ void xbox_GuestCpuLeaveCallback(int took)
 unsigned long xbox_GuestCpuOwner(void)
 {
     return (unsigned long)InterlockedCompareExchange(&s_owner_tid, 0, 0);
+}
+
+int xbox_GuestCpuWaiting(void)
+{
+    int n;
+
+    if (!xbox_GuestCpuOn())
+        return 0;
+    EnterCriticalSection(&s_lock);
+    n = (int)s_waiting;
+    LeaveCriticalSection(&s_lock);
+    return n;
 }
 
 void xbox_GuestCpuStatsGet(XboxGuestCpuStats *out, int reset)

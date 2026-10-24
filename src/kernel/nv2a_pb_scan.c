@@ -120,7 +120,7 @@ static void note(uint32_t subch, uint32_t method)
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
  * decide what a translator has to implement, and a bare method number does not
- * answer that -- "0x1808 x412" only means something once it reads
+ * answer that -- "0x1818 x412" only means something once it reads
  * INLINE_ARRAY. Unnamed ones still get counted. */
 static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0000, "SET_OBJECT" },

@@ -365,7 +365,7 @@ static inline int nv2a_clear_box(const struct nv2a_pb_gpu *g, uint32_t w, uint32
         sw = nv2a_swizzle_side((g->format >> 16) & 0x1Fu);
         sh = nv2a_swizzle_side((g->format >> 24) & 0x1Fu);
     }
-    if (g->clear_rect_set) {
+    if ((g->clear_rect_set & 3) == 3) {
         ax = g->clear_rect_h & 0xFFFFu;
         bx = (g->clear_rect_h >> 16) + 1u;
         ay = g->clear_rect_v & 0xFFFFu;

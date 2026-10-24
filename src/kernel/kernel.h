@@ -633,6 +633,14 @@ ULONG   __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG P
 /* Name contended CRT locks by index instead of by address. */
 void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 
+/* Deliver file I/O APCs (ReadFileEx/WriteFileEx completions) at the issuing
+ * thread's next alertable wait, which then returns STATUS_USER_APC, instead of
+ * inline at the request. That is what the hardware does, and a title whose
+ * completion routine clears a flag it sets *after* issuing the read needs it.
+ * Off by default: the inline path is what every other title was brought up
+ * on. Call before the guest runs. */
+void xbox_SetDeferredIoApc(int on);
+
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
@@ -830,11 +838,14 @@ void     xbox_GuestCpuPreempt(uint32_t va); /* RECOMP_BACK_EDGE with the flag se
 int      xbox_GuestCpuEnterCallback(void);      /* 1 when it took the CPU */
 void     xbox_GuestCpuLeaveCallback(int took);
 unsigned long xbox_GuestCpuOwner(void);         /* the holder's tid, 0 when free */
+int      xbox_GuestCpuWaiting(void);            /* threads queued for it */
 /* Read by RECOMP_SPIN_WAIT: guest threads blocked waiting for the CPU. */
 extern volatile int g_xbox_guest_cpu_waiters;
 /* Read by RECOMP_BACK_EDGE: a waiter has waited its quantum; the holder
- * hands over at its next loop back edge. */
-extern volatile int g_xbox_guest_cpu_preempt;
+ * hands over at its next loop back edge. Only ever accessed atomically: a
+ * relaxed load in lifted code (templates/runtime/recomp_types.h), the
+ * Interlocked calls here. */
+extern int32_t g_xbox_guest_cpu_preempt;
 typedef struct {
     long turns;         /* turns ended by a hand-off or by another thread taking the CPU */
     long releases;      /* kernel calls that let go (soft) */
@@ -927,6 +938,9 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+/* The one-CPU DISPATCH gate (kernel_hal.c), on under RECOMP_DISPATCH_GATE=1.
+ * Off (the default) the entries below succeed and take nothing. */
+int     xbox_DispatchGateOn(void);
 int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery */
 void    xbox_DispatchGateEnter(void);
 void    xbox_DispatchGateLeave(void);
@@ -952,10 +966,12 @@ enum {
     XBOX_IRQ_POSTED   = 0,  /* left for the holder (or already run) */
     XBOX_IRQ_GATED    = 1,  /* the caller has the gate: deliver, then
                                xbox_DispatchGateLeave */
-    XBOX_IRQ_UNGATED  = 2   /* deliver without the gate (irq_safe_force, or
-                               irq_safe_points=0) */
+    XBOX_IRQ_UNGATED  = 2   /* deliver without the gate (RECOMP_IRQ_SAFE_FORCE,
+                               or RECOMP_IRQ_SAFE_POINTS=0) */
 };
-/* 0 under RECOMP_DEBUG=irq_safe_points=0: the models' old hold-off. */
+/* 1 only with the gate on and RECOMP_IRQ_SAFE_POINTS not 0. 0: the models'
+ * hold-off, keyed on the gate when it is on and on the raised-IRQL count
+ * (xbox_IrqlBlocksInterrupts) when it is off. */
 int     xbox_IrqSafePointsOn(void);
 /* The routine the holder runs for a line: it finds the connected ISR and
  * calls it on g_esp (a worker stack the caller set up) at the device IRQL. */
@@ -966,9 +982,9 @@ void    xbox_IrqSafePoint(void);
 void    xbox_IrqReport(void);
 /* The thread holding the gate (0 when free), for the ungated-delivery logs. */
 unsigned long xbox_DispatchGateOwner(void);
-/* A model is about to run an ISR without the gate (irq_safe_points=0, or
- * irq_safe_force): one line naming the holder it runs beside (the first 20
- * per line), and a count in the [IRQ] summary. */
+/* A model is about to run an ISR without the gate (RECOMP_IRQ_SAFE_POINTS=0,
+ * or RECOMP_IRQ_SAFE_FORCE): one line naming the holder it runs beside (the
+ * first 20 per line), and a count in the [IRQ] summary. */
 void    xbox_IrqNoteUngated(int line);
 
 /* DPCs queued by an interrupt (the queue in kernel_bridge.c). On the console
@@ -983,21 +999,23 @@ int     xbox_DpcDrainHere(void);        /* the caller holds the gate; DPCs run *
  * waits; 1 when DPCs stayed queued on a busy gate. *ran counts what ran. */
 int     xbox_DpcDrainTimer(int *ran);
 void    xbox_DpcMarkGuestThread(void);  /* this thread runs guest code */
-int     xbox_DpcOnRaise(void);          /* 0 under RECOMP_DEBUG=dpc_on_raise=0 */
+int     xbox_DpcOnRaise(void);  /* gate on and RECOMP_DPC_ON_RAISE not 0 */
 
 typedef struct {
     long posted[XBOX_IRQ_LINES];       /* posts that found the gate held */
     long on_holder[XBOX_IRQ_LINES];    /* run by the holder at a safe point */
     long second_try[XBOX_IRQ_LINES];   /* taken back by the poster's retry */
-    long forced[XBOX_IRQ_LINES];       /* irq_safe_force deliveries */
+    long forced[XBOX_IRQ_LINES];       /* RECOMP_IRQ_SAFE_FORCE deliveries */
     long ungated[XBOX_IRQ_LINES];      /* run beside a holder (any mode) */
     long max_wait_us[XBOX_IRQ_LINES];  /* longest post-to-run wait */
     long wait_logs;                    /* holder-without-safe-point lines */
     long refused;                      /* safe points that could not run */
 } XboxIrqStats;
 void    xbox_IrqStatsGet(XboxIrqStats *out, int reset);
-/* Tests: re-read irq_safe_* after recomp_env_set, and a hook run between
- * the poster's first try and its post (the lost-post window). */
+/* Tests: re-read RECOMP_DISPATCH_GATE, RECOMP_IRQ_SAFE_* and
+ * RECOMP_DPC_ON_RAISE after changing the environment, and a
+ * hook run between the poster's first try and its post (the lost-post
+ * window). */
 void    xbox_IrqReloadConfig(void);
 void    xbox_IrqSetPostHook(void (*hook)(int line));
 /* Tests: a hook run inside the lower that gives the gate back, after its
@@ -1318,9 +1336,10 @@ unsigned long xbox_log_ms(void);
  * pad waiting for a movie, say) installs it before the game starts. */
 extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
 
-/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
- * Interlaced output shows one field per vblank, so its low bit is the field
- * parity that the field pin (port 0x80C0) reports. */
+/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off):
+ * the clock a held flip waits on (nv2a_flip_hold.h). Interlaced output shows
+ * one field per vblank, so its low bit is the field parity that the field pin
+ * (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
 
 /* Host time (xbox_HostNowNs) of the last vblank raised more than
@@ -1372,6 +1391,12 @@ void     xbox_PortOut(uint32_t port, uint32_t value, int width);
 /* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
  * in templates/runtime/recomp_types.h for generated code. */
 void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+/* RECOMP_VBLANK's mode (kernel_bridge.c): off when unset; the tick v0.14.0
+ * had when set; the 60 Hz schedule with the vblank-ack thread when it is
+ * "paced" or paced_wanted (the gate or the flip hold is on). Pure,
+ * for tests/vblank_ack. */
+enum { XBOX_VBLANK_OFF, XBOX_VBLANK_TICK, XBOX_VBLANK_PACED };
+int xbox_VblankMode(const char *env, int paced_wanted);
 
 #ifdef __cplusplus
 }

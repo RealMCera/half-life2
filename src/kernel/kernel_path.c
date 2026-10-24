@@ -64,11 +64,10 @@ static const path_rule s_rules[] = {
     { "\\Device\\Harddisk0\\Partition1\\TDATA", 2, "\\TDATA",  "/TDATA"      },
     /* E:\CACHE is the title's own scratch on the console's hard disk, and it
      * writes there: Burnout 3 opens CACHE\LocalCache00.bin and
-     * LocalCache08.bin with disposition 3 (FILE_OPEN_IF) from 0x0032A73C. Under
-     * the Partition1 rule below those landed in the game dir, so every run
-     * wrote into the user's dump and shared one cache across all save dirs;
-     * a race gate on 2026-10-15 overwrote LocalCache08.bin in a dump meant to
-     * stay read-only. It goes with the saves for the same reasons they do.
+     * LocalCache08.bin with FILE_OPEN_IF. Under the Partition1 rule below
+     * those landed in the game dir, so every run wrote into the extracted
+     * game files and all save dirs shared one cache. It goes with the saves,
+     * for the same reasons they do.
      *
      * Its folder is TitleCache, not CACHE: Z: and Partition3-5 (the cache
      * partitions behind X:, Y: and Z:) already go to <save>/Cache, and on a

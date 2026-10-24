@@ -3,7 +3,7 @@
  *
  * The host backends behind input_core.c (input_backend.h): each one reads
  * a host pad and maps it to the Duke layout through the table in
- * input_map.c, so both hosts map controls the same way.
+ * pad_map.c, so both hosts map controls the same way.
  *
  *   _WIN32 -> Windows XInput (also Proton/Wine)
  *   POSIX  -> SDL3 gamepad
@@ -11,7 +11,7 @@
 
 #include "input_backend.h"
 #include "recomp_env.h"
-#include "input_map.h"
+#include "pad_map.h"
 #include "keyboard.h"
 #include <stddef.h>
 #include <stdlib.h>
@@ -96,7 +96,7 @@ static DWORD xi_read(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
     g.wButtons &= (WORD)~XI_GUIDE;
     memcpy(&pad, &g, sizeof pad);
     out->dwPacketNumber = packet;
-    xbox_InputMapXInput(&pad, &out->Gamepad);
+    xbox_PadMapXInput(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
 
@@ -422,7 +422,7 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
     __atomic_store_n(&g_sdl_extra[port], sdl_extra(c), __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_slot_lock);
     out->dwPacketNumber = ++g_packet[port];
-    xbox_InputMapSdl(&pad, &out->Gamepad);
+    xbox_PadMapSdl(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
 
@@ -466,7 +466,7 @@ static DWORD sdl_read_host(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
     *extra = sdl_extra(c);
     pthread_mutex_unlock(&g_slot_lock);
     out->dwPacketNumber = 0;
-    xbox_InputMapSdl(&pad, &out->Gamepad);
+    xbox_PadMapSdl(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
 

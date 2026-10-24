@@ -166,8 +166,54 @@ void xbox_FlipHoldCancel(XboxFlipHold *h, uint64_t now_ns)
     h->swap_immediate = 0;
 }
 
-int xbox_FrameCounterOwned(int seeded, uint32_t last_written, uint32_t cur)
+int xbox_FrameCounterOwned(XboxFrameCounterWatch *w, int seeded,
+                           uint32_t last_written, uint32_t cur,
+                           uint32_t now_ms)
 {
+    if (w->owned) {
+        if (cur != w->last_seen) {
+            w->last_seen = cur;
+            w->moved_ms = now_ms;
+            return 1;
+        }
+        if (now_ms - w->moved_ms < XBOX_FRAME_COUNTER_IDLE_MS)
+            return 1;
+        /* Stopped: the toolkit bumps it again, from where it is. */
+        w->owned = 0;
+        w->foreign = 0;
+        return 0;
+    }
+    if (!seeded)
+        return 0;
     /* Backwards is a device reset, not the title counting: still ours. */
-    return seeded && (int32_t)(cur - last_written) > 0;
+    if ((int32_t)(cur - last_written) <= 0)
+        return 0;
+    if (!w->foreign || now_ms - w->first_ms > XBOX_FRAME_COUNTER_WINDOW_MS) {
+        w->foreign = 1;
+        w->first_ms = now_ms;
+    } else {
+        w->foreign++;
+    }
+    if (w->foreign < XBOX_FRAME_COUNTER_FOREIGN)
+        return 0;
+    w->owned = 1;
+    w->foreign = 0;
+    w->last_seen = cur;
+    w->moved_ms = now_ms;
+    return 1;
+}
+
+int xbox_FrameCounterBump(XboxFrameCounterBump *b, volatile uint32_t *word,
+                          int pacing, uint32_t now_ms)
+{
+    uint32_t cur = *word;
+    int was = b->watch.owned;
+
+    if (pacing && xbox_FrameCounterOwned(&b->watch, b->seeded,
+                                         b->last_written, cur, now_ms))
+        return was ? XBOX_FRAME_COUNTER_TITLES : XBOX_FRAME_COUNTER_HANDED_OVER;
+    *word = cur + 1;
+    b->last_written = cur + 1;
+    b->seeded = 1;
+    return was ? XBOX_FRAME_COUNTER_HANDED_BACK : XBOX_FRAME_COUNTER_BUMPED;
 }

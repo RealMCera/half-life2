@@ -271,6 +271,19 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--entry-stubs", action="store_true",
+                        help="Stub an unresolved target that lies inside a "
+                             "known function with a copy of that function "
+                             "entered at the target, instead of a plain "
+                             "return. Each target is a full copy, so it can "
+                             "grow the generated code a lot. Off by default")
+    parser.add_argument("--back-edge-yield", action="store_true",
+                        help="Call RECOMP_BACK_EDGE, the guest CPU's quantum "
+                             "check, at every loop back edge. The guest CPU "
+                             "lock (RECOMP_GUEST_LOCK=1) needs it to preempt "
+                             "a loop that makes no kernel call; it costs a "
+                             "load and a branch per edge when the lock is "
+                             "off. Off by default: edges stay bare")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -280,11 +293,6 @@ def main():
                         default=[],
                         help="seed_functions.json; the flag-fallback report "
                              "lists its sites in the seeds marked observed")
-    parser.add_argument("--no-back-edge-yield", action="store_true",
-                        help="Leave loop back edges bare. By default every "
-                             "back edge calls RECOMP_BACK_EDGE, the guest "
-                             "CPU's quantum check (RECOMP_GUEST_LOCK): a load "
-                             "and a branch when the lock is off")
     parser.add_argument("--spin-waits", metavar="JSON",
                         help="Lower guest busy-wait loops to RECOMP_SPIN_WAIT "
                              "(the runtime sleeps in them when its pacing "
@@ -375,7 +383,8 @@ def main():
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
         spin_waits=spin_waits,
-        back_edge_yield=not args.no_back_edge_yield,
+        back_edge_yield=args.back_edge_yield,
+        entry_stubs=args.entry_stubs,
     )
     translator.observed_seeds = _load_observed_seeds(args.seeds)
 

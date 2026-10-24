@@ -2,7 +2,7 @@
  * input_hotplug_sdl test: see CMakeLists.txt.
  *
  * The real SDL backend behind the public API, with a fake clock in the core
- * only (the core's once-a-second probe of an empty port is input_map's
+ * only (the core's once-a-second probe of an empty port is pad_map's
  * test; here each step moves the clock a second on so every port is asked).
  * Pads are SDL virtual joysticks of the gamepad type; which port a
  * pad landed on is found by pressing its START and seeing which port reads

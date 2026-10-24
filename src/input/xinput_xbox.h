@@ -95,7 +95,7 @@ void xbox_InputInit(void);
 void xbox_InputShutdown(void);
 
 /**
- * Get the state of a controller, mapped to the Duke layout (input_map.h).
+ * Get the state of a controller, mapped to the Duke layout (pad_map.h).
  * Port: 0-3 (Xbox controller ports). A port last seen disconnected returns
  * ERROR_DEVICE_NOT_CONNECTED without asking the host until a second has
  * passed since it was last probed.

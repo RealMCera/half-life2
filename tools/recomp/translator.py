@@ -530,8 +530,8 @@ class FunctionTranslator:
         # starting there; translate_function tail-dispatches each by address.
         self.falloffs = []
         # The guest CPU's quantum check at every loop back edge
-        # (RECOMP_BACK_EDGE); --no-back-edge-yield leaves the edges bare.
-        self.back_edge_yield = True
+        # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
+        self.back_edge_yield = False
         # --spin-waits: a spin_waits.SpinWaitReport, or None (the matcher
         # does not run and the output is unchanged).
         self.spin_waits = None
@@ -713,7 +713,9 @@ class FunctionTranslator:
                          if s.va <= target < s.va + s.va_size), None)
             if home is None:
                 continue
-            bound = home.va + min(home.va_size, home.raw_size)
+            # readable_end: a callback whose last instruction crosses the
+            # raw end into the loader's zero fill keeps that instruction.
+            bound = min(home.va + home.va_size, _config.readable_end(home))
             if next_start is not None:
                 bound = min(bound, next_start)
             if bound <= target:
@@ -1713,6 +1715,36 @@ class FunctionTranslator:
                     return 0
         return 0
 
+    def _stub_epilogue(self, addr, max_insns=8):
+        """The registers popped, then the `ret N` immediate, when the code at
+        `addr` is nothing but a function epilogue (`pop r32`* then `ret`).
+
+        Such an address is a branch target into another function's shared
+        exit -- `jne <epilogue>` from a switch arm that was split off as its
+        own function. A stub that only moves esp leaves every popped
+        callee-saved register holding the jumper's value, so its caller
+        carries on with the wrong esi/edi/ebx; SSX 3's Options menu crashed
+        that way. Returns None for anything else.
+        """
+        offset = va_to_file_offset(addr)
+        if offset is None or not self.xbe_data:
+            return None
+        window = self.xbe_data[offset:offset + max_insns * 3]
+        regs = []
+        try:
+            for insn in self.disasm._cs.disasm(window, addr):
+                mnemonic = insn.mnemonic.lower()
+                if mnemonic == "pop" and insn.op_str in (
+                        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"):
+                    regs.append(insn.op_str)
+                    continue
+                if mnemonic in ("ret", "retn"):
+                    return regs, (int(insn.op_str, 0) if insn.op_str else 0)
+                return None
+        except Exception:
+            return None
+        return None
+
     def _read_local_jump_table(self, table_va, lower, upper,
                                max_entries=256, min_entry_va=None):
         """Read the contiguous pointer cluster around an indexed-jump base."""
@@ -2484,6 +2516,10 @@ class FunctionTranslator:
         self.lifter.imm_code_refs = imm_refs
 
         # Build basic blocks
+        forced = getattr(self, "_forced_leaders", None)
+        if forced:
+            switch_leaders = set(switch_leaders or ()) | {
+                a for a in forced if start < a < end}
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None,
@@ -2514,6 +2550,57 @@ class FunctionTranslator:
                         and block.last_insn.address not in debug_slide_int3s):
                     block.successors = []
         return instructions, blocks
+
+    def entry_stub(self, addr, name):
+        """C for a call/jump target in the middle of another function.
+
+        tools.disasm sometimes splits one function in two (a switch arm, a
+        shared epilogue), so a jump between the halves becomes a call to an
+        address that is no function start. A stub that only returns skips that
+        code silently -- SSX 3's Options menu crashed on one, Equip Gear went
+        wrong on others. Instead: the containing function translated again
+        with `addr` forced to a block leader, renamed, entered with a goto.
+        Registers are the globals; ebp is the jumper's frame (g_seh_ebp, set
+        before every tail jump), exactly the state a guest jump arrives with.
+        Returns None when addr is not an instruction of a known function.
+        """
+        if not hasattr(self, "_entry_index"):
+            self._entry_index = sorted(
+                (a, info) for a, info in self.func_db.items())
+            self._entry_starts = [a for a, _ in self._entry_index]
+        import bisect as _bisect
+        i = _bisect.bisect_right(self._entry_starts, addr) - 1
+        if i < 0:
+            return None
+        fstart, finfo = self._entry_index[i]
+        fend = finfo.get("end") or fstart + finfo.get("size", 0)
+        recovered = self._recovered_cfg.get(fstart)
+        if recovered:
+            fend = recovered["end"]
+        if not (fstart < addr < fend):
+            return None
+        self._forced_leaders = {addr}
+        try:
+            code = self.translate_function(fstart, finfo)
+        except Exception:
+            code = None
+        finally:
+            self._forced_leaders = None
+        label = f"loc_{addr:08X}:"
+        if not code or label not in code:
+            return None
+        fname = _func_ident(fstart, finfo.get("name", f"sub_{fstart:08X}"))
+        head = f"void {fname}(void)"
+        if head not in code:
+            return None
+        code = code.replace(head, f"void {name}(void)", 1)
+        first = code.find("\nloc_")
+        if first < 0:
+            return None
+        frame = "    ebp = g_seh_ebp;\n" if "uint32_t ebp" in code[:first] else ""
+        entry = (f"\n    /* entered at 0x{addr:08X}, inside 0x{fstart:08X} */\n"
+                 f"{frame}    goto loc_{addr:08X};\n")
+        return code[:first] + entry + code[first:]
 
     def translate_function(self, func_addr, func_info):
         """
@@ -2804,7 +2891,7 @@ class FunctionTranslator:
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
                                  "lock cmpxchg", "inc", "dec", "sahf", "fcomi",
                                  "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
-               or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
+               or insn.mnemonic.removeprefix("lock ") in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -3164,21 +3251,25 @@ class FunctionTranslator:
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
+    entry_stubs = False     # --entry-stubs; see translate_batch_split
+
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, spin_waits=None,
-                 back_edge_yield=True):
+                 back_edge_yield=False, entry_stubs=False):
         """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
-        back_edge_yield: RECOMP_BACK_EDGE at every loop back edge (the
-        default; --no-back-edge-yield clears it)."""
+        back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
+        (--back-edge-yield; off by default). entry_stubs: an unresolved
+        target inside a function enters a copy of it (--entry-stubs)."""
         self.xbe_path = xbe_path
         self.back_edge_yield = back_edge_yield
         # Starts of the seeds a run saw (--seeds, `"observed": true`): the
         # flag-fallback report names its sites in these functions.
         self.observed_seeds = set()
+        self.entry_stubs = entry_stubs
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -3682,10 +3773,13 @@ class BatchTranslator:
                 "",
                 "#define RECOMP_GENERATED_CODE",
                 f'#include "{header_name}"',
+                '#include <math.h>',
                 "",
             ]
             stub_lines.append(
-                "/* Each stub consumes the return address its caller pushed,")
+                "/* A target inside another function is that function's code entered")
+            stub_lines.append(
+                " * at the target (entry_stub). The rest: each stub consumes the return address its caller pushed,")
             stub_lines.append(
                 " * exactly as a real 'ret' would. An empty body leaves esp 4 bytes")
             stub_lines.append(
@@ -3729,7 +3823,31 @@ class BatchTranslator:
                 "        fflush(stderr); } } while (0)",
                 "",
             ]
+            entry_n = 0
             for addr in sorted(unresolved):
+                # --entry-stubs: re-emit the containing function from addr.
+                # Opt-in: each target is a full copy of its function, so a
+                # title with many targets in one function grows by that much.
+                code = (self.translator.entry_stub(addr, unresolved[addr])
+                        if self.entry_stubs else None)
+                if code:
+                    stub_lines.append(code)
+                    entry_n += 1
+                    continue
+                epi = self.translator._stub_epilogue(addr)
+                if epi and epi[0]:
+                    # A shared epilogue: run it -- restore the registers it
+                    # pops, then return (address + N bytes of arguments).
+                    regs, n = epi
+                    body = " ".join(f"g_{r} = MEM32(g_esp); g_esp += 4;"
+                                    for r in regs)
+                    note = "; ".join(f"pop {r}" for r in regs) + f"; ret {n}"
+                    stub_lines.append(
+                        f"void {unresolved[addr]}(void) {{ "
+                        f"RECOMP_STUB_HIT(0x{addr:08X}u); {body} g_esp += {4 + n}; "
+                        f"/* 0x{addr:08X}: {note} */ }}"
+                    )
+                    continue
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
@@ -3743,8 +3861,8 @@ class BatchTranslator:
             generated_files.append(stub_path)
 
             if verbose:
-                print(f"  Wrote {stub_path} ({len(unresolved)} stubs)",
-                      file=sys.stderr)
+                print(f"  Wrote {stub_path} ({len(unresolved)} stubs, "
+                      f"{entry_n} entry)", file=sys.stderr)
 
         # Generate dispatch table.
         #

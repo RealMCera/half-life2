@@ -333,6 +333,13 @@ class DisasmEngine:
             hi = lo + home.virtual_size
             entries = 0
             while entries < max_entries:
+                # MSVC's two-level switch parks the byte index table straight
+                # after the dword table. Its first bytes, small arm numbers
+                # such as `00 02 02 00`, read as a dword are an address low
+                # in the section, so the walk would take them as one more
+                # arm. A `movzx` names that byte table; stop in front of it.
+                if tbl + entries * 4 in self.byte_tables:
+                    break
                 target = self.image.read_u32_at_va(tbl + entries * 4)
                 if target is None or not (lo <= target < hi):
                     break
@@ -673,12 +680,25 @@ class DisasmEngine:
     def probes_as_callback_body(self, addr: int, upper: int,
                                 lower: Optional[int] = None,
                                 tail_targets=(), *, require_entry_frame=False,
-                                allow_indirect_tails=False) -> bool:
+                                allow_indirect_tails=False,
+                                escapes: Optional[Set[int]] = None) -> bool:
         """Read-only proof of a closed callback CFG inside an unclaimed gap.
 
         Calls may return from other functions; branches and fallthrough must
         stay on decoded instruction boundaries. Reuse the translator's CFG
         decoder and the sweep's measured switch tables, without a size cap.
+
+        allow_indirect_tails: an indirect jmp that is not a measured table is
+        an exit. True takes any form; "mem" takes a memory operand
+        (`jmp [reg + N]`, a vtable slot or a function-pointer field), or a
+        register the body itself wrote, never a bare `jmp reg`.
+
+        escapes: when given, a direct jmp or jcc out of [lower, upper) to an
+        address nobody has proven is not a refusal: the destination is added
+        to the set and the edge counts as an exit. The body is closed only
+        once the caller proves every destination itself, in its own gap.
+        A switch arm outside the gap counts as an exit when it is in
+        tail_targets, whether or not escapes is given.
         """
         from ..recomp.disasm import Disassembler
 
@@ -726,16 +746,30 @@ class DisasmEngine:
                 if (allow_indirect_tails
                         and (op.type != "mem" or not op.mem_index
                              or not self.jump_table_entries(op.mem_disp))):
+                    # "mem": `jmp reg` only when the body loaded that
+                    # register itself, a handler fetched from a table
+                    # (`mov eax, [eax*4+T] ; ... ; jmp eax`). A lone `ff e0`
+                    # decoded from a stray word has no such load.
+                    if (allow_indirect_tails == "mem" and op.type != "mem"
+                            and not (op.type == "reg" and any(
+                                op.reg in other.regs_written
+                                for other in decoded if other is not insn))):
+                        return False
                     indirect_tails.add(insn.address)
                     continue
                 if (op.type != "mem" or not op.mem_index or op.mem_base
                         or op.mem_scale != 4 or op.mem_seg):
                     return False
                 targets = self.jump_table_entries(op.mem_disp)
-                if not targets or any(not lower <= t < upper for t in targets):
+                # An arm outside the gap is fine when it is a proven entry: a
+                # dispatcher whose arms are other functions (a two-instruction
+                # `mov eax, [ecx+N]; jmp [eax*4+table]` method) exits into
+                # them as a tail call does.
+                if not targets or any(not lower <= t < upper
+                                      and t not in tail_targets for t in targets):
                     return False
                 tables[insn.address] = targets
-                arms.update(targets)
+                arms.update(t for t in targets if lower <= t < upper)
             if arms <= entries:
                 break
             entries.update(arms)
@@ -775,8 +809,17 @@ class DisasmEngine:
             for edge in edges:
                 if edge in starts:
                     continue
-                if edge == insn.jump_target and edge in tail_targets:
+                if edge in tail_targets and (edge == insn.jump_target
+                                             or insn.address in tables):
                     exits = True  # preserve proven tails to existing bodies
+                    continue
+                # A direct jump or branch out of the gap to code nobody has
+                # proven yet. The caller may prove that destination on its
+                # own (escapes); until it does, this body is not closed.
+                if (escapes is not None and edge == insn.jump_target
+                        and not lower <= edge < upper):
+                    escapes.add(edge)
+                    exits = True
                     continue
                 return False
             backward |= any(edge in starts and edge <= insn.address for edge in edges)
@@ -841,11 +884,22 @@ class DisasmEngine:
         if not data:
             return False
 
-        insns = list(self._cs.disasm(data, addr, count=2))
-        if len(insns) != 2:
+        insns = list(self._cs.disasm(data, addr, count=3))
+        # A thunk into a member subobject adjusts `this` first:
+        #
+        #     mov ecx, [ecx + 8]          ; or add/sub ecx, imm
+        #     mov eax, [ecx]
+        #     jmp dword ptr [eax + 0x80]
+        #
+        # Half-Life 2's 0x00452AC0 is one, named only by a vtable without
+        # RTTI. Missing it skipped the call and the boot crashed a few
+        # million calls later.
+        if len(insns) == 3 and self._is_this_adjust(insns[0]):
+            insns = insns[1:]
+        if len(insns) < 2:
             return False
 
-        load, dispatch = insns
+        load, dispatch = insns[:2]
         if load.mnemonic.lower() != "mov":
             return False
         try:
@@ -868,6 +922,25 @@ class DisasmEngine:
             return False
         # ...through the register the load just filled.
         return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
+
+    @staticmethod
+    def _is_this_adjust(insn) -> bool:
+        """mov ecx, [ecx + N] / mov ecx, [N] / add ecx, imm / sub ecx, imm."""
+        m = insn.mnemonic.lower()
+        try:
+            ops = insn.operands
+        except Exception:
+            return False
+        if len(ops) != 2 or ops[0].type != CS_OP_REG or ops[0].reg != x86_const.X86_REG_ECX:
+            return False
+        if m == "mov":
+            # [ecx + N] for a member subobject, or [N] for a global object
+            # (Half-Life 2's 0x00457420: mov ecx, [0x0080C1F0]).
+            src = ops[1]
+            return (src.type == CS_OP_MEM and src.mem.index == 0
+                    and src.mem.disp != 0
+                    and src.mem.base in (x86_const.X86_REG_ECX, 0))
+        return m in ("add", "sub") and ops[1].type == CS_OP_IMM
 
     def probes_as_prologue(self, addr: int) -> bool:
         """
@@ -945,6 +1018,20 @@ class DisasmEngine:
                     data[offset:offset + 24], addr, count=3))
                 if len(third) > 2 and third[2].mnemonic == "call":
                     return True
+
+        # A frame larger than a page, which MSVC opens with a stack probe:
+        #
+        #     mov eax, <frame size>
+        #     call __chkstk            (_alloca_probe)
+        #
+        # Same reason as __SEH_prolog: the helper moves esp, so there is no
+        # push/sub to find. Half-Life 2's 0x00426370 (mov eax, 0x8028) is
+        # reached only through a vtable without RTTI; once code after int3
+        # padding had to probe as code, it and every function like it
+        # vanished, and the vtable call went to nothing.
+        if (m == "mov" and ops.startswith("eax, 0x") and len(insns) > 1
+                and insns[1].mnemonic == "call"):
+            return True
 
         return False
 

@@ -154,6 +154,16 @@ static void test_keycodes(void)
                 hit |= rows[i].vk == vk;
             CHECK(hit, "map key vk 0x%02X (%s) has no SDL key here", vk, xbox_key_map[r].keys);
         }
+    /* And no two SDL keys give one VK, except the pairs that always have
+     * (Return and keypad Enter, the two sides' either-side code). */
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++)
+        for (size_t j = i + 1; j < sizeof rows / sizeof rows[0]; j++) {
+            int a = rows[i].vk;
+            if (!a || a != rows[j].vk || a == 0x0D || a == 0x10 || a == 0x11 || a == 0x12)
+                continue;
+            CHECK(rows[i].sym == rows[j].sym, "keycodes 0x%X and 0x%X both give 0x%02X",
+                  (unsigned)rows[i].sym, (unsigned)rows[j].sym, a);
+        }
 }
 
 static void test_events(void)

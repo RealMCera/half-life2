@@ -548,29 +548,28 @@ void xbox_worker_stack_free(int slot)
  * DISPATCH_LEVEL, and putting them on the guest core would queue a DPC
  * behind a main thread spinning in its frame wait, the latency the
  * DPC-on-raise work (kernel_hal.c) removed. The GPU and the audio keep
- * their cores for the same reason. RECOMP_GUEST_CPUS=all is the A/B, =one
- * the default spelled out (for a game's RECOMP_ENV_GAME_DEFAULTS), =<n>
- * picks the core (cpu 0 takes most of the IRQ work on Linux).
+ * their cores for the same reason.
+ *
+ * Opt-in, like the one-CPU gate it was made beside: RECOMP_GUEST_CPUS=one
+ * pins to the lowest core the process may use, =<n> picks the core (cpu 0
+ * takes most of the IRQ work on Linux). Unset or =all, the title's threads
+ * go wherever the host scheduler puts them.
  */
 DWORD_PTR xbox_GuestCpuMask(void)
 {
     const char *mode = recomp_env(RENV_GUEST_CPUS);
     DWORD_PTR proc = 0, sys = 0;
 
-    if (mode && !strcmp(mode, "all"))
+    if (!mode || !*mode || !strcmp(mode, "all"))
         return 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc)
         return 0;
-    /* =one: the default, spelled out (a game states it in its
-     * RECOMP_ENV_GAME_DEFAULTS). =<n>: that core, when the process may use
-     * it. */
-    if (mode && !strcmp(mode, "one"))
-        mode = NULL;
-    if (mode && *mode >= '0' && *mode <= '9') {
+    /* =<n>: that core, when the process may use it; =one: the lowest. */
+    if (*mode >= '0' && *mode <= '9') {
         long n = strtol(mode, NULL, 10);
         if (n >= 0 && n < (long)(8 * sizeof proc) && (proc & ((DWORD_PTR)1 << n)))
             return (DWORD_PTR)1 << n;
-        fprintf(stderr, "  [KERNEL] guest_cpus=%s: not a core the process may"
+        fprintf(stderr, "  [KERNEL] RECOMP_GUEST_CPUS=%s: not a core the process may"
                         " use (mask %#lx); taking the lowest\n", mode,
                 (unsigned long)proc);
     }
@@ -604,8 +603,8 @@ void xbox_GuestThreadPin(const char *role)
     if (!announced) {
         announced = 1;
         fprintf(stderr, "  [KERNEL] guest threads on one host core (cpu %d),"
-                        " as on the console (RECOMP_GUEST_CPUS=all: every core)\n",
-                core);
+                        " as on the console (RECOMP_GUEST_CPUS=%s)\n",
+                core, recomp_env(RENV_GUEST_CPUS));
         fflush(stderr);
     }
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "guest thread %s on cpu %d",

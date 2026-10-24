@@ -1,9 +1,10 @@
 """pushfd after cmp, sub, add, and, or and xor pushes the flags the CPU would.
 
-pushfd rebuilds CF/PF/ZF/SF/OF from the instruction that last set them, one
-jcc rule per flag. cmp had no rule for OF and sub/add/and/or/xor none for OF
-or PF, so the pushed word read those as 0: signed 8-bit -128 - 1 wraps to 127
-and sets OF, and `cmp al, bl; pushfd` saved it clear.
+pushfd publishes CF/PF/ZF/SF/OF into g_eflags through publish_flags, which
+reads each flag through the rule a jcc on it uses, and pushes that image. A
+flag with no rule would keep a stale value: before the OF/PF rules for these
+setters, signed 8-bit -128 - 1 (which wraps to 127 and sets OF) went out
+of `cmp al, bl; pushfd` with OF clear.
 
 The text tests pin the rules. The runtime test lifts `<op> dst, src; pushfd;
 pop ecx` at 8, 16 and 32 bits, compiles it against the real
@@ -64,7 +65,7 @@ class TextTest(unittest.TestCase):
                     self.assertNotIn("RECOMP_UNIMPL", out)
                     self.assertNotIn("pushfd (flags)", lifter.unimplemented)
                     self.assertIn("0x800u", out)    # OF
-                    self.assertIn("0x004u", out)    # PF
+                    self.assertIn("0x4u", out)      # PF
 
     def test_jo_after_cmp_reads_the_snapshot(self):
         jo = _insn("jo", addr=4)

@@ -348,6 +348,34 @@ static void test_case_fallback(void)
                "a missing directory keeps the rest as written");
 }
 
+/* Saves only in the game dir stay there (a build before the UDATA/TDATA
+ * rules put them there); the cache never does, even with a CACHE left in
+ * the game dir by such a build. */
+static void test_legacy_saves(void)
+{
+    char want[1200], dir[700];
+
+    printf("saves left in the game dir\n");
+    recomp_env_set(RENV_SAVE_DIR, NULL);
+    snprintf(dir, sizeof dir, "%s" SEP "UDATA", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "TDATA", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "CACHE", g_game);
+    make_dir(dir);
+    xbox_path_init(g_game, g_save);
+
+    snprintf(want, sizeof want, "%s" SEP "UDATA" SEP "4541005b", g_game);
+    expect("\\Device\\Harddisk0\\Partition1\\UDATA\\4541005b", want,
+           "UDATA only in the game dir stays there");
+    snprintf(want, sizeof want, "%s" SEP "TDATA" SEP "4541005b", g_game);
+    expect("\\Device\\Harddisk0\\Partition1\\TDATA\\4541005b", want,
+           "TDATA only in the game dir stays there");
+    snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache08.bin", g_save);
+    expect("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin", want,
+           "CACHE still goes to <save>/TitleCache");
+}
+
 int main(int argc, char **argv)
 {
     /* argv[1]: write the report there (Proton drops a console exe's stdout) */
@@ -378,6 +406,7 @@ int main(int argc, char **argv)
     test_default_root();
     test_save_dir_root();
     test_case_fallback();
+    test_legacy_saves();
     remove_root();
 
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");

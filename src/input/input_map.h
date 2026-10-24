@@ -1,145 +1,189 @@
-/**
- * xbox_input -- host controller -> Xbox (Duke) gamepad mapping.
+/*
+ * input_map -- what a host key, mouse button or pad control means to an Xbox
+ * controller.
  *
- * One table (xbox_input_map[]) says which host control drives which field of
- * the guest's XBOX_GAMEPAD, and both host backends go through it: the XInput
- * backend (Windows, Proton) via xbox_InputMapXInput() and the SDL3
- * gamepad backend via xbox_InputMapSdl(). The helpers are pure (no
- * platform calls, no SDL or XInput headers), so tests/input_map checks every
- * row on every host, and checks the table in src/input/README.md against
- * xbox_InputMapReadmeRow() so the documentation cannot drift from the code.
+ * Pure arithmetic and text: no Windows, no SDL, no mutable globals. A host
+ * layer reads the devices and hands normalized values to this; keeping the
+ * rules here is what lets a test check binding resolution and deadzones
+ * without a pad on the desk. keyboard.c (RECOMP_KEYBOARD) is the first
+ * adopter: its key map is resolved here.
  *
- * Conventions (the Duke's, which the title was tuned for):
- *   - digital face buttons and shoulders become 255 (held) or 0 in
- *     bAnalogButtons[]; the console's pressure sensitivity is not available
- *     from a modern pad;
- *   - White = left shoulder (LB), Black = right shoulder (RB), Microsoft's own
- *     Xbox 360 convention and xemu's default;
- *   - triggers are 0..255 (XInput natively; SDL's 0..32767 shifted right 7);
- *   - sticks are signed 16-bit, up and right positive; SDL's Y axis points
- *     down and is inverted as (-1 - v), so -32768 cannot overflow;
- *   - no deadzone unless RECOMP_PAD_DEADZONE=N is set (the title applies its
- *     own); see xbox_InputApplyDeadzone().
+ * Three pieces:
+ *
+ *   Keyboard and mouse bindings. Each Xbox control has up to four host inputs
+ *   bound to it, written as a comma separated list of names ("L, Space,
+ *   Mouse1"). A bound key is a Windows virtual-key code, the same codes as
+ *   the key table in keyboard.h, so the held-key array is that table and
+ *   there is one key space on every host. The names are the persistence
+ *   format; the codes are what the writers record.
+ *
+ *   Pad remapping. Each of the pad's sixteen digital and trigger controls
+ *   takes its value from one named physical control (the names are SDL's
+ *   positional ones: south is the bottom face button, an Xbox A, a PlayStation
+ *   cross), and each stick can come from either physical stick or from none.
+ *
+ *   Deadzones. A radial deadzone for sticks that rescales so the stick still
+ *   reaches full deflection, and a threshold for triggers.
+ *
+ * Every output is an XBOX_GAMEPAD (xinput_xbox.h): wButtons with the
+ * XBOX_GAMEPAD_* bits, bAnalogButtons[] at the XBOX_BUTTON_* indices, and the
+ * sticks with Y positive upwards.
  */
 #ifndef XBOX_INPUT_MAP_H
 #define XBOX_INPUT_MAP_H
 
-#include <stddef.h>
 #include <stdint.h>
-#include "xinput_xbox.h"
+#include "keyboard.h"     /* XBOX_VK_*, and XBOX_GAMEPAD through xinput_xbox.h */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* XInput's XINPUT_GAMEPAD, byte for byte, so the helper builds without
- * <xinput.h>. The Windows backend checks the layout with a static assert. */
-typedef struct XBOX_HOST_XINPUT_GAMEPAD {
-    uint16_t wButtons;
-    uint8_t  bLeftTrigger;
-    uint8_t  bRightTrigger;
-    int16_t  sThumbLX;
-    int16_t  sThumbLY;
-    int16_t  sThumbRX;
-    int16_t  sThumbRY;
-} XBOX_HOST_XINPUT_GAMEPAD;
+/* Pointer contract: structs, arrays and output pointers must be non-NULL unless
+ * a function explicitly documents otherwise. Independent caller-owned states
+ * may be used concurrently. Coordinate access to a shared mutable state. */
 
-/* XINPUT_GAMEPAD_* button bits (xinput.h). */
-#define XBOX_XI_DPAD_UP        0x0001
-#define XBOX_XI_DPAD_DOWN      0x0002
-#define XBOX_XI_DPAD_LEFT      0x0004
-#define XBOX_XI_DPAD_RIGHT     0x0008
-#define XBOX_XI_START          0x0010
-#define XBOX_XI_BACK           0x0020
-#define XBOX_XI_LEFT_THUMB     0x0040
-#define XBOX_XI_RIGHT_THUMB    0x0080
-#define XBOX_XI_LEFT_SHOULDER  0x0100
-#define XBOX_XI_RIGHT_SHOULDER 0x0200
-#define XBOX_XI_A              0x1000
-#define XBOX_XI_B              0x2000
-#define XBOX_XI_X              0x4000
-#define XBOX_XI_Y              0x8000
+/* The Xbox controller's inputs, in the order settings list them. The first
+ * eight are the wButtons bits in bit order (XBOX_GAMEPAD_DPAD_UP is bit 0),
+ * the next eight the bAnalogButtons[] indices in order (INPUT_A is
+ * XBOX_BUTTON_A); these sixteen are what a pad's physical controls can be
+ * remapped onto. */
+typedef enum InputControl {
+    INPUT_DPAD_UP, INPUT_DPAD_DOWN, INPUT_DPAD_LEFT, INPUT_DPAD_RIGHT,
+    INPUT_START, INPUT_BACK, INPUT_LEFT_THUMB, INPUT_RIGHT_THUMB,
+    INPUT_A, INPUT_B, INPUT_X, INPUT_Y, INPUT_BLACK, INPUT_WHITE,
+    INPUT_LEFT_TRIGGER, INPUT_RIGHT_TRIGGER,
+    /* Keyboard only: the sticks as four keys each. */
+    INPUT_LSTICK_UP, INPUT_LSTICK_DOWN, INPUT_LSTICK_LEFT, INPUT_LSTICK_RIGHT,
+    INPUT_RSTICK_UP, INPUT_RSTICK_DOWN, INPUT_RSTICK_LEFT, INPUT_RSTICK_RIGHT,
+    INPUT_CONTROL_COUNT
+} InputControl;
+#define INPUT_PAD_CONTROL_COUNT 16
 
-/* SDL3's SDL_GamepadButton and SDL_GamepadAxis values, the same numbers
- * SDL2's controller enums had; the SDL backend checks them with static
- * asserts. SDL3 names the face buttons by position (SOUTH, EAST, WEST,
- * NORTH), which are the Xbox A, B, X and Y places the Duke mapping wants, so
- * the names here keep the Xbox letters. */
+/* Names use ASCII case-insensitive matching. The setting key for a control
+ * ("dpad_up", "left_stick_left"), or NULL. */
+const char *xbox_InputMap_ControlName(int control);
+/* The control for a setting key, or -1. */
+int xbox_InputMap_ControlFromName(const char *name);
+
+/* Add `src` to `dst`: buttons are ORed, analog buttons take the larger, and a
+ * stick takes whichever of the two is deflected further (the destination wins
+ * ties). */
+void xbox_InputMap_PadMerge(XBOX_GAMEPAD *dst, const XBOX_GAMEPAD *src);
+
+/* ---- keyboard and mouse -------------------------------------------------- */
+
+/* The held-key array KeysResolve reads: one entry per virtual-key code, the
+ * same 256 as keyboard.h's table. */
+#define INPUT_KEY_COUNT 256
+#define INPUT_BINDINGS_PER_CONTROL 4
+
+/* How a stick built from keys handles two directions at once. */
 enum {
-    XBOX_SDL_BUTTON_A = 0, XBOX_SDL_BUTTON_B, XBOX_SDL_BUTTON_X,
-    XBOX_SDL_BUTTON_Y, XBOX_SDL_BUTTON_BACK, XBOX_SDL_BUTTON_GUIDE,
-    XBOX_SDL_BUTTON_START, XBOX_SDL_BUTTON_LEFTSTICK,
-    XBOX_SDL_BUTTON_RIGHTSTICK, XBOX_SDL_BUTTON_LEFTSHOULDER,
-    XBOX_SDL_BUTTON_RIGHTSHOULDER, XBOX_SDL_BUTTON_DPAD_UP,
-    XBOX_SDL_BUTTON_DPAD_DOWN, XBOX_SDL_BUTTON_DPAD_LEFT,
-    XBOX_SDL_BUTTON_DPAD_RIGHT,
-    XBOX_SDL_BUTTON_COUNT
-};
-enum {
-    XBOX_SDL_AXIS_LEFTX = 0, XBOX_SDL_AXIS_LEFTY, XBOX_SDL_AXIS_RIGHTX,
-    XBOX_SDL_AXIS_RIGHTY, XBOX_SDL_AXIS_TRIGGERLEFT,
-    XBOX_SDL_AXIS_TRIGGERRIGHT,
-    XBOX_SDL_AXIS_COUNT
+    /* Each axis at full deflection: a diagonal is (32767, 32767). What
+     * keyboard.c has always done, and the default of a zeroed InputBindings. */
+    INPUT_DIAGONAL_FULL = 0,
+    /* A unit circle: a diagonal is (23169, 23169), so it is no faster than a
+     * straight line. */
+    INPUT_DIAGONAL_ROUND = 1,
 };
 
-/* A snapshot of an SDL gamepad: button[i] = SDL_GetGamepadButton(i),
- * axis[i] = SDL_GetGamepadAxis(i), indexed by the enums above. */
-typedef struct XBOX_HOST_SDL_GAMEPAD {
-    uint8_t button[XBOX_SDL_BUTTON_COUNT];
-    int16_t axis[XBOX_SDL_AXIS_COUNT];
-} XBOX_HOST_SDL_GAMEPAD;
+typedef struct InputBindings {
+    uint8_t key[INPUT_CONTROL_COUNT][INPUT_BINDINGS_PER_CONTROL];  /* VK codes, 1..255 */
+    uint8_t count[INPUT_CONTROL_COUNT];
+    uint8_t diagonal;                       /* INPUT_DIAGONAL_* */
+} InputBindings;
 
-/* What a row writes in the guest's XBOX_GAMEPAD. */
-enum xbox_map_kind {
-    XBOX_MAP_DIGITAL,   /* wButtons |= guest */
-    XBOX_MAP_ANALOG,    /* bAnalogButtons[guest] = 255 while held */
-    XBOX_MAP_TRIGGER,   /* bAnalogButtons[guest] = trigger, 0..255 */
-    XBOX_MAP_STICK      /* stick axis guest (0 LX, 1 LY, 2 RX, 3 RY) */
-};
+/* The virtual-key code for a key name, case-insensitive ("a", "space",
+ * "numpad4", "mouse1", "lshift"), or -1 if there is no such key. Aliases
+ * ("return", "esc", "control") give the same code as the name they stand for. */
+int xbox_InputMap_KeyFromName(const char *name);
 
-/* XInput analog sources (for TRIGGER and STICK rows). */
-enum { XBOX_XI_SRC_LT, XBOX_XI_SRC_RT, XBOX_XI_SRC_LX, XBOX_XI_SRC_LY,
-       XBOX_XI_SRC_RX, XBOX_XI_SRC_RY };
+/* Immutable canonical name for a virtual-key code, or NULL when the code has
+ * no name. Safe across threads. */
+const char *xbox_InputMap_KeyName(int vk);
 
-typedef struct xbox_input_map_row {
-    const char *host;        /* host control, as documented */
-    uint8_t     kind;        /* enum xbox_map_kind */
-    uint16_t    guest;       /* wButtons bit, bAnalogButtons index or axis */
-    uint16_t    xinput;      /* XInput bit (DIGITAL/ANALOG) or XBOX_XI_SRC_* */
-    int8_t      sdl;         /* XBOX_SDL_BUTTON_* or XBOX_SDL_AXIS_* */
-    int8_t      sdl_invert;  /* STICK: SDL axis points the other way */
-    const char *guest_name;  /* guest field, as documented */
-    const char *value;       /* guest value, as documented */
-} xbox_input_map_row;
+/* Parse "L, Space" into `control`'s bindings, replacing them. "none" or an
+ * empty string clears it. Names that are not keys are skipped and counted in
+ * the return value; at most four keys are kept. Returns the number of names
+ * rejected, or -1 for an invalid binding pointer/control. No fixed input-text
+ * limit. */
+int xbox_InputMap_BindingsParse(InputBindings *b, int control, const char *text);
 
-extern const xbox_input_map_row xbox_input_map[];
-extern const size_t xbox_input_map_count;
+/* The bindings of `control` as text that xbox_InputMap_BindingsParse reads back. */
+const char *xbox_InputMap_BindingsFormat(const InputBindings *b, int control,
+                                         char *buf, int size);
 
-/* Map one host pad to the guest gamepad (every field of *out is written).
- * Sticks go through xbox_InputApplyDeadzone() with xbox_InputDeadzone(). */
-void xbox_InputMapXInput(const XBOX_HOST_XINPUT_GAMEPAD *in, XBOX_GAMEPAD *out);
-void xbox_InputMapSdl(const XBOX_HOST_SDL_GAMEPAD *in, XBOX_GAMEPAD *out);
+/* The pad a set of held keys makes. `down` has INPUT_KEY_COUNT entries indexed
+ * by virtual-key code, non-zero for held. Digital controls set their wButtons
+ * bit, analog ones read 255, and stick keys deflect fully, opposite keys
+ * cancelling; two directions at once follow b->diagonal. */
+void xbox_InputMap_KeysResolve(const InputBindings *b, const uint8_t *down,
+                               XBOX_GAMEPAD *out);
 
-/* Radial deadzone of dz (0..32767) on one stick, rescaled so the edge of the
- * zone reads 0 and full deflection still reads full: |v| <= dz -> (0, 0),
- * otherwise the magnitude m becomes (m - dz) / (32767 - dz) * 32767 along the
- * same direction (m capped at 32767 for the scale, so corners and -32768 are
- * unchanged). dz <= 0 is the identity. */
-void xbox_InputApplyDeadzone(SHORT *x, SHORT *y, int dz);
+/* ---- pad remapping and deadzones ------------------------------------------ */
 
-/* The deadzone the helpers apply: RECOMP_PAD_DEADZONE (0..32767, default 0),
- * read once. xbox_InputSetDeadzone overrides it (tests; -1 = back to env). */
-int  xbox_InputDeadzone(void);
-void xbox_InputSetDeadzone(int dz);
+/* The physical controls a pad has, SDL's positional names. */
+typedef enum InputSource {
+    INPUT_SRC_NONE,
+    INPUT_SRC_SOUTH, INPUT_SRC_EAST, INPUT_SRC_WEST, INPUT_SRC_NORTH,
+    INPUT_SRC_BACK, INPUT_SRC_GUIDE, INPUT_SRC_START,
+    INPUT_SRC_LEFT_STICK_CLICK, INPUT_SRC_RIGHT_STICK_CLICK,
+    INPUT_SRC_LEFT_SHOULDER, INPUT_SRC_RIGHT_SHOULDER,
+    INPUT_SRC_DPAD_UP, INPUT_SRC_DPAD_DOWN, INPUT_SRC_DPAD_LEFT, INPUT_SRC_DPAD_RIGHT,
+    INPUT_SRC_MISC1, INPUT_SRC_TOUCHPAD,
+    INPUT_SRC_PADDLE1, INPUT_SRC_PADDLE2, INPUT_SRC_PADDLE3, INPUT_SRC_PADDLE4,
+    INPUT_SRC_LEFT_TRIGGER, INPUT_SRC_RIGHT_TRIGGER,
+    /* A stick pushed one way, 0 to full. */
+    INPUT_SRC_LSTICK_UP, INPUT_SRC_LSTICK_DOWN, INPUT_SRC_LSTICK_LEFT, INPUT_SRC_LSTICK_RIGHT,
+    INPUT_SRC_RSTICK_UP, INPUT_SRC_RSTICK_DOWN, INPUT_SRC_RSTICK_LEFT, INPUT_SRC_RSTICK_RIGHT,
+    INPUT_SRC_COUNT
+} InputSource;
 
-/* Line i of the README's mapping table, as Markdown (no newline): 0 is the
- * header, 1 the separator, 2.. the rows of xbox_input_map[] in order.
- * Returns the length written, or 0 past the end of the table. */
-size_t xbox_InputMapReadmeRow(size_t i, char *buf, size_t size);
+const char *xbox_InputMap_SourceName(int source);
+int xbox_InputMap_SourceFromName(const char *name);      /* -1 if unknown */
 
-/* The README markers the table sits between. */
-#define XBOX_INPUT_MAP_README_BEGIN "<!-- input_map:begin (generated from src/input/input_map.c; tests/input_map checks it) -->"
-#define XBOX_INPUT_MAP_README_END   "<!-- input_map:end -->"
+/* The adapter must populate directional sources explicitly if they are used
+ * as bindings; stick axes are not automatically copied into src[].
+ * Missing sources are zero. Negative src[] values are treated as zero.
+ * Digital/face-button mappings use button_threshold (clamped to 0..100%).
+ */
+
+/* What the host read from a pad before any mapping. Every source is 0 to
+ * 32767 (a button is 0 or 32767); the sticks are signed, Y positive upwards. */
+typedef struct InputRaw {
+    int16_t src[INPUT_SRC_COUNT];
+    int16_t lx, ly, rx, ry;
+} InputRaw;
+
+enum { INPUT_STICK_LEFT, INPUT_STICK_RIGHT, INPUT_STICK_NONE };
+
+typedef struct InputPadMap {
+    uint8_t source[INPUT_PAD_CONTROL_COUNT];   /* InputSource for each control */
+    uint8_t left_stick;                        /* INPUT_STICK_*: which physical stick */
+    uint8_t right_stick;
+    uint8_t deadzone_left;                     /* percent, 0-95 */
+    uint8_t deadzone_right;
+    uint8_t trigger_threshold;                 /* percent, 0-95 */
+    uint8_t button_threshold;                  /* percent a trigger/stick must reach to count as a button */
+} InputPadMap;
+
+/* The identity mapping: a pad as the Xbox pad it is shaped like, with the
+ * shoulders as Black (left) and White (right) like xinput_device.c.
+ * Deadzones 15%, trigger threshold 5%, an axis counts as a button at 50%. */
+void xbox_InputMap_PadMapDefaults(InputPadMap *m);
+
+/* Apply `m` to a raw pad. */
+void xbox_InputMap_PadMap(const InputPadMap *m, const InputRaw *raw, XBOX_GAMEPAD *out);
+
+/* A radial deadzone (percent clamped to 0..95): a stick inside `deadzone_pct` of full deflection reads as
+ * centred, and the range beyond it is stretched so full deflection is still
+ * full. The direction is preserved. */
+void xbox_InputMap_ApplyStick(int x, int y, int deadzone_pct, SHORT *ox, SHORT *oy);
+
+/* A trigger threshold is clamped to 0..95. A trigger value (0-255) below `threshold_pct` of the range reads 0; the rest
+ * is stretched to 0-255. */
+uint8_t xbox_InputMap_ApplyTrigger(int value, int threshold_pct);
 
 #ifdef __cplusplus
 }

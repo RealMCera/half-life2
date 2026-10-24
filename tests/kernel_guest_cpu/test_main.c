@@ -8,7 +8,8 @@
  * black. The cases:
  *  - the mask is one core, inside the process's set, and the same on every
  *    call, so a worker created from any core lands with the main thread;
- *  - RECOMP_GUEST_CPUS=all is no mask at all, =<n> is that core;
+ *  - unset (the default) and RECOMP_GUEST_CPUS=all are no mask at all, so
+ *    stock threads are not pinned; =one is the lowest core, =<n> that core;
  *  - where the host has thread affinity, guest-main and a guest-worker,
  *    logged with their routines, both run on that one core, and a thread
  *    that does not pin itself keeps the process's mask whether it was
@@ -123,9 +124,13 @@ int main(void)
     HANDLE th;
 
     recomp_env_set(RENV_GUEST_CPUS, NULL);
+    CHECK(xbox_GuestCpuMask() == 0, "unset, nothing is pinned (opt-in)");
+    recomp_env_set(RENV_GUEST_CPUS, "");
+    CHECK(xbox_GuestCpuMask() == 0, "empty, nothing is pinned");
+    recomp_env_set(RENV_GUEST_CPUS, "one");
     mask = xbox_GuestCpuMask();
     again = xbox_GuestCpuMask();
-    CHECK(mask != 0, "the default is one core, got no mask");
+    CHECK(mask != 0, "=one is one core, got no mask");
     CHECK((mask & (mask - 1)) == 0, "the mask is one core: %#lx", (unsigned long)mask);
     CHECK(mask == again, "the choice is fixed: %#lx then %#lx",
           (unsigned long)mask, (unsigned long)again);
@@ -134,7 +139,7 @@ int main(void)
           (unsigned long)mask, (unsigned long)proc);
 
     recomp_env_set(RENV_GUEST_CPUS, "all");
-    CHECK(xbox_GuestCpuMask() == 0, "guest_cpus=all leaves every core");
+    CHECK(xbox_GuestCpuMask() == 0, "RECOMP_GUEST_CPUS=all leaves every core");
     {
         /* =<n>: the highest core of the process, or the lowest when the
          * number is not one the process may use. */
@@ -144,13 +149,14 @@ int main(void)
         snprintf(num, sizeof num, "%d", hi);
         recomp_env_set(RENV_GUEST_CPUS, num);
         CHECK(xbox_GuestCpuMask() == ((DWORD_PTR)1 << hi),
-              "guest_cpus=%s is that core: %#lx", num,
+              "RECOMP_GUEST_CPUS=%s is that core: %#lx", num,
               (unsigned long)xbox_GuestCpuMask());
         recomp_env_set(RENV_GUEST_CPUS, "63");
         CHECK(xbox_GuestCpuMask() == mask || proc == (DWORD_PTR)-1,
-              "guest_cpus=63 falls back to the lowest core");
+              "RECOMP_GUEST_CPUS=63 falls back to the lowest core");
     }
-    recomp_env_set(RENV_GUEST_CPUS, NULL);
+    /* The pin cases below, with the pin asked for. */
+    recomp_env_set(RENV_GUEST_CPUS, "one");
 
     th = CreateThread(NULL, 0, early, NULL, 0, NULL);
     CHECK(th != NULL, "early thread");

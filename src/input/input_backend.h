@@ -4,7 +4,7 @@
  * elsewhere). Internal to src/input and its tests.
  *
  * input_core.c owns the per-port connection cache and the probe backoff;
- * a backend only answers "what is on port N now". tests/input_map installs
+ * a backend only answers "what is on port N now". tests/pad_map installs
  * a fake backend with xbox_InputSetBackend() and counts the calls.
  */
 #ifndef XBOX_INPUT_BACKEND_H
@@ -22,7 +22,7 @@ typedef struct xbox_input_backend {
     /* Called once from xbox_InputInit(); may be NULL. */
     void  (*init)(void);
     /* Read port's pad. ERROR_SUCCESS with *out filled (already mapped
-     * through input_map), or ERROR_DEVICE_NOT_CONNECTED. */
+     * through pad_map), or ERROR_DEVICE_NOT_CONNECTED. */
     DWORD (*get_state)(DWORD port, XBOX_INPUT_STATE *out);
     /* Set port's motors. */
     DWORD (*set_state)(DWORD port, const XBOX_VIBRATION *vib);

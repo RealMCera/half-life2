@@ -1158,7 +1158,10 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
         return prev ? prev : mask;
     }
 #else
-    return 0;   /* no thread affinity on this host */
+    /* No thread affinity on this host: macOS has only affinity tags, a
+     * hint, so the guest threads' one-core pin (RECOMP_GUEST_CPUS) does
+     * nothing here and returns 0 as a failed call would. */
+    return 0;
 #endif
 }
 

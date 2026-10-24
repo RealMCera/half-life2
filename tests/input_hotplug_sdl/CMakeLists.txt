@@ -15,7 +15,7 @@ add_executable(input_hotplug_sdl_test
     test_main.c
     ${INPUT_SRC}/xinput_device.c
     ${INPUT_SRC}/input_core.c
-    ${INPUT_SRC}/input_map.c
+    ${INPUT_SRC}/pad_map.c
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
     ${INPUT_SRC}/input_names.c
