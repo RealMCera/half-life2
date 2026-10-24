@@ -463,6 +463,7 @@ int main(void)
         MEM32(THUNK_VA + 4u * (uint32_t)i) = 0x80000000u | k_ordinals[i];
 
     recomp_env_set(RENV_GUEST_LOCK, "1");
+    recomp_env_set(RENV_DISPATCH_GATE, "1");
     recomp_env_set(RENV_IRQ_SAFE_MS, "20");
     xbox_GuestCpuReloadConfig();
     xbox_IrqReloadConfig();

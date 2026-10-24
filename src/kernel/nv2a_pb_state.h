@@ -132,9 +132,10 @@ struct nv2a_pb_gpu {
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
     /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL: (max << 16) | min, both inclusive,
-     * as xemu reads them; clear_rect_set is 0 until the title sends one.
-     * Every path clears this rect alone once set, else the clip
-     * (nv2a_clear_box). */
+     * as xemu reads them. clear_rect_set: bit 0 horizontal, bit 1 vertical
+     * sent; every path clears this rect alone once both have been, else the
+     * clip (nv2a_clear_box): one half alone would read the other as 0 and
+     * cover a single row or column. */
     uint32_t clear_rect_h, clear_rect_v;
     int      clear_rect_set;
     uint32_t clears, unhandled_total;

@@ -1,5 +1,5 @@
 # Xbox Input → XInput Compatibility Layer
-#   input_map.c     the host -> Duke mapping table and pure helpers
+#   pad_map.c       the host pad -> Duke mapping table and pure helpers
 #   input_core.c    public API, connection cache, probe backoff
 #   xinput_device.c host backends (XInput on Windows, SDL3 elsewhere)
 #   keyboard.c      the key table, the compiled-in key map, the runtime
@@ -12,7 +12,7 @@
 #   mouse_sdl.c     the SDL window's mouse events and relative mode (POSIX)
 
 add_library(xbox_input STATIC
-    input_map.c
+    pad_map.c
     input_core.c
     xinput_device.c
     keyboard.c
@@ -22,6 +22,11 @@ add_library(xbox_input STATIC
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# The mapping rules (bindings, remapping, deadzones), also buildable alone;
+# keyboard.c resolves its key map through them.
+add_subdirectory(mapping)
+target_link_libraries(xbox_input PUBLIC xbox_input_map)
 
 if(WIN32)
     # mingw-w64's libxinput.a imports XINPUT1_3.dll, the DirectX June 2010
@@ -46,12 +51,16 @@ endif()
 
 # The mapping table, deadzone and connection cache, against a fake backend
 # (every host, no device needed).
-add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_map
-                 ${CMAKE_CURRENT_BINARY_DIR}/input_map)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pad_map
+                 ${CMAKE_CURRENT_BINARY_DIR}/pad_map)
 # The key map and its README table (every host, no SDL), and the SDL key
 # and focus rules against synthetic events (POSIX).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard
                  ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard)
+# The key map through the mapping rules, against a frozen copy of the old
+# resolver, and the Win32 key and mouse message decoding (every host).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard_map
+                 ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard_map)
 # The names, the bindings, the composer, the mouse model and capture, the
 # injector and the port-0 merge (every host, no SDL, no window).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_bindings

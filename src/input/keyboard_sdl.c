@@ -19,6 +19,7 @@ _Static_assert(SDLK_A == 'a' && SDLK_Z == 'z' && SDLK_0 == '0' && SDLK_9 == '9',
                "SDL letter and digit keycodes are their ASCII codes");
 _Static_assert(SDLK_RETURN == '\r' && SDLK_BACKSPACE == '\b',
                "SDL Return and Backspace keycodes are their ASCII codes");
+_Static_assert(SDLK_F12 - SDLK_F1 == 11, "SDL F1..F12 keycodes are one run");
 
 /* The keys every host names the same way: letters, digits, the F-keys, the
  * named keys and the keypad. The sides of Shift, Ctrl and Alt and keypad

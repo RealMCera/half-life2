@@ -7,16 +7,18 @@ function popped its caller's saved registers instead of its own: an EFLAGS.ID
 + CPUID feature probe returned with the caller's callee-saved registers
 swapped.
 
+pushfd pushes the g_eflags image after writing the tracked arithmetic flags
+into it (publish_flags); popfd loads it.
+
 The text tests pin what is emitted. The runtime tests compile the lifted probe
 against the header's own PUSH32/POP32/recomp_pushfd/recomp_popfd and the
 runtime's xbox_Cpuid, and run it, because the property that matters is
 behavioural: stack balanced, saved registers restored, the ID bit writable,
-and MMX reported only when RECOMP_DEBUG=cpuid_mmx asks for it.
+and MMX/FXSR/SSE reported unless RECOMP_CPUID_NO_SIMD=1 masks them.
 
 The runtime half skips itself if no C compiler is on PATH.
 """
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -24,10 +26,9 @@ import unittest
 
 from .disasm import BasicBlock, Disassembler, Instruction, Operand
 from .lifter import Lifter, lift_basic_block, _EFLAGS_PRESERVE
-from .translator import FunctionTranslator
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-HEADER = os.path.join(ROOT, "templates", "runtime", "recomp_types.h")
+RUNTIME = os.path.join(ROOT, "templates", "runtime")
 HAL = os.path.join(ROOT, "src", "kernel", "kernel_hal.c")
 
 # A hand-written EFLAGS.ID + CPUID feature probe: save ebx/esi, toggle
@@ -86,26 +87,6 @@ def _probe_c():
     return "\n".join(body), lifter.unimplemented
 
 
-def _header_piece(start_pat, end_pat="\n}\n"):
-    src = open(HEADER, encoding="utf-8").read()
-    m = re.search(start_pat, src)
-    assert m, start_pat
-    end = src.index(end_pat, m.start()) + len(end_pat)
-    return src[m.start():end]
-
-
-def _macro(name):
-    lines = open(HEADER, encoding="utf-8").read().splitlines()
-    for i, line in enumerate(lines):
-        if re.match(r"#define\s+%s\b" % re.escape(name), line):
-            out = [line]
-            while out[-1].rstrip().endswith("\\"):
-                i += 1
-                out.append(lines[i])
-            return "\n".join(out)
-    raise AssertionError(f"{name} not in {HEADER}")
-
-
 def _cpuid_c():
     src = open(HAL, encoding="utf-8").read()
     start = src.index("void xbox_Cpuid(")
@@ -119,14 +100,15 @@ class TextTest(unittest.TestCase):
 
     def test_pushfd_without_tracked_flags_reads_g_eflags(self):
         out = Lifter().lift_instruction(_insn("pushfd"))
-        self.assertEqual(out, ["PUSH32(esp, recomp_pushfd(0u, 0u)); /* pushfd */"])
+        self.assertEqual(out, ["PUSH32(esp, recomp_pushfd()); /* pushfd */"])
 
     def test_pushfd_rebuilds_flags_from_the_tracked_setter(self):
         cmp_ = _insn("cmp", [_reg("eax"), _reg("ebx")])
         _, out, _ = _lift_block([cmp_, _insn("pushfd")])
-        self.assertIn("recomp_pushfd(0x8D5u, ", out)
-        self.assertIn("CMP_EQ(_fa, _fb)) ? 0x040u", out)
-        self.assertIn("CMP_B(_fa, _fb)) ? 0x001u", out)
+        self.assertIn("g_eflags = (g_eflags & ~0x8C5u) | ", out)
+        self.assertIn("CMP_EQ(_fa, _fb)) ? 0x40u", out)
+        self.assertIn("CMP_B(_fa, _fb)) ? 0x1u", out)
+        self.assertIn("/* flags for pushfd */\nPUSH32(esp, recomp_pushfd());", out)
 
     def test_popfd_becomes_the_setter_and_jcc_reads_g_eflags(self):
         cmp_ = _insn("cmp", [_reg("eax"), _reg("ebx")])
@@ -134,44 +116,57 @@ class TextTest(unittest.TestCase):
         je.jump_target = 0x40
         _, out, state = _lift_block([cmp_, _insn("popfd"), je])
         self.assertIn("recomp_popfd(_efl);", out)
-        self.assertIn("if ((g_eflags & 0x040u) /* popfd */)",
-                      out)
+        self.assertIn("if ((g_eflags & 0x40u) /* eflags */)", out)
         self.assertNotIn("CMP_EQ", out.split("popfd")[-1])
 
     def test_popfd_flag_state_crosses_a_block(self):
         _, _, state = _lift_block([_insn("popfd")])
-        self.assertEqual(state, ("popfd", []))
+        self.assertEqual(state, ("eflags", []))
         jl = _insn("jl")
         jl.jump_target = 0x80
         stmts, _ = lift_basic_block(Lifter(), BasicBlock(0, [jl]),
                                     flag_state=state)
-        self.assertIn("(((g_eflags >> 7) ^ (g_eflags >> 11)) & 1u)", stmts[0])
+        self.assertIn("(((g_eflags >> 7) & 1u) != ((g_eflags >> 11) & 1u))",
+                      stmts[0])
 
     def test_pushfd_after_popfd_takes_every_flag_from_g_eflags(self):
         _, out, _ = _lift_block([_insn("popfd"), _insn("pushfd")])
-        self.assertIn("recomp_pushfd(0u, 0u)", out)
+        self.assertIn("recomp_pushfd()", out)
+        self.assertNotIn("g_eflags = (g_eflags", out)
 
     def test_popfd_feeds_cf_when_the_function_keeps_one(self):
         _, out, _ = _lift_block([_insn("popfd")], needs_cf=True)
         self.assertIn("_cf = (int)(g_eflags & 1u);", out)
-
-    def test_pushfd_after_add_declares_cf(self):
-        add = _insn("add", [_reg("eax"), _reg("eax")])
-        self.assertTrue(FunctionTranslator._function_needs_cf(
-            [add, _insn("pushfd")]))
-        self.assertFalse(FunctionTranslator._function_needs_cf(
-            [add, _insn("popfd"), _insn("pushfd")]))
 
     def test_pushfd_after_stc_pushes_the_carry(self):
         lifter, out, state = _lift_block([_insn("stc"), _insn("pushfd")],
                                          needs_cf=True)
         self.assertEqual(state, ("__cf_only", []))
         self.assertIn("_cf = 1; /* stc */", out)
-        self.assertIn("((_cf) ? 0x001u : 0u)", out)
+        self.assertIn("g_eflags = (g_eflags & ~0x1u) | ((_cf) ? 0x1u : 0u)", out)
         # The flags stc does not set are not rebuilt, and the site says so.
-        self.assertIn('RECOMP_UNIMPL("pushfd: PF,ZF,SF,OF not rebuilt from '
-                      '__cf_only, read as 0"', out)
+        self.assertIn('RECOMP_UNIMPL("pushfd: PF,ZF,SF,OF not rebuilt after '
+                      'stc/clc/cmc, kept from g_eflags"', out)
         self.assertIn("pushfd (flags)", lifter.unimplemented)
+
+    def test_pushfd_after_popfd_then_stc_has_nothing_missing(self):
+        # popfd put PF/ZF/SF/OF in g_eflags; stc only replaces CF.
+        lifter, out, _ = _lift_block(
+            [_insn("popfd"), _insn("stc"), _insn("pushfd")], needs_cf=True)
+        self.assertIn("g_eflags = (g_eflags & ~0x1u) | ((_cf) ? 0x1u : 0u)", out)
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertNotIn("pushfd (flags)", lifter.unimplemented)
+
+    def test_pushfd_with_no_tracked_setter_says_so(self):
+        # Function entry: nothing tracked, so the image is g_eflags as it is.
+        # The site says so in a comment; no RECOMP_UNIMPL, since the CPUID
+        # probe starts this way (test_no_unimpl_left).
+        lifter, out, _ = _lift_block([_insn("pushfd")])
+        self.assertNotIn("g_eflags = (g_eflags", out)
+        self.assertIn("/* pushfd: no tracked flag setter, pushes g_eflags as "
+                      "last written */", out)
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertNotIn("pushfd (flags)", lifter.unimplemented)
 
     def test_jb_after_clc_reads_cf(self):
         jb = _insn("jb")
@@ -181,18 +176,12 @@ class TextTest(unittest.TestCase):
 
     def test_pushfd_marks_flags_its_setter_cannot_rebuild(self):
         # cmp/sub/add/and/or/xor rebuild every flag
-        # (test_lifter_pushfd_arith.py); adc does not have OF or PF yet.
-        adc = _insn("adc", [_reg("eax"), _reg("ebx")])
-        lifter, out, _ = _lift_block([adc, _insn("pushfd")], needs_cf=True)
-        self.assertIn('RECOMP_UNIMPL("pushfd: PF,OF not rebuilt from adc, '
-                      'read as 0"', out)
+        # (test_lifter_pushfd_arith.py); bt defines only CF.
+        bt = _insn("bt", [_reg("eax"), _reg("ebx")])
+        lifter, out, _ = _lift_block([bt, _insn("pushfd")], needs_cf=True)
+        self.assertIn('RECOMP_UNIMPL("pushfd: PF,ZF,SF,OF not rebuilt after bt, '
+                      'kept from g_eflags"', out)
         self.assertIn("pushfd (flags)", lifter.unimplemented)
-        cmp_ = _insn("cmp", [_reg("eax"), _reg("ebx")])
-        lifter, out, _ = _lift_block([cmp_, _insn("pushfd")])
-        # cmp answers jo/jno exactly (the AND of a test is a cmp against
-        # zero now, so the cmp arm has to), which rebuilds OF here too.
-        self.assertNotIn("RECOMP_UNIMPL", out)
-        self.assertIn("0x800u", out)
 
     def test_cpuid_writes_all_four_and_keeps_the_flags(self):
         out = "".join(Lifter().lift_instruction(_insn("cpuid")))
@@ -208,24 +197,27 @@ class TextTest(unittest.TestCase):
 
 
 HARNESS = r"""
-#include <stdint.h>
+#include "recomp_types.h"
 #include <stdio.h>
 #include <string.h>
-#define RECOMP_TLS
 static uint8_t g_mem[0x10000];
-#define MEM32(a) (*(uint32_t *)(g_mem + ((a) & 0xFFFFu)))
+ptrdiff_t g_xbox_mem_offset;
 RECOMP_TLS int g_df = 0;
 RECOMP_TLS uint32_t g_eflags = 0x00000202u;
-%(push)s
-%(pop)s
-%(writable)s
-%(pushfd)s
-%(popfd)s
-enum { RENV_CPUID_MMX };
-static const char *recomp_env(int id) { (void)id; return CPUID_MMX_ENV; }
+RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
+void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
+/* xbox_Cpuid reads RECOMP_CPUID_NO_SIMD through the recomp_env table; the
+ * test pins its value per build. */
+enum { RENV_CPUID_NO_SIMD };
+static int recomp_env_on(int id)
+{
+    const char *v = CPUID_NO_SIMD_ENV;
+    (void)id;
+    return v && *v && *v != '0';
+}
 %(cpuid)s
 
-static uint32_t eax, ebx, ecx, edx, esi, esp, ebp, g_ebp, g_seh_ebp;
+static uint32_t eax, ebx, ecx, edx, esi, esp, ebp;
 static void probe(void)
 {
     uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0;
@@ -236,6 +228,7 @@ static void probe(void)
 int main(void)
 {
     uint32_t r[4], v, w;
+    g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)g_mem;
     esp = 0x8000; ebp = 0x1234; ecx = 0x11111111u; ebx = 0x22222222u;
     esi = 0x33333333u;
     MEM32(esp - 4) = 0xDEADBEEFu; esp -= 4;     /* return address */
@@ -244,15 +237,16 @@ int main(void)
 
     /* The ID bit, both ways, plus bit 1 and the read-only bits. */
     esp = 0x8000;
-    PUSH32(esp, recomp_pushfd(0u, 0u)); POP32(esp, v);
+    PUSH32(esp, recomp_pushfd()); POP32(esp, v);
     PUSH32(esp, v ^ 0x00200000u); POP32(esp, w); recomp_popfd(w);
-    PUSH32(esp, recomp_pushfd(0u, 0u)); POP32(esp, w);
+    PUSH32(esp, recomp_pushfd()); POP32(esp, w);
     printf("id %%08X\n", v ^ w);
     recomp_popfd(0xFFFFFFFFu);
-    printf("all %%08X df=%%d\n", recomp_pushfd(0u, 0u), g_df);
+    printf("all %%08X df=%%d\n", recomp_pushfd(), g_df);
     recomp_popfd(0);
-    printf("none %%08X df=%%d\n", recomp_pushfd(0u, 0u), g_df);
-    printf("overlay %%08X\n", recomp_pushfd(0x8D5u, 0x041u));
+    printf("none %%08X df=%%d\n", recomp_pushfd(), g_df);
+    g_df = 1;
+    printf("df %%08X\n", recomp_pushfd());
 
     for (v = 0; v < 4; v++) {
         xbox_Cpuid(v, 0, r);
@@ -279,22 +273,16 @@ def _cc():
 @unittest.skipUnless(_cc(), "no C compiler")
 class RuntimeTest(unittest.TestCase):
     @classmethod
-    def _run(cls, mmx_env):
+    def _run(cls, no_simd_env):
         body, _ = _probe_c()
-        src = HARNESS % {
-            "push": _macro("PUSH32"), "pop": _macro("POP32"),
-            "writable": _macro("RECOMP_EFL_WRITABLE"),
-            "pushfd": _header_piece(r"static inline uint32_t recomp_pushfd"),
-            "popfd": _header_piece(r"static inline void recomp_popfd"),
-            "cpuid": _cpuid_c(), "body": body,
-        }
+        src = HARNESS % {"cpuid": _cpuid_c(), "body": body}
         with tempfile.TemporaryDirectory() as d:
             c, exe = os.path.join(d, "t.c"), os.path.join(d, "t")
             open(c, "w").write(src)
-            subprocess.run([_cc(), "-std=c11", "-O1", "-Wall",
+            subprocess.run([_cc(), "-std=c11", "-O1", "-Wall", "-I", RUNTIME,
                             "-Wno-unused-label", "-Wno-unused-variable",
                             "-Wno-parentheses-equality",
-                            f"-DCPUID_MMX_ENV={mmx_env}", "-o", exe, c],
+                            f"-DCPUID_NO_SIMD_ENV={no_simd_env}", "-o", exe, c],
                            check=True)
             out = subprocess.run([exe], check=True, capture_output=True,
                                  text=True).stdout
@@ -302,16 +290,16 @@ class RuntimeTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.masked = cls._run("NULL")
-        cls.mmx = cls._run('"1"')
+        cls.simd = cls._run("NULL")
+        cls.masked = cls._run('"1"')
 
     def test_probe_restores_registers_and_stack(self):
+        self.assertEqual(self.simd["probe"],
+                         "eax=1 ebx=22222222 esi=33333333 esp=8000")
+
+    def test_probe_sees_no_mmx_when_opted_out(self):
         self.assertEqual(self.masked["probe"],
                          "eax=0 ebx=22222222 esi=33333333 esp=8000")
-
-    def test_probe_sees_mmx_only_when_asked(self):
-        self.assertEqual(self.mmx["probe"],
-                         "eax=1 ebx=22222222 esi=33333333 esp=8000")
 
     def test_id_bit_is_writable(self):
         self.assertEqual(self.masked["id"], "00200000")
@@ -320,22 +308,22 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.masked["all"], "00247FD7 df=1")
         self.assertEqual(self.masked["none"], "00000002 df=0")
 
-    def test_pushfd_overlays_the_rebuilt_flags(self):
-        # After popfd(0): CF and ZF from the rebuilt bits, the rest cleared.
-        self.assertEqual(self.masked["overlay"], "00000043")
+    def test_pushfd_takes_df_from_g_df(self):
+        # After popfd(0), std: DF is the only flag set, beside bit 1.
+        self.assertEqual(self.masked["df"], "00000402")
 
     def test_cpuid_leaves(self):
         self.assertEqual(self.masked["vendor"], "GenuineIntel")
         self.assertEqual(self.masked["leaf0"].split()[0], "00000002")
-        self.assertEqual(self.mmx["leaf1"],
+        self.assertEqual(self.simd["leaf1"],
                          "00000683 00000000 00000000 0383F9FF")
         self.assertEqual(self.masked["leaf2"],
-                         "03020101 00000000 00000000 0C040841")
+                         "03020101 00000000 00000000 0C040800")
         # Above the max leaf, extended included: the highest basic leaf.
         self.assertEqual(self.masked["leaf3"], self.masked["leaf2"])
         self.assertEqual(self.masked["ext"], self.masked["leaf2"])
 
-    def test_mmx_is_masked_by_default(self):
+    def test_no_simd_masks_mmx_fxsr_and_sse(self):
         # With MMX goes everything that implies it: FXSR and SSE.
         self.assertEqual(self.masked["leaf1"],
                          "00000683 00000000 00000000 0003F9FF")

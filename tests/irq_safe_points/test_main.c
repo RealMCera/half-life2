@@ -41,7 +41,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
-extern RECOMP_TLS uint32_t g_ebp;
+extern RECOMP_TLS uint32_t g_ebp, g_eflags;
 extern RECOMP_TLS RecompXmm g_xmm0;
 extern uint32_t g_xbox_stack_size;
 extern ptrdiff_t g_xbox_mem_offset;
@@ -113,6 +113,7 @@ static void apu_routine(void)
             InterlockedIncrement(&s_irql_bad);
         g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0xBADBADu;
         g_ebp = 0xBADBADu;
+        g_eflags = 0x2u;
         g_esp -= 64;
         memset(&g_xmm0, 0xEE, sizeof g_xmm0);
         break;
@@ -331,7 +332,7 @@ static DWORD WINAPI clobber_holder(LPVOID p)
     g_fs_base = 0;
     saved = xbox_IrqlEnterInterrupt(DISPATCH_LEVEL);
     g_eax = 1; g_ecx = 2; g_edx = 3; g_ebx = 4; g_esi = 5; g_edi = 6;
-    g_ebp = 7; g_esp = 0x123450;
+    g_ebp = 7; g_esp = 0x123450; g_eflags = 0x00200ED7u;
     memset(&g_xmm0, 0x5A, sizeof g_xmm0);
     x = g_xmm0;
     SetEvent(ev_a);
@@ -340,6 +341,7 @@ static DWORD WINAPI clobber_holder(LPVOID p)
     ok[0] = s_runs == 1;
     ok[1] = g_eax == 1 && g_ecx == 2 && g_edx == 3 && g_ebx == 4
             && g_esi == 5 && g_edi == 6 && g_ebp == 7 && g_esp == 0x123450
+            && g_eflags == 0x00200ED7u
             && !memcmp(&g_xmm0, &x, sizeof x);
     ok[2] = xbox_IrqlCurrent() == DISPATCH_LEVEL;
     xbox_IrqlLeaveInterrupt(saved);
@@ -602,7 +604,18 @@ int main(void)
     xbox_IrqSetHandler(XBOX_IRQ_OHCI, ohci_routine);
 
     printf("irq_safe_points:\n");
-    check(xbox_IrqSafePointsOn(), "safe points are the default");
+    if (!recomp_env(RENV_DISPATCH_GATE)) {
+        check(!xbox_DispatchGateOn() && !xbox_IrqSafePointsOn(),
+              "by default the gate is off, and safe points with it");
+        check(xbox_IrqPost(XBOX_IRQ_APU) == XBOX_IRQ_UNGATED,
+              "no gate: a post is never left pending");
+        check(xbox_DispatchGateTryEnter() && !xbox_DispatchGateOwner(),
+              "no gate: an entry succeeds and takes nothing");
+        xbox_DispatchGateLeave();
+    }
+    set_env(RENV_DISPATCH_GATE, "1");
+    check(xbox_DispatchGateOn() && xbox_IrqSafePointsOn(),
+          "RECOMP_DISPATCH_GATE=1: safe points are on with it");
     race_shown();
     gate_release();
     non_holder();

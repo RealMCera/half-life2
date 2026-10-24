@@ -10,7 +10,7 @@
  * later shows up within a second while the title polls the mask every frame.
  *
  * Nothing here calls the platform: the backend (input_backend.h) does, and
- * tests/input_map swaps in a fake one to count the calls.
+ * tests/pad_map swaps in a fake one to count the calls.
  */
 #include "input_backend.h"
 #include "host_pad.h"

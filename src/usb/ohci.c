@@ -13,6 +13,7 @@
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
+#include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,9 +129,11 @@ static void wr32(uint32_t va, uint32_t v);
 #define PORT_W_PPS_SET_POWER    0x00000100u   /* SetPortPower                */
 #define PORT_W_CLEAR_POWER      0x00000200u   /* ClearPortPower              */
 
-/* The MCPX gives each controller a small root hub. Two ports apiece covers
- * the console's four front sockets, which is what a title enumerates over. */
-#define OHCI_PORTS              2
+/* The root hub the pads are plugged into. With four ports XAPI numbers the
+ * controller slots from them as root port 3 = controller port 1 (player 1),
+ * 4 = 2, 1 = 3, 2 = 4 -- measured: SSX 3's debug quick-start menu reads
+ * controller slot 0 only, and saw the pad only on root port 3. */
+#define OHCI_PORTS              4
 
 /* Passes this thread will keep an interrupt back while the guest is at
  * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
@@ -177,9 +180,8 @@ static OhciController s_hc[2];
  * it starts from decides whether a pad shows up as player 1 or player 3 --
  * a mapping worth finding by measurement, not by assertion. */
 static int s_device_hc;
-/* Downstream ports the root hub reports in HcRhDescriptorA. Two is what the
- * MCPX's own hubs have; RECOMP_USB_NDP exists because which slot XAPI gives a
- * pad is decided somewhere in here and the mapping is worth measuring. */
+/* Downstream ports the root hub reports in HcRhDescriptorA (RECOMP_USB_NDP,
+ * 1-4). Which slot XAPI gives a pad is decided by its port: see OHCI_PORTS. */
 static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
@@ -781,14 +783,36 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             moved = n;
         }
     } else {
-        /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded -- but only the control pipe's ends a
-         * control transfer. A rumble packet on endpoint 2 used to clear the
-         * pending setup too, so a force-feedback write landing between a
-         * control request's stages broke that request; Burnout 3 starts its
-         * engine-rev rumble on the Crash countdown and then paused with the
-         * pad unresponsive. */
+        /* OUT: the status stage of an IN control transfer, or rumble. Only
+         * the control pipe's ends a control transfer. A rumble packet on
+         * endpoint 2 used to clear the pending setup too, so a force-feedback
+         * write landing between a control request's stages broke that
+         * request; Burnout 3 starts its engine-rev rumble on the Crash
+         * countdown and then paused with the pad unresponsive. */
         moved = len;
+        /* Rumble: an XID output report -- 00 06, left motor, right motor
+         * (16-bit each) -- on the interrupt OUT endpoint, or as the data of
+         * a SET_REPORT (21 09) on the control pipe. Forwarded to the host
+         * pad; RECOMP_RUMBLE=0 ignores it. */
+        if (len >= 6 && td_buf(td, cbp, 6u)
+            && (endpoint != 0 || (g_setup_pending && g_setup.bmRequestType == 0x21
+                                  && g_setup.bRequest == 0x09))) {
+            static int rumble = -1;
+            const uint8_t *r = td_buf(td, cbp, 6u);
+            if (rumble < 0) {
+                const char *e = recomp_env(RENV_RUMBLE);
+                rumble = !(e && *e == '0');
+            }
+            if (rumble && r[0] == 0x00 && r[1] >= 6) {
+                XBOX_VIBRATION v;
+                v.wLeftMotorSpeed  = (WORD)(r[2] | r[3] << 8);
+                v.wRightMotorSpeed = (WORD)(r[4] | r[5] << 8);
+                if (s_trace)
+                    fprintf(stderr, "  [OHCI%d] rumble pad %d left %u right %u (ep %u)\n",
+                            hc->index, pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint);
+                xbox_InputSetState((DWORD)pad, &v);
+            }
+        }
         if (endpoint == 0) {
             g_setup_pending = 0;
             s_n_out_ep0++;
@@ -1230,11 +1254,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * arrives. */
         if (!plugged && (enable & INTR_RHSC)) {
             /* Which port the device appears on decides which controller slot
-             * XAPI assigns it, and a title that reads "player 1" looks at slot
-             * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
-             * mapping can be found by measurement rather than assumed. */
+             * XAPI assigns it, and a title that reads "player 1" without
+             * asking which port pressed Start looks at slot 0. The default is
+             * root port 3 (index 2), controller port 1, when there are four;
+             * RECOMP_USB_PORT (0..3) picks another. */
             const char *pspec = recomp_env(RENV_USB_PORT);
-            unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
+            unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
@@ -1242,7 +1267,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             s_plugged_pads = 1;
             first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on port %u\n", waited * 20, port + 1);
             fflush(stderr);
         }
 
@@ -1361,8 +1386,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (!status)
             continue;
 
-        /* (irq_safe_points=0 only, below.) Bounded, because the mask is a
-         * model and not the hardware.
+        /* (Without safe points only, below.) Bounded, because the mask
+         * is a model and not the hardware.
          *
          * The depth is a count of raise/lower pairs across every thread, and
          * one unmatched raise anywhere leaves the gate shut for the rest of
@@ -1387,9 +1412,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             if (!gated)
                 xbox_IrqNoteUngated(XBOX_IRQ_OHCI);
         } else {
-            /* irq_safe_points=0: the old bounded hold-off, then beside the
-             * holder. */
-            gated = xbox_DispatchGateTryEnter();
+            /* No gate (the default): held off while a guest thread is at
+             * raised IRQL; RECOMP_IRQ_SAFE_POINTS=0 under the gate: held off
+             * while the gate is. Then beside the holder either way. Without
+             * the gate the try always succeeds and the leave takes nothing. */
+            gated = xbox_DispatchGateOn() ? xbox_DispatchGateTryEnter()
+                                          : !xbox_IrqlBlocksInterrupts();
             if (!gated && ++held_off <= OHCI_IRQ_HOLDOFF) {
                 if (!held_off_warned) {
                     held_off_warned = 1;

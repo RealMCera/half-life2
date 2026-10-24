@@ -1214,18 +1214,18 @@ static void counter_mirrors_tick(void)
 #define XBOX_FRAME_PERIOD_MS    16      /* ~60 Hz */
 
 /* A counter can belong to the title after all. A title may register the
- * miniport's own vblank count, which D3D's vblank DPC bumps itself now
- * that vblanks reach the title; bumped here per flip as well, the XMV
- * player's clock ran at 60 Hz plus the flip rate and movies played several
- * times too fast. So each bump first checks that nothing else
- * moved the counter since the last one, and once something has, the
- * counter is the title's and is left alone (nv2a_flip_hold.h). The first
- * bump only seeds: a field D3D initialised is not the title counting. */
+ * miniport's own vblank count, which D3D's vblank DPC bumps itself once
+ * vblanks reach the title (RECOMP_VBLANK); bumped here per flip as well, it
+ * ran at 60 Hz plus the flip rate, and video and loads timed on it played
+ * several times too fast. So under the flip hold each bump first checks
+ * whether something else moved the counter since the last one; one that
+ * keeps moving on its own is the title's and is left alone for as long as
+ * it keeps moving (nv2a_flip_hold.h). The first bump only seeds: a field
+ * D3D initialised is not the title counting. */
 static struct {
     uint32_t device_ptr_va;
     uint32_t counter_off;
-    uint32_t last_written;
-    int      seeded, owned_by_title;
+    XboxFrameCounterBump bump;
 } g_frame_counters[XBOX_MAX_FRAME_COUNTERS];
 static int   g_frame_counter_count = 0;
 static DWORD g_frame_counter_last_ms = 0;
@@ -1234,15 +1234,15 @@ static uint32_t g_frame_counters_owned;
 extern int nv2a_pb_exec_flip_pacing(void);
 extern void nv2a_pb_exec_put_read(uint32_t vbl, uint32_t put);
 
+/* Registered counters the title is moving itself right now. */
 uint32_t xbox_Nv2aFrameCountersOwned(void) { return g_frame_counters_owned; }
 
 static void frame_counter_bump(int i)
 {
-    uint32_t dev, cur;
+    uint32_t dev;
     volatile uint32_t *p;
+    int r;
 
-    if (g_frame_counters[i].owned_by_title)
-        return;
     if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
         return;
     dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
@@ -1251,22 +1251,21 @@ static void frame_counter_bump(int i)
         return;
     p = (volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
                               + g_memory_offset);
-    cur = *p;
-    if (nv2a_pb_exec_flip_pacing()
-            && xbox_FrameCounterOwned(g_frame_counters[i].seeded,
-                                      g_frame_counters[i].last_written, cur)) {
-        g_frame_counters[i].owned_by_title = 1;
+    r = xbox_FrameCounterBump(&g_frame_counters[i].bump, p,
+                              nv2a_pb_exec_flip_pacing(), GetTickCount());
+    if (r == XBOX_FRAME_COUNTER_HANDED_OVER) {
         g_frame_counters_owned++;
-        fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X moves on"
-                " its own (0x%08X after 0x%08X): the title counts it, the"
+        fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X keeps"
+                " moving on its own (0x%08X): the title counts it, the"
                 " toolkit stops\n", g_frame_counters[i].device_ptr_va,
-                g_frame_counters[i].counter_off, cur,
-                g_frame_counters[i].last_written);
-        return;
+                g_frame_counters[i].counter_off, *p);
+    } else if (r == XBOX_FRAME_COUNTER_HANDED_BACK) {
+        g_frame_counters_owned--;
+        fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X has"
+                " stopped moving on its own: the toolkit bumps it again\n",
+                g_frame_counters[i].device_ptr_va,
+                g_frame_counters[i].counter_off);
     }
-    *p = cur + 1;
-    g_frame_counters[i].last_written = cur + 1;
-    g_frame_counters[i].seeded = 1;
 }
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
@@ -3663,9 +3662,8 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
 RECOMP_TLS int g_df = 0;
-
-/* The last EFLAGS image popfd loaded (see recomp_types.h). Bit 1 is always
- * set and IF is on, as in any guest thread the kernel schedules. */
+/* EFLAGS: the image pushfd and popfd use (see recomp_types.h). Bit 1 is
+ * always set and IF is on, as in any guest thread the kernel schedules. */
 RECOMP_TLS uint32_t g_eflags = 0x00000202u;
 
 /* ICALL trace ring buffer */
@@ -5485,10 +5483,43 @@ static void contig_take(uint32_t first, uint32_t n)
         g_contig_first_free++;
 }
 
+/* Whether page q may start or extend a new block.
+ *
+ * The first pass also keeps out of the loaded image's physical range. Here
+ * the window and the RAM the image sits in are separate storage, so a block
+ * placed at an image page gives one physical number two meanings, and a
+ * device model holding only the number has to guess. Darkwatch's XPP lost
+ * that guess both ways: a 1200 KB block at 0x0045C000 covered its .data
+ * control-transfer buffer (0x004C20D4), and its OHCI descriptors, allocated
+ * inside the block, resolved to the image and read back zero, so the pad
+ * never enumerated. The console never has the overlap: its kernel keeps the
+ * image's pages out of the pool. The second pass allows them, because an
+ * image whose BSS runs past 48 MB would otherwise leave almost no window.
+ *
+ * Opt-in (RECOMP_CONTIG_AVOID_IMAGE=1): it moves every block above the
+ * image, and game glue names some of them by address (a DSP doorbell, say). */
+static int contig_avoid_image(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = recomp_env_int(RENV_CONTIG_AVOID_IMAGE, 0) != 0;
+    }
+    return on;
+}
+
+static int contig_page_free(uint32_t q, int avoid_image)
+{
+    if (g_contig_used[q])
+        return 0;
+    return !(avoid_image && g_xbox_image_hi
+             && q >= g_xbox_image_lo / CONTIG_PAGE
+             && q < (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE);
+}
+
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi)
 {
-    uint32_t n, align_pages, lo_page, limit, p, q, result = 0;
+    uint32_t n, align_pages, lo_page, limit, p, q, pass, result = 0;
 
     if (alignment < CONTIG_PAGE) alignment = CONTIG_PAGE;
     if (alignment & (alignment - 1)) {            /* round up to a power of 2 */
@@ -5507,24 +5538,27 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
 
     contig_lock();
     if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
-    p = (lo_page + align_pages - 1) & ~(align_pages - 1);
-    while ((uint64_t)p + n <= limit) {
-        /* A request free to go above 16 MB steps over the low reserve. */
-        if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
-                && p + n > CONTIG_LOW_RESERVE_START) {
-            p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
-            continue;
+    for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
+        int avoid = pass == 0;
+        p = (lo_page + align_pages - 1) & ~(align_pages - 1);
+        while ((uint64_t)p + n <= limit) {
+            /* A request free to go above 16 MB steps over the low reserve. */
+            if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
+                    && p + n > CONTIG_LOW_RESERVE_START) {
+                p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
+                continue;
+            }
+            for (q = p; q < p + n && contig_page_free(q, avoid); q++)
+                ;
+            if (q == p + n) {
+                contig_take(p, n);
+                result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                break;
+            }
+            /* Skip the run that stopped us, then realign. */
+            while (q < limit && !contig_page_free(q, avoid)) q++;
+            p = (q + align_pages - 1) & ~(align_pages - 1);
         }
-        for (q = p; q < p + n && !g_contig_used[q]; q++)
-            ;
-        if (q == p + n) {
-            contig_take(p, n);
-            result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
-            break;
-        }
-        /* Skip the used run that stopped us, then realign. */
-        while (q < limit && g_contig_used[q]) q++;
-        p = (q + align_pages - 1) & ~(align_pages - 1);
     }
     if (result) {
         g_contig_allocs++;

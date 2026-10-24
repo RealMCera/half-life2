@@ -1,6 +1,6 @@
 /**
- * xbox_input keyboard, SDL side (POSIX): the SDL window's key and focus
- * events into the key table of keyboard.h. See keyboard_sdl.c.
+ * xbox_input keyboard, SDL side (POSIX): the SDL window's key, mouse-button
+ * and focus events into the key table of keyboard.h. See keyboard_sdl.c.
  */
 #ifndef XBOX_INPUT_KEYBOARD_SDL_H
 #define XBOX_INPUT_KEYBOARD_SDL_H
@@ -12,7 +12,8 @@ extern "C" {
 #endif
 
 /* An SDL keycode (SDL_Keycode, unmodified) as a Windows VK, or 0 when the
- * key is not one the table records. */
+ * key is not one the table records. Every key input_map.h has a name for
+ * is recorded; a left or right modifier gives the either-side VK here. */
 int  xbox_InputSdlKeyToVk(int sdl_keycode);
 /* The same with the sides kept: LShift/RShift, LCtrl/RCtrl, LAlt/RAlt and
  * keypad Enter get input_names.h's own codes. The event path uses this. */

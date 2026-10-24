@@ -16,15 +16,20 @@
  * acks later, the timer thread's own raising of the bits (not an ack), and
  * a vblank raised while the DPC has the interrupt masked (xbox_VblankRaise-
  * Bits: no ISR, so no tick_busy to hold the DPC's ack). That last one hung
- * Burnout 3: the vblank was posted to the gate holder, which was running
- * the DPC with no safe point in its spin, and tick_busy never came down.
+ * a title: the vblank was posted to the gate holder, which was running the
+ * DPC with no safe point in its spin, and tick_busy never came down.
  * The masked tick must also leave a DPC's ack it did not write
  * (xbox_VblankArmBits with raised 0): a DPC that writes its ack once would
  * otherwise spin until the backstop.
+ * First, which vblank RECOMP_VBLANK selects (xbox_VblankMode): 0 or empty
+ * is off, set alone it is the tick v0.14.0 had, and all of the above is the 60 Hz schedule's.
  */
 #include "kernel.h"
 
 #include <stdio.h>
+#ifdef _WIN32
+#include <mmsystem.h>   /* timeBeginPeriod */
+#endif
 #include <stdlib.h>
 
 /* Provided by the generated title; nothing here calls a guest function. */
@@ -59,8 +64,7 @@ static long long now_ms(void)
 /* The DPC: after `delay` ms, ack and record when the PMC bit came down.
  * Other modes play someone else: 1 the next vblank's re-arm, 2 a backstop
  * clearing PMC, 3 the timer thread raising the next vblank. Mode 4 is the
- * XDK DPC's own loop (seen in Burnout 3): the ack rewritten on every
- * pass of the spin. */
+ * XDK DPC's own loop: the ack rewritten on every pass of the spin. */
 typedef struct { DWORD delay; int mode; long long acked_at, cleared_at; } Dpc;
 
 /* What the DPC waits for its bit to clear: past the watch's 1 s phase. */
@@ -125,9 +129,31 @@ int main(void)
     long late;
     int r;
 
+#ifdef _WIN32
+    /* The waits here are 1-2 ms; at the default 15.6 ms tick a turn
+     * outlives its quantum and a late DPC looks late. */
+    timeBeginPeriod(1);
+#endif
+
     setvbuf(stdout, NULL, _IONBF, 0);
     rearm = CreateEventW(NULL, FALSE, FALSE, NULL);
     printf("vblank_ack: running\n");
+
+    /* RECOMP_VBLANK=1 alone is v0.14.0's tick; the 60 Hz schedule and
+     * this ack watch only come with "paced" or a switch that needs them. */
+    check(xbox_VblankMode(NULL, 0) == XBOX_VBLANK_OFF
+          && xbox_VblankMode(NULL, 1) == XBOX_VBLANK_OFF,
+          "unset: no vblanks, whatever else is on");
+    check(xbox_VblankMode("0", 0) == XBOX_VBLANK_OFF
+          && xbox_VblankMode("0", 1) == XBOX_VBLANK_OFF
+          && xbox_VblankMode("", 1) == XBOX_VBLANK_OFF,
+          "RECOMP_VBLANK=0 (or empty): off, even with a switch that wants it");
+    check(xbox_VblankMode("1", 0) == XBOX_VBLANK_TICK,
+          "RECOMP_VBLANK=1 alone: the old tick");
+    check(xbox_VblankMode("paced", 0) == XBOX_VBLANK_PACED,
+          "RECOMP_VBLANK=paced: the 60 Hz schedule");
+    check(xbox_VblankMode("1", 1) == XBOX_VBLANK_PACED,
+          "RECOMP_VBLANK=1 with a switch that needs it: the schedule");
 
     {
         Dpc d = { 0, 0, 0, 0 };

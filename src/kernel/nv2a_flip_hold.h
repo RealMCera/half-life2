@@ -25,7 +25,8 @@
  * Not D3D's max(last + interval, now + 1): a title that already takes its
  * interval per frame (one that waits for two vblanks itself) is never held,
  * and a late frame on a slow backend is not pushed to the next vblank.
- * flip_pacing=edge selects D3D's rule for A/B runs.
+ * The hold is opt-in: RECOMP_FLIP_PACING=1 turns it on, =edge with D3D's
+ * rule for A/B runs; unset, flips complete at once as before.
  *
  * The count a stall is measured at is the vblank the walk began in. After
  * a host stall that can be vblanks after the one the title kicked in: the
@@ -68,7 +69,7 @@ extern "C" {
 #define XBOX_FLIP_CLOCK_STALE_NS 100000000ull
 
 typedef struct {
-    int      edge;          /* flip_pacing=edge: D3D's quantising rule */
+    int      edge;          /* RECOMP_FLIP_PACING=edge: D3D's rule */
     /* The latest swap NOP since the previous FLIP_STALL. */
     int      have_swap;
     unsigned swap_interval;
@@ -132,10 +133,59 @@ int xbox_FlipHoldPoll(XboxFlipHold *h, uint32_t count, uint64_t now_ns,
 /* Drop a pending hold without waiting (a walk that lost its place). */
 void xbox_FlipHoldCancel(XboxFlipHold *h, uint64_t now_ns);
 
-/* A frame counter the toolkit bumps: has something else (the title's own
- * vblank DPC) moved it forward since the toolkit last wrote it? Never
- * before the first bump has seeded last_written. */
-int xbox_FrameCounterOwned(int seeded, uint32_t last_written, uint32_t cur);
+/* A frame counter the toolkit bumps: does something else (the title's own
+ * vblank DPC) keep moving it? Called once per bump with the value the bump
+ * found and the time in ms. Returns 1 while the counter is the title's, and
+ * then the caller does not bump it. Never the title's before the first bump
+ * has seeded last_written.
+ *
+ * One move is not enough. Burnout 3's counter moves once on its own at boot
+ * (3 after the toolkit's 2) and never again; taken as the title's there, it
+ * was left alone, and the title waited on it at its first movie for good.
+ * Nor is a slow trickle: something writing the counter once a second would
+ * pile up moves over a few seconds. So a counter is the title's once it has
+ * moved on its own at XBOX_FRAME_COUNTER_FOREIGN bumps within
+ * XBOX_FRAME_COUNTER_WINDOW_MS, which a counter the title's DPC drives at
+ * 60 Hz reaches within a few frames at any flip rate above 4 per second.
+ * And it is the title's only while it keeps moving: one that has not moved
+ * for XBOX_FRAME_COUNTER_IDLE_MS (15 vblanks) goes back to the toolkit, so
+ * a wrong hand-over costs a quarter of a second, not the rest of the run. */
+#define XBOX_FRAME_COUNTER_FOREIGN    3
+#define XBOX_FRAME_COUNTER_WINDOW_MS  500u
+#define XBOX_FRAME_COUNTER_IDLE_MS    250u
+
+typedef struct {
+    uint32_t foreign;   /* moves on its own in the current window */
+    uint32_t first_ms;  /* when the window's first move was seen */
+    int      owned;     /* the title's: not bumped */
+    uint32_t last_seen; /* owned: the value last read */
+    uint32_t moved_ms;  /* owned: when it last moved */
+} XboxFrameCounterWatch;
+
+int xbox_FrameCounterOwned(XboxFrameCounterWatch *w, int seeded,
+                           uint32_t last_written, uint32_t cur,
+                           uint32_t now_ms);
+
+/* One bump of a registered counter word, the part of xbox_memory_layout.c's
+ * frame_counter_bump after the guest pointers are resolved. pacing is
+ * RECOMP_FLIP_PACING: off, every call adds one, as before the hold, and the
+ * watch never runs. On, the watch decides. Returns what happened, for the
+ * caller's log line. */
+typedef struct {
+    uint32_t last_written;
+    int      seeded;
+    XboxFrameCounterWatch watch;
+} XboxFrameCounterBump;
+
+enum {
+    XBOX_FRAME_COUNTER_BUMPED,       /* the toolkit's: one added */
+    XBOX_FRAME_COUNTER_TITLES,       /* the title's: left alone */
+    XBOX_FRAME_COUNTER_HANDED_OVER,  /* became the title's at this call */
+    XBOX_FRAME_COUNTER_HANDED_BACK   /* stopped moving: the toolkit's again */
+};
+
+int xbox_FrameCounterBump(XboxFrameCounterBump *b, volatile uint32_t *word,
+                          int pacing, uint32_t now_ms);
 
 #ifdef __cplusplus
 }

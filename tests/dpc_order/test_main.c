@@ -414,7 +414,20 @@ int main(void)
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     xbox_IrqSetHandler(XBOX_IRQ_APU, apu_isr);
     printf("dpc_order:\n");
-    check(xbox_DpcOnRaise(), "dpc_on_raise is the default");
+    /* A run with RECOMP_DISPATCH_GATE already set (the gate-on ctest pass)
+     * has no default to check. */
+    if (!recomp_env(RENV_DISPATCH_GATE)) {
+        check(!xbox_DispatchGateOn() && !xbox_DpcOnRaise(),
+              "by default the gate is off, and DPCs on raise with it");
+        recomp_env_set(RENV_DPC_ON_RAISE, "1");
+        xbox_IrqReloadConfig();
+        check(!xbox_DpcOnRaise(), "dpc_on_raise=1 without the gate stays off");
+        recomp_env_set(RENV_DPC_ON_RAISE, NULL);
+    }
+    recomp_env_set(RENV_DISPATCH_GATE, "1");
+    xbox_IrqReloadConfig();
+    check(xbox_DispatchGateOn() && xbox_DpcOnRaise(),
+          "RECOMP_DISPATCH_GATE=1: DPCs on raise are on with it");
     raise_runs_it();
     raise_holds_cpu();
     lower_runs_it();

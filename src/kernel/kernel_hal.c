@@ -206,7 +206,23 @@ static XBOX_THREAD_LOCAL int t_irql_counted;
  * beside the holder: on hardware they preempt DISPATCH-level code, which
  * stays frozen until they return.
  * Recursive, so a thread already through it (a DPC that raises again) never
- * waits on itself. */
+ * waits on itself.
+ *
+ * Opt-in: RECOMP_DISPATCH_GATE=1. It changes when DPCs and device interrupts
+ * run, which is a scheduling change for every title, and one run of a title
+ * in a few stalled at its first movie with it. Off, the gate is not there:
+ * an entry is free, raises take nothing, the timer thread runs DPCs and
+ * timer routines as it always did, and the device models hold their
+ * interrupts off on the raised-IRQL count (xbox_IrqlBlocksInterrupts). */
+static int s_gate_on;                          /* RECOMP_DISPATCH_GATE */
+static void irq_config_once(void);
+
+int xbox_DispatchGateOn(void)
+{
+    irq_config_once();
+    return s_gate_on;
+}
+
 static CRITICAL_SECTION s_dispatch_gate;
 static INIT_ONCE s_dispatch_gate_once = INIT_ONCE_STATIC_INIT;
 static XBOX_THREAD_LOCAL int t_dispatch_gate_held;
@@ -275,15 +291,19 @@ unsigned long xbox_DispatchGateOwner(void)
  * voice callback and the ISR leaves the voice lists alone while it is set,
  * a check-then-act that is only safe when the two never run at once. So an
  * ISR is delivered holding the gate when it is free, and posted to the
- * holder when it is not (xbox_IrqPost). */
+ * holder when it is not (xbox_IrqPost). With the gate off these succeed
+ * and take nothing, so their callers run as they did before it. */
 int xbox_DispatchGateTryEnter(void)
 {
+    if (!xbox_DispatchGateOn())
+        return 1;
     return gate_try();
 }
 
 void xbox_DispatchGateEnter(void)
 {
-    gate_enter();
+    if (xbox_DispatchGateOn())
+        gate_enter();
 }
 
 static void irq_release_point(void);
@@ -292,6 +312,8 @@ static void irq_release_point(void);
  * gate runs here, before anyone else can take it. */
 void xbox_DispatchGateLeave(void)
 {
+    if (!xbox_DispatchGateOn())
+        return;
     xbox_IrqSafePoint();
     gate_leave_raw();
     if (t_gate_depth == 0)
@@ -331,9 +353,9 @@ static uint64_t s_irq_post_ns[XBOX_IRQ_LINES]; /* when the bit went up */
 static XBOX_THREAD_LOCAL int t_in_isr;
 static void (*s_irq_post_hook)(int line);
 static void (*s_irq_release_hook)(void);   /* tests: the lower's window */
-static int s_irq_mode = -1;                    /* irq_safe_points */
+static int s_irq_mode;          /* irq_safe_points, under the gate */
 static int s_irq_force;
-static int s_dpc_on;                           /* dpc_on_raise */
+static int s_dpc_on;            /* dpc_on_raise, under the gate */
 /* A thread that runs guest code (guest-main, a spawned worker): the only
  * kind that drains queued DPCs at its raise and release (dpc_run_here). */
 static XBOX_THREAD_LOCAL int t_guest_thread;
@@ -353,15 +375,30 @@ static struct {
 static volatile LONG s_irq_points_refused;
 static uint64_t s_irq_last_log_ns;
 
+/* RECOMP_DISPATCH_GATE turns the gate on, and with it the two things that
+ * need a holder: interrupts posted to it and run at its safe points
+ * (irq_safe_points=0 turns that off again), and queued DPCs drained on the
+ * guest thread at its raise and release (dpc_on_raise=0 leaves them to the
+ * timer thread). Without the gate both are off whatever they say: a post
+ * has nobody to run it, and a drain at a raise is only atomic against the
+ * timer thread's because the gate orders the two. */
 static void irq_config(void)
 {
-    s_irq_mode = recomp_env(RENV_IRQ_SAFE_POINTS)
-                 ? (int)recomp_env_int(RENV_IRQ_SAFE_POINTS, 1) != 0 : 1;
+    s_gate_on = recomp_env_int(RENV_DISPATCH_GATE, 0) != 0;
+    s_irq_mode = s_gate_on
+                 && (recomp_env(RENV_IRQ_SAFE_POINTS)
+                     ? (int)recomp_env_int(RENV_IRQ_SAFE_POINTS, 1) != 0 : 1);
     s_irq_force = recomp_env_on(RENV_IRQ_SAFE_FORCE);
     s_irq_wait_ns = (uint64_t)recomp_env_int(RENV_IRQ_SAFE_MS, 250) * 1000000ull;
-    s_dpc_on = recomp_env(RENV_DPC_ON_RAISE)
-               ? (int)recomp_env_int(RENV_DPC_ON_RAISE, 1) != 0 : 1;
-    if (!s_irq_mode || s_irq_force) {
+    s_dpc_on = s_gate_on
+               && (recomp_env(RENV_DPC_ON_RAISE)
+                   ? (int)recomp_env_int(RENV_DPC_ON_RAISE, 1) != 0 : 1);
+    if (s_gate_on) {
+        fprintf(stderr, "  [IRQ] one-CPU DISPATCH gate on (RECOMP_DISPATCH_GATE),"
+                " DPCs on raise %s\n", s_dpc_on ? "on" : "off");
+        fflush(stderr);
+    }
+    if (s_gate_on && (!s_irq_mode || s_irq_force)) {
         fprintf(stderr, "  [IRQ] safe points %s%s\n",
                 s_irq_mode ? "on" : "off (irq_safe_points=0: interrupts run "
                                     "beside the gate holder after a hold-off)",
@@ -371,22 +408,41 @@ static void irq_config(void)
     }
 }
 
+/* Read once, by whichever thread asks first: the device models' threads,
+ * the timer thread and the title's ask at once at boot, and a plain lazy
+ * init let one of them see the gate on with safe points still unset. The
+ * INIT_ONCE completes with a release, and every check below goes through
+ * it (one acquire load once done). */
+static INIT_ONCE s_irq_config_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK irq_config_run(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    irq_config();
+    return TRUE;
+}
+
+static void irq_config_once(void)
+{
+    InitOnceExecuteOnce(&s_irq_config_once, irq_config_run, NULL, NULL);
+}
+
+/* Tests only, single-threaded: the environment changed under them. */
 void xbox_IrqReloadConfig(void)
 {
+    irq_config_once();
     irq_config();
 }
 
 int xbox_IrqSafePointsOn(void)
 {
-    if (s_irq_mode < 0)
-        irq_config();
+    irq_config_once();
     return s_irq_mode;
 }
 
 int xbox_DpcOnRaise(void)
 {
-    if (s_irq_mode < 0)
-        irq_config();
+    irq_config_once();
     return s_dpc_on;
 }
 
@@ -600,7 +656,14 @@ void xbox_IrqSafePoint(void)
  * the gate while the routine runs. */
 static void irq_release_point(void)
 {
-    if ((!s_irq_pending && !(t_guest_thread && xbox_DpcPending()))
+    /* A full-barrier read, not a plain one: the leave just before is a
+     * release only, and on arm64 a plain load may be satisfied before the
+     * unlock is seen. A poster that tried the gate in that gap and found it
+     * held would then post a bit this check had already missed, and the
+     * line would wait for the next holder's safe point. */
+    LONG pending = InterlockedCompareExchange(&s_irq_pending, 0, 0);
+
+    if ((!pending && !(t_guest_thread && xbox_DpcPending()))
         || t_in_isr || g_current_irql > DISPATCH_LEVEL)
         return;
     if (!gate_try())
@@ -672,6 +735,8 @@ int xbox_IrqPost(int line)
     LONG bit = 1L << line, was;
     uint64_t now;
 
+    if (!xbox_DispatchGateOn())
+        return XBOX_IRQ_UNGATED;        /* no gate, nobody to post to */
     if (gate_try())
         goto gated;
     if (!xbox_IrqSafePointsOn())
@@ -793,6 +858,10 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
                              int gate)
 {
     int now = (new_level >= DISPATCH_LEVEL);
+    /* With the gate off the count moves on the edge, as it did before the
+     * gate: the hold-off it drives is the one the device models had. */
+    int was = xbox_DispatchGateOn() ? t_irql_counted
+                                    : (old_level >= DISPATCH_LEVEL);
     LONG d;
 
     (void)old_level;
@@ -804,7 +873,7 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
         xbox_IrqSafePoint();
     t_irql_counted = now;
 
-    if (now && gate) {
+    if (now && gate && xbox_DispatchGateOn()) {
         gate_enter();
         t_dispatch_gate_held = 1;
     }
@@ -889,7 +958,8 @@ void xbox_IrqlLeaveInterrupt(int saved)
 
 /* Whether this thread is at DISPATCH_LEVEL or above, or holds the one-CPU
  * gate: while it is, no DPC can run, so a spin wait here must not sleep for
- * one (kernel_pacing.c). */
+ * one (kernel_pacing.c), nor hand the guest CPU on in the hope of one
+ * (kernel_guest_cpu.c). */
 int xbox_IrqlThisThreadBlocksDpcs(void)
 {
     return t_irql_counted || t_dispatch_gate_held
@@ -938,25 +1008,32 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     if (NewIrql > g_current_irql) {
         /* A lower that would raise. The title's own pairs never do this;
          * one that does is restoring a level it read from somewhere other
-         * than its matching raise. Take the level it asks for, but never
-         * count it: a raise counted here has no lower to undo it, and the
-         * count is what every device model reads before delivering, so one
-         * of these used to end interrupts for the rest of the run. A thread
-         * already counted stays counted until it really lowers. */
+         * than its matching raise. With the gate on, take the level it asks
+         * for but never count it: a raise counted here has no lower to undo
+         * it, so it would hold the gate, and the count every device model
+         * reads, for the rest of the run. A thread already counted stays
+         * counted until it really lowers. With the gate off it is counted
+         * as a raise, as before the gate, and the depth stays one too high:
+         * loud, because the symptom is a device going quiet much later. */
         static volatile LONG n;
+        int gated = xbox_DispatchGateOn();
         if (InterlockedIncrement(&n) <= 20) {
             fprintf(stderr, "  [IRQLBUG] tid %lu KfLowerIrql(%d) while at %d"
-                    " -- level set, not counted as a raise\n",
+                    " -- %s\n",
                     (unsigned long)GetCurrentThreadId(),
-                    (int)NewIrql, (int)g_current_irql);
+                    (int)NewIrql, (int)g_current_irql,
+                    gated ? "level set, not counted as a raise"
+                          : "counted as a raise, depth is now stuck");
             fflush(stderr);
         }
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
-        g_current_irql = NewIrql;
-        irql_publish();
-        return;
+        if (gated) {
+            g_current_irql = NewIrql;
+            irql_publish();
+            return;
+        }
     }
 
     old = g_current_irql;
@@ -1864,12 +1941,19 @@ void xbox_PortOut(uint32_t port, uint32_t value, int width)
 /* =========================================================================
  * cpuid
  *
- * The Xbox CPU is a 733 MHz Coppermine-based Pentium III. Leaf 1 eax 0x683
- * is family 6, model 8 (Coppermine), stepping 3: the cB0 stepping's
- * signature in Intel's Pentium III Processor Specification Update.
- * The max basic leaf is 2 and there are no extended leaves. Leaf 1's edx is
- * the P3 feature set (FPU..CMOV, PAT, PSE-36, MMX, FXSR, SSE). Leaf 2 gives
- * the Coppermine Celeron's descriptors (128 KB 4-way L2, 16 KB L1s, TLBs).
+ * The Xbox CPU is a 733 MHz Coppermine-based Pentium III with MMX, FXSR and
+ * SSE, and that is what is reported by default. Leaf 1 eax 0x683 is family
+ * 6, model 8 (Coppermine), stepping 3: one of the Coppermine signatures in
+ * Intel's Pentium III Processor Specification Update. Which stepping the
+ * console ships is not documented, so software should key on family and
+ * model only. The max basic leaf is 2 and there are no extended leaves.
+ * Leaf 1's edx is the P3 feature set (FPU..CMOV, PAT, PSE-36, MMX, FXSR,
+ * SSE).
+ *
+ * Leaf 2 gives the P6 TLB and 16 KB 4-way L1 descriptors (0x01-0x04, 0x08,
+ * 0x0C). The L2 byte is 0, the null descriptor: the console's 128 KB L2 is
+ * reported to be 8-way, and the SDM's 128 KB 32-byte-line descriptor (0x41)
+ * says 4-way, so no L2 is described rather than a wrong one.
  *
  * A leaf above the maximum, extended ones included, returns the highest
  * basic leaf's data: Intel SDM vol. 2A, CPUID, "If a value entered for
@@ -1878,18 +1962,15 @@ void xbox_PortOut(uint32_t port, uint32_t value, int width)
  * information leaf is returned." So 0x80000000 reads eax 0x03020101, below
  * 0x80000001, which is how software learns there are no extended leaves.
  *
- * MMX is masked unless RECOMP_DEBUG=cpuid_mmx is set. D3DX's JPEG decoder
- * takes an MMX IDCT when the bit is set, and that path has never run in a
- * lifted title. Masking only bit 23 would describe a CPU with SSE but no
- * MMX, which never existed: SSE's integer extensions operate on the MMX
- * registers, and FXSAVE/FXRSTOR (FXSR) arrived alongside SSE to save that
- * state. So the masked CPU drops MMX, FXSR and SSE together (bits 23-25)
- * and reads as a plain P6 feature set -- self-consistent, if not the
- * family/model leaf 1 eax still names.
+ * RECOMP_CPUID_NO_SIMD=1 is an opt-out for a title whose MMX or SSE paths
+ * do not lift correctly: it clears MMX, FXSR and SSE together (bits 23-25),
+ * so the title takes its scalar path. Masking only MMX would describe a CPU
+ * with SSE but no MMX, which never existed: SSE's integer extensions use
+ * the MMX registers, and FXSAVE/FXRSTOR arrived with SSE to save that state.
  * ========================================================================= */
 void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
 {
-    const char *mmx = recomp_env(RENV_CPUID_MMX);
+    int no_simd = recomp_env_on(RENV_CPUID_NO_SIMD);
 
     (void)subleaf;
     out[0] = out[1] = out[2] = out[3] = 0;
@@ -1905,12 +1986,12 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
     case 1:
         out[0] = 0x00000683u;
         out[3] = 0x0383F9FFu;
-        if (!(mmx && *mmx && *mmx != '0'))
+        if (no_simd)
             out[3] &= ~0x03800000u;     /* MMX, FXSR, SSE */
         break;
     default:
         out[0] = 0x03020101u;
-        out[3] = 0x0C040841u;
+        out[3] = 0x0C040800u;   /* L1 D, DTLB 4M, L1 I, no L2 */
         break;
     }
 }

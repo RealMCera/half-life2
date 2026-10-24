@@ -33,6 +33,9 @@
 #include "platform/host_time.h"
 
 #include <stdio.h>
+#ifdef _WIN32
+#include <mmsystem.h>   /* timeBeginPeriod */
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -49,6 +52,19 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
     do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
 
 static int failures;
+
+/* The flag is only ever accessed atomically (kernel.h): a plain load in a
+ * polling loop may be hoisted now that it is no longer volatile. */
+static int32_t preempt_flag(void)
+{
+    return (int32_t)InterlockedCompareExchange(
+        (volatile LONG *)&g_xbox_guest_cpu_preempt, 0, 0);
+}
+
+static void preempt_flag_set(int32_t v)
+{
+    InterlockedExchange((volatile LONG *)&g_xbox_guest_cpu_preempt, (LONG)v);
+}
 
 static void check(int ok, const char *what)
 {
@@ -516,7 +532,7 @@ static void back_edge(void)
           "back edge: the other thread waits while this one loops");
     t0 = xbox_HostNowNs();
     while (!s_be_ran && xbox_HostNowNs() - t0 < 2000000000ull) {
-        if (g_xbox_guest_cpu_preempt) {
+        if (preempt_flag()) {
             flagged = 1;
             xbox_GuestCpuPreempt(0x00010001u);       /* RECOMP_BACK_EDGE */
             preempted = 1;
@@ -525,7 +541,7 @@ static void back_edge(void)
     check(flagged, "back edge: past the quantum the waiter raised the preempt flag");
     check(preempted && s_be_ran, "back edge: the holder handed over there and the waiter ran");
     check(xbox_GuestCpuHeld(), "back edge: the holder queued behind it and has the CPU again");
-    check(!g_xbox_guest_cpu_preempt, "back edge: the hand-off cleared the flag");
+    check(!preempt_flag(), "back edge: the hand-off cleared the flag");
     xbox_GuestCpuStatsGet(&st, 0);
     check(st.preempts >= 1 && st.max_turn_kind == XBOX_GUEST_CPU_PREEMPT,
           "back edge: the turn is counted as a preemption at the edge");
@@ -535,11 +551,11 @@ static void back_edge(void)
 
     /* The lock off: the flag never rises and the check is inert. */
     set_lock("0");
-    g_xbox_guest_cpu_preempt = 1;
+    preempt_flag_set(1);
     xbox_GuestCpuPreempt(0x00010001u);
-    check(g_xbox_guest_cpu_preempt == 1 && !xbox_GuestCpuHeld(),
+    check(preempt_flag() == 1 && !xbox_GuestCpuHeld(),
           "back edge: with the lock off the check does nothing");
-    g_xbox_guest_cpu_preempt = 0;
+    preempt_flag_set(0);
 }
 
 /* ── A thread back from a wait preempts the holder at once ─────────── */
@@ -595,7 +611,7 @@ static void wake(void)
     check(xbox_GuestCpuHeld(), "wake: this thread took the free CPU meanwhile");
     t0 = xbox_HostNowNs();
     while (xbox_HostNowNs() - t0 < 2000000000ull && !s_wk_ran) {
-        if (g_xbox_guest_cpu_preempt) {
+        if (preempt_flag()) {
             flagged = 1;
             xbox_GuestCpuPreempt(0x00010001u);
             preempted = 1;
@@ -605,7 +621,7 @@ static void wake(void)
           "wake: back from its call it asked, and the holder handed over at the edge");
     check(s_wk_wait_ms >= 0 && s_wk_wait_ms < 500,
           "wake: it ran well inside the 1 s quantum");
-    check(xbox_GuestCpuHeld() && !g_xbox_guest_cpu_preempt,
+    check(xbox_GuestCpuHeld() && !preempt_flag(),
           "wake: the holder has the CPU back and the flag is clear");
     xbox_GuestCpuStatsGet(&st, 0);
     check(st.preempts >= 1, "wake: the turn is counted as a preemption");
@@ -685,7 +701,7 @@ static void dispatch_call(void)
           "dispatch: the other thread waits while this one runs");
     g_fs_base = 0;
     saved = xbox_IrqlEnterInterrupt(DISPATCH_LEVEL);
-    g_xbox_guest_cpu_preempt = 1;
+    preempt_flag_set(1);
     Sleep(5);                           /* past the 0 ms quantum, flag up */
     held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 161 /* KfLowerIrql */);
     xbox_GuestCpuAcquire();
@@ -693,7 +709,7 @@ static void dispatch_call(void)
     check(held && xbox_GuestCpuHeld() && st.turns == 0 && st.releases == 1,
           "dispatch: the call soft-released and barged back, no hand-off");
     xbox_IrqlLeaveInterrupt(saved);
-    g_xbox_guest_cpu_preempt = 0;
+    preempt_flag_set(0);
     held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 161);
     xbox_GuestCpuAcquire();
     xbox_GuestCpuStatsGet(&st, 0);
@@ -710,6 +726,12 @@ int main(void)
 {
     HANDLE wd;
     XboxGuestCpuStats st;
+
+#ifdef _WIN32
+    /* The waits here are 1-2 ms; at the default 15.6 ms tick a turn
+     * outlives its quantum and a late DPC looks late. */
+    timeBeginPeriod(1);
+#endif
 
     wd = CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
     CloseHandle(wd);

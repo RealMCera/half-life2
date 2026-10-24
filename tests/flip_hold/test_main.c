@@ -10,8 +10,9 @@
  * the 100 ms bound with and without vblanks, ONE_OR_IMMEDIATE under edge,
  * two stalls in one walk, last_flip after a timeout, a count that wraps,
  * a walk that starts vblanks after its kick in the clock's catch-up (the
- * grid must not shift) and one with no catch-up (the old rule), and the
- * frame counter ownership rule with its seeding.
+ * grid must not shift) and one with no catch-up (the old rule), the frame
+ * counter ownership rule with its seeding, window and hand-back, and the
+ * bump of a counter word with flip pacing off and on.
  */
 #include "nv2a_flip_hold.h"
 
@@ -348,12 +349,116 @@ int main(void)
           "no clock, late walk: the kick's vblank");
 
     printf("frame counter ownership\n");
-    check(!xbox_FrameCounterOwned(0, 0, 7),
-          "not seeded: a counter that starts non-zero is not the title's");
-    check(!xbox_FrameCounterOwned(1, 8, 8), "unchanged since the bump: ours");
-    check(xbox_FrameCounterOwned(1, 8, 9), "moved on by something else: the title's");
-    check(!xbox_FrameCounterOwned(1, 8, 3), "went backwards (device reset): ours");
-    check(xbox_FrameCounterOwned(1, 0xFFFFFFFFu, 0), "moved across the wrap: the title's");
+    {
+        XboxFrameCounterWatch w;
+        uint32_t ms, v;
+        int k, owned;
+
+        memset(&w, 0, sizeof w);
+        check(!xbox_FrameCounterOwned(&w, 0, 0, 7, 0),
+              "not seeded: a counter that starts non-zero is not the title's");
+        check(!xbox_FrameCounterOwned(&w, 1, 8, 8, 0), "unchanged since the bump: ours");
+        check(!xbox_FrameCounterOwned(&w, 1, 8, 3, 0), "went backwards (device reset): ours");
+
+        /* Burnout 3 at boot: one move on its own (3 after 2), then only the
+         * toolkit's bumps, at 11 flips a second (a slow host). The counter
+         * stays the toolkit's however long it runs on. */
+        memset(&w, 0, sizeof w);
+        check(!xbox_FrameCounterOwned(&w, 1, 2, 3, 1000), "one move on its own: still ours");
+        for (k = 0, owned = 0; k < 1000; k++)
+            owned |= xbox_FrameCounterOwned(&w, 1, 4 + k, 4 + k, 1000 + 90 * k);
+        check(!owned, "a one-off move never makes it the title's");
+
+        /* Something writing it once a second, against 11 bumps a second:
+         * a move at every 11th bump never makes three in the window. */
+        memset(&w, 0, sizeof w);
+        for (k = 0, owned = 0, v = 100; k < 600; k++) {
+            int moved = k % 11 == 0;
+            owned |= xbox_FrameCounterOwned(&w, 1, v, v + (moved ? 1u : 0u),
+                                            90u * (uint32_t)k);
+            v += moved ? 2u : 1u;
+        }
+        check(!owned, "a 1 Hz writer never makes it the title's");
+
+        /* A title DPC at 60 Hz against 11 flips a second: it moves the
+         * counter between every two bumps, and the third move in the
+         * window hands it over. */
+        memset(&w, 0, sizeof w);
+        check(!xbox_FrameCounterOwned(&w, 1, 100, 105, 0), "DPC move 1");
+        check(!xbox_FrameCounterOwned(&w, 1, 106, 111, 90), "DPC move 2");
+        check(xbox_FrameCounterOwned(&w, 1, 112, 117, 180), "DPC move 3: the title's");
+        check(xbox_FrameCounterOwned(&w, 1, 112, 122, 270),
+              "still moving: still the title's");
+        check(xbox_FrameCounterOwned(&w, 1, 112, 122, 270 + 249),
+              "quiet for 249 ms: still the title's");
+        check(!xbox_FrameCounterOwned(&w, 1, 112, 122, 270 + 250) && !w.owned,
+              "quiet for 250 ms: the toolkit's again");
+
+        /* Three moves spread wider than the window don't add up. */
+        memset(&w, 0, sizeof w);
+        xbox_FrameCounterOwned(&w, 1, 10, 11, 0);
+        xbox_FrameCounterOwned(&w, 1, 12, 13, 300);
+        check(!xbox_FrameCounterOwned(&w, 1, 14, 15, 600),
+              "three moves over 600 ms: not the title's");
+        check(!xbox_FrameCounterOwned(&w, 1, 16, 17, 700)
+              && xbox_FrameCounterOwned(&w, 1, 18, 19, 750),
+              "and three inside 500 ms (600, 700, 750): the title's");
+
+        memset(&w, 0, sizeof w);
+        ms = 0xFFFFFF00u;     /* the millisecond clock wraps too */
+        xbox_FrameCounterOwned(&w, 1, 0xFFFFFFFEu, 0xFFFFFFFFu, ms);
+        xbox_FrameCounterOwned(&w, 1, 0xFFFFFFFFu, 0, ms + 100);
+        check(xbox_FrameCounterOwned(&w, 1, 1, 2, ms + 200),
+              "moves across both wraps count too");
+    }
+
+    printf("frame counter bumps, flip pacing off and on\n");
+    {
+        XboxFrameCounterBump b;
+        volatile uint32_t word;
+        uint32_t ms = 5000;
+        int k, r, all;
+
+        /* Off: one per call whatever moves it, as before the hold. */
+        memset(&b, 0, sizeof b);
+        word = 7;
+        for (k = 0, all = 1; k < 20; k++) {
+            word += 5;                       /* a title DPC as well */
+            all &= xbox_FrameCounterBump(&b, &word, 0, ms += 90)
+                   == XBOX_FRAME_COUNTER_BUMPED;
+        }
+        check(all && word == 7 + 20 * 6, "off: bumped every time, never handed over");
+
+        /* On, Burnout 3: seeded at 2, one move on its own, then only bumps. */
+        memset(&b, 0, sizeof b);
+        word = 1;
+        check(xbox_FrameCounterBump(&b, &word, 1, ms += 90)
+              == XBOX_FRAME_COUNTER_BUMPED && word == 2, "on: first bump seeds");
+        word = 3;
+        for (k = 0, all = 1; k < 200; k++)
+            all &= xbox_FrameCounterBump(&b, &word, 1, ms += 90)
+                   == XBOX_FRAME_COUNTER_BUMPED;
+        check(all && word == 203, "on: a one-off move, bumped on from it");
+
+        /* On, a title DPC: handed over at the third move, left alone while
+         * it moves, handed back once it stops. */
+        memset(&b, 0, sizeof b);
+        word = 50;
+        xbox_FrameCounterBump(&b, &word, 1, ms += 90);
+        for (k = 0, r = 0; k < 3; k++) {
+            word += 5;
+            r = xbox_FrameCounterBump(&b, &word, 1, ms += 90);
+        }
+        check(r == XBOX_FRAME_COUNTER_HANDED_OVER, "on: DPC moves hand it over");
+        word += 5;
+        check(xbox_FrameCounterBump(&b, &word, 1, ms += 90)
+              == XBOX_FRAME_COUNTER_TITLES && word == 73,
+              "on: the title's, not bumped");
+        xbox_FrameCounterBump(&b, &word, 1, ms += 200);
+        check(xbox_FrameCounterBump(&b, &word, 1, ms += 100)
+              == XBOX_FRAME_COUNTER_HANDED_BACK && word == 74,
+              "on: quiet 300 ms, handed back and bumped");
+    }
 
     printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

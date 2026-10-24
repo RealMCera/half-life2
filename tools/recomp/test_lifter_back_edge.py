@@ -1,7 +1,7 @@
-"""Every loop back edge calls RECOMP_BACK_EDGE, the guest CPU's quantum check
-(templates/runtime/recomp_types.h); forward jumps do not; a lowered
-spin-wait's edge keeps RECOMP_SPIN_WAIT alone; --no-back-edge-yield leaves
-the edges bare."""
+"""With --back-edge-yield every loop back edge calls RECOMP_BACK_EDGE, the guest
+CPU's quantum check (templates/runtime/recomp_types.h), and forward jumps do
+not; a lowered spin-wait's edge keeps RECOMP_SPIN_WAIT alone; by default the
+edges stay bare."""
 
 from tools.recomp import config
 from tools.recomp.spin_waits import SpinWaitConfig, SpinWaitReport
@@ -19,7 +19,8 @@ FORWARD = "83f8057d029090c3"
 SPIN = f"3905{D32}7cf8c3"
 
 
-def _translate(hexcode, spin_waits=None, back_edge_yield=True):
+def _translate(hexcode, back_edge_yield=True, spin_waits=None):
+    """back_edge_yield as --back-edge-yield sets it; None leaves the default."""
     image = bytes.fromhex(hexcode)
     config._install(
         [config.Section(".text", BASE, len(image), 0, len(image), True)],
@@ -27,7 +28,8 @@ def _translate(hexcode, spin_waits=None, back_edge_yield=True):
     db = {BASE: {"start": f"0x{BASE:08X}", "end": BASE + len(image),
                  "_addr": BASE, "size": len(image)}}
     t = FunctionTranslator(image, db)
-    t.back_edge_yield = back_edge_yield
+    if back_edge_yield is not None:
+        t.back_edge_yield = back_edge_yield
     if spin_waits is not None:
         t.spin_waits = SpinWaitReport(spin_waits)
     return t.translate_function(BASE, db[BASE])
@@ -46,15 +48,24 @@ def test_a_forward_jump_does_not():
 
 
 def test_a_lowered_spin_wait_keeps_its_own_yield():
-    code = _translate(SPIN, SpinWaitConfig(auto=False, sites={BASE}))
+    code = _translate(SPIN, spin_waits=SpinWaitConfig(auto=False, sites={BASE}))
     assert "RECOMP_SPIN_WAIT" in code
     assert "RECOMP_BACK_EDGE" not in code
 
 
-def test_the_switch_leaves_the_edges_bare():
-    code = _translate(COUNT_DOWN, back_edge_yield=False)
+def test_by_default_the_edges_stay_bare():
+    code = _translate(COUNT_DOWN, back_edge_yield=None)
     assert "goto loc_00010000; /* jne" in code, code
     assert "RECOMP_BACK_EDGE" not in code
+
+
+def test_the_batch_translator_defaults_to_bare_edges():
+    import inspect
+
+    from tools.recomp.translator import BatchTranslator
+
+    sig = inspect.signature(BatchTranslator.__init__)
+    assert sig.parameters["back_edge_yield"].default is False
 
 
 # +0 L0: dec ecx ; +1 jz J (+6) ; +3 cmp eax, 1 ; +6 J: jne L0 ; +8 ret

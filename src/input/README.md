@@ -7,7 +7,8 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | File | Purpose |
 |------|---------|
 | `xinput_xbox.h` | Public header: types, button constants, function prototypes |
-| `input_map.h`, `input_map.c` | The host → Xbox mapping table, the pure map and deadzone helpers |
+| `pad_map.h`, `pad_map.c` | The host → Xbox mapping table, the pure map and deadzone helpers |
+| `input_map.h`, `input_map.c` | Named bindings over the key table, pad remapping, deadzones, merging (`xbox_input_map`) |
 | `input_core.c` | The public API: connection cache, probe backoff, keyboard merge, shutdown |
 | `input_backend.h` | The seam between `input_core.c` and a host backend (tests swap it) |
 | `host_pad.h` | The host pad before any merge (`struct xbox_host_pad`, the host-only buttons) and the pad filter seam |
@@ -131,10 +132,10 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 
 ### Host controller → Xbox mapping
 
-One table in `input_map.c` drives both backends (XInput on Windows and
-Proton, the SDL3 gamepad API elsewhere); `tests/input_map` checks every row
+One table in `pad_map.c` drives both backends (XInput on Windows and
+Proton, the SDL3 gamepad API elsewhere); `tests/pad_map` checks every row
 and fails if the table below and the code disagree. Regenerate it with
-`INPUT_MAP_README_OUT=<file>` set when running the test.
+`PAD_MAP_README_OUT=<file>` set when running the test.
 
 - White is the left shoulder (LB) and Black the right shoulder (RB):
   Microsoft's own Xbox 360 convention, and xemu's default.
@@ -151,7 +152,7 @@ and fails if the table below and the code disagree. Regenerate it with
   `NORTH` are where A, B, X and Y sit on an Xbox pad, so a pad with other
   labels (Nintendo's swapped A/B, say) maps by place, not by letter.
 
-<!-- input_map:begin (generated from src/input/input_map.c; tests/input_map checks it) -->
+<!-- pad_map:begin (generated from src/input/pad_map.c; tests/pad_map checks it) -->
 | Host control | Guest field | Guest value | XInput | SDL3 |
 |---|---|---|---|---|
 | A | `bAnalogButtons[A]` | 255 held, 0 released | `A` | `SOUTH` |
@@ -174,7 +175,7 @@ and fails if the table below and the code disagree. Regenerate it with
 | Left stick Y | `sThumbLY` | -32768..32767, up positive | `sThumbLY` | `LEFTY` as `-1 - v` |
 | Right stick X | `sThumbRX` | -32768..32767, right positive | `sThumbRX` | `RIGHTX` |
 | Right stick Y | `sThumbRY` | -32768..32767, up positive | `sThumbRY` | `RIGHTY` as `-1 - v` |
-<!-- input_map:end -->
+<!-- pad_map:end -->
 
 **Host-only buttons.** A host pad has buttons the Duke never had, and the
 table above maps none of them to the guest. The backends report them
@@ -221,6 +222,12 @@ and the SDL window on macOS and Linux turns SDL keycodes into the same codes
 table below and the code disagree; regenerate it with
 `INPUT_KEYBOARD_README_OUT=<file>` set when running the test.
 
+The map is resolved by the mapping rules below (`input_map.c`), as the
+bindings `xbox_InputKeyboardBindings` builds from it, so a named binding and
+the map read the same table. The pad is the same as before the map used them:
+`tests/input_keyboard_map` compares it, byte for byte, with a frozen copy of
+v0.14.0's resolver.
+
 - Keys are read only while the game's window has the focus. Losing the
   focus (and on SDL, hiding or minimising the window) releases every key.
 - Letters follow the keyboard layout (the key labelled Z), not the
@@ -263,6 +270,12 @@ table below and the code disagree; regenerate it with
 | J | Right stick left |
 | L | Right stick right |
 <!-- keyboard_map:end -->
+
+As binding text (`xbox_InputMap_BindingsFormat`), the same map is
+`dpad_up = up`, `start = enter`, `back = backspace`, `left_thumb = shift`,
+`right_thumb = ctrl`, `a = Z` ... `white = Q`, `left_trigger = 1`,
+`left_stick_up = W, Numpad8` and so on: a port that lets the player rebind
+starts from that.
 
 ### Keyboard and mouse
 
@@ -350,3 +363,87 @@ pad connected before launch is connected at the first read.
 ```
 
 The Xbox supports 4 controllers. Each port can have a controller with optional memory units and other accessories. This layer only handles the gamepad; memory unit emulation is not needed for recompiled games.
+
+## Bindings, remapping and deadzones
+
+`input_map.h` (target `xbox_input_map`) holds the rules a port needs to let a
+player choose their controls, on the same key table as the keyboard map above:
+
+- **Named bindings.** Up to four keys or mouse buttons per Xbox control,
+  written as text: `xbox_InputMap_BindingsParse(&b, INPUT_A, "L, Space, Mouse1")`
+  and `xbox_InputMap_BindingsFormat` back. The names are the persistence
+  format; a binding holds the Windows VK code from `keyboard.h`, so the
+  held-key array is that table and there is one key space on every host.
+  Names are ASCII case-insensitive. Unknown or oversized names and a fifth
+  key are skipped and counted in the return value; duplicates are dropped;
+  `none` or empty clears a control. Long text is read in full, not truncated.
+- **Key resolution.** `xbox_InputMap_KeysResolve` turns held keys into an
+  `XBOX_GAMEPAD`: the eight digital controls set their `wButtons` bit, the
+  eight analog ones read 255, stick keys give full deflection and opposite
+  keys cancel. Two directions at once give (32767, 32767), as the keyboard
+  map always has; `b.diagonal = INPUT_DIAGONAL_ROUND` makes the stick a unit
+  circle instead, (23169, 23169), so a diagonal is no faster than a straight
+  line.
+- **Pad remapping.** `xbox_InputMap_PadMap` takes each of the sixteen digital
+  and trigger controls from one named physical control (SDL's positional
+  names: `south` is the bottom face button), and each stick from either
+  physical stick or none. `InputRaw.src[]` is 0..32767 (a button is 0 or
+  32767; missing and negative read as 0); sticks are signed with Y positive
+  upwards. Face buttons and shoulders come out as 0/255, triggers keep their
+  travel. `xbox_InputMap_PadMapDefaults` is the identity (shoulders as Black
+  and White, as `xinput_device.c` maps them) with 15% stick deadzones, a 5%
+  trigger threshold and a 50% press threshold; it is an initializer, applied
+  only by a port that calls it.
+- **Deadzones.** `xbox_InputMap_ApplyStick` is radial: inside the deadzone the
+  stick is centred, beyond it the range is stretched so full deflection stays
+  full and the direction is kept. `xbox_InputMap_ApplyTrigger` zeroes a
+  trigger below its threshold and stretches the rest to 0..255. Percentages
+  are clamped to 0..95 (the press threshold to 0..100).
+- **Merging.** `xbox_InputMap_PadMerge` ORs buttons, takes the larger analog
+  value, and takes whichever whole stick is deflected further (the
+  destination wins ties).
+
+Key names: letters `A`..`Z`, digits `0`..`9`, `F1`..`F12`, `Numpad0`..`Numpad9`,
+`numpadmultiply` `numpadadd` `numpadsubtract` `numpaddecimal` `numpaddivide`,
+`space` `enter` (`return`) `backspace` `tab` `escape` (`esc`) `pause` `capslock`,
+`up` `down` `left` `right` `home` `end` `pageup` `pagedown` `insert` `delete`,
+`shift` `ctrl` (`control`) `alt` and the sides `lshift` `rshift` `lctrl` `rctrl`
+`lalt` `ralt`, punctuation `semicolon` `equals` `comma` `minus` `period` `slash`
+`grave` `leftbracket` `backslash` `rightbracket` `quote` (the US layout's keys,
+as Windows reports them), and `mouse1`..`mouse5`. The mouse wheel has no VK
+code and is not a key here.
+
+Letters and punctuation are logical keys (the key labelled Z), not text or
+physical positions; layouts and IME are the writer's business. `shift` and
+`lshift` are different keys: a binding to `shift` is pressed by either side,
+one to `lshift` only by the left, so the writers record both.
+
+The module is pure arithmetic and text: no device, window or SDL, no mutable
+globals. States belong to the caller; independent states can be used from
+different threads. Required pointers must be non-NULL unless a function says
+otherwise.
+
+```c
+#include "input_map.h"
+
+InputBindings bindings = {0};
+uint8_t held[INPUT_KEY_COUNT] = {0};
+XBOX_GAMEPAD pad;
+
+xbox_InputMap_BindingsParse(&bindings, INPUT_A, "space, mouse1");
+held[XBOX_VK_SPACE] = 1;          /* or the key table, as keyboard.c reads it */
+xbox_InputMap_KeysResolve(&bindings, held, &pad);
+/* pad.bAnalogButtons[XBOX_BUTTON_A] == 255 */
+```
+
+A port links `xbox_input_map` (or `xbox_input`, which links it); a port
+that wants only the rules can `add_subdirectory(src/input/mapping)` without
+SDL or the rest of the runtime. It needs the C math library (`m` on non-MSVC
+toolchains) for the radial deadzone. `tests/input_map` checks it with no
+controller, game data or SDL:
+
+```sh
+cmake -S tests/input_map -B build/input-map -DCMAKE_BUILD_TYPE=Release
+cmake --build build/input-map --config Release
+ctest --test-dir build/input-map -C Release --output-on-failure
+```

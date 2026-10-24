@@ -52,6 +52,10 @@ extern "C" {
  * #ifndef RECOMP_ENV_HAVE_FOLDER_ROWS until its pin is past this change.
  * Defined before the game header is included, for that test. */
 #define RECOMP_ENV_HAVE_FOLDER_ROWS 1
+/* RUMBLE (RECOMP_RUMBLE) is a toolkit row since v0.16, read by the OHCI pad
+ * model; a game that defined it as its own key keeps that row under
+ * #ifndef RECOMP_ENV_HAVE_RUMBLE_ROW, as above. */
+#define RECOMP_ENV_HAVE_RUMBLE_ROW 1
 
 #ifdef RECOMP_ENV_HAVE_GAME_KEYS
 #include "recomp_env_game.h"
@@ -97,7 +101,10 @@ extern "C" {
     X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off") \
     X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, d3d11, null") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host); the template's Windows fatal-error dialog is skipped too") \
-    X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
+    X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host and the Win32 framebuffer window, 1-8, default 2)") \
+    X(FB_FULLSCREEN,     CONFIG, "RECOMP_FULLSCREEN",        NULL, "Win32 framebuffer window: 1 starts in borderless fullscreen (F11 / Alt+Enter toggle)") \
+    X(D3D_PRESENT,       CONFIG, "RECOMP_D3D_PRESENT",       NULL, "Win32 framebuffer window: 1 presents through D3D11 instead of GDI (falls back to GDI on failure)") \
+    X(CLOSE_KEEPS_RUNNING, CONFIG, "RECOMP_CLOSE_KEEPS_RUNNING", NULL, "Win32 framebuffer window: 1 closing the window only closes it; default ends the process") \
     X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync: SDL host 0 = off (default on); D3D11 1 = on (default off)") \
     X(WINDOW_QUIT_AFTER, CONFIG, "RECOMP_WINDOW_QUIT_AFTER", NULL, "close the window after this many seconds") \
     X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window (not beside the d3d11 backend)") \
@@ -106,10 +113,17 @@ extern "C" {
     X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA/CACHE") \
     X(DXBC_CACHE,        CONFIG, "RECOMP_DXBC_CACHE",        NULL, "D3D11 compiled-shader (DXBC) cache: on (default, <hdd dir>/ShaderCache/dxbc), 0/off/false/no: off, or an absolute directory") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
-    X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt; =0 off") \
+    X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "vblank interrupt: unset, empty or 0 off (default); paced the 60 Hz schedule with the KickOff ack watch; any other value the plain tick, which becomes the schedule when RECOMP_DISPATCH_GATE or RECOMP_FLIP_PACING is on") \
     X(TITLE_KEVENTS,     CONFIG, "RECOMP_TITLE_KEVENTS",     NULL, "1: a KEVENT the title builds itself gets a host event (upstream, default off)") \
-    X(FILE_APC_DEFER,    CONFIG, "RECOMP_FILE_APC_DEFER",    NULL, "0: run a file I/O APC inside the request (old inline delivery); default 1 runs it at the issuing thread's next alertable wait, as the kernel does") \
+    X(FILE_APC_DEFER,    CONFIG, "RECOMP_FILE_APC_DEFER",    NULL, "1: run a file I/O APC at the issuing thread's next alertable wait, as the kernel does; 0: inside the request (inline); default inline unless the title calls xbox_SetDeferredIoApc") \
     X(GUEST_LOCK,        CONFIG, "RECOMP_GUEST_LOCK",        NULL, "1: one guest thread runs guest code at a time, released in kernel calls (upstream, default off)") \
+    X(DISPATCH_GATE,     CONFIG, "RECOMP_DISPATCH_GATE",     NULL, "1: the one-CPU DISPATCH gate: device interrupts are posted to the holder and run at its safe points, and queued DPCs run on the guest thread at its raise and release (default off)") \
+    X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "1: the walker and the KickOff ack hold after a flip until the guest vblank reaches the swap's interval, and a frame counter the title moves itself is left to it; edge: D3D's rule, a late frame waits for the next vblank; default off: a FLIP_STALL completes at once and registered frame counters are bumped on every flip") \
+    X(GUEST_CPUS,        CONFIG, "RECOMP_GUEST_CPUS",        NULL, "one: the title's threads on one host core, as on the console; n: that core; unset or all: every core (default)") \
+    X(CPUID_NO_SIMD,     CONFIG, "RECOMP_CPUID_NO_SIMD",     NULL, "1: cpuid hides MMX, FXSR and SSE, for a title whose SIMD paths do not lift correctly (default: reported, as on the console's P3)") \
+    X(CONTIG_AVOID_IMAGE, CONFIG, "RECOMP_CONTIG_AVOID_IMAGE", NULL, "1: contiguous allocations stay out of the loaded image's physical range (default off: they fill from the bottom, as on the console)") \
+    X(RUMBLE,            CONFIG, "RECOMP_RUMBLE",            NULL, "0: ignore the title's rumble reports (default: forwarded to the host pad)") \
+    X(APU_HRTF,          CONFIG, "RECOMP_APU_HRTF",          NULL, "0: no HRTF filter on 3D voices (default on)") \
     X(HEAP_RECLAIM,      CONFIG, "RECOMP_HEAP_RECLAIM",      NULL, "1: on, the heap splits and merges freed blocks (upstream); 0 or empty: off; a game may default it on") \
     X(HEAP_QUARANTINE,   CONFIG, "RECOMP_HEAP_QUARANTINE",   NULL, "=KiB: freed heap blocks held back from reuse, oldest first, up to that much; a larger block is freed at once (8192 suggested); 0 or empty: off") \
     X(EXT_VMA,           CONFIG, "RECOMP_EXT_VMA",           NULL, "set: honour reservations at fixed addresses above the RAM mirrors (upstream, default off)") \
@@ -213,14 +227,12 @@ extern "C" {
     X(APU_MIXDOWN_ALL,   DEBUG, "apu_mixdown_all", "RECOMP_APU_MIXDOWN_ALL",   "=0: two bins; =2: all at unity") \
     X(POKE,              DEBUG, "poke",            "RECOMP_POKE",              "=va:value,...: write guest words") \
     X(WORKERS,           DEBUG, "workers",         "RECOMP_WORKERS",           "=inline: run worker threads inline") \
-    X(GUEST_CPUS,        DEBUG, "guest_cpus",      "RECOMP_GUEST_CPUS",        "=one (default, as on the console) | all: the title's threads on one host core or every core; =n: that core") \
     X(GUEST_PRIORITY,    DEBUG, "guest_priority",  NULL,                       "=0: KeSetBasePriorityThread leaves host thread priorities alone and KeQueryBasePriorityThread reads 0; default 1: the title's priorities reach its host threads where they exclude (native Windows, not Wine, guest threads pinned to one core, guest CPU lock off); =2: everywhere (A/B)") \
-    X(GUEST_QUANTUM,     DEBUG, "guest_quantum",   NULL,                       "=ms: a guest thread that has held the guest CPU (RECOMP_GUEST_LOCK) this long with another waiting hands it over at its next kernel call (default 4; 0: at every kernel call)") \
+    X(GUEST_QUANTUM,     DEBUG, "guest_quantum",   "RECOMP_GUEST_QUANTUM",     "=ms: a guest thread that has held the guest CPU (RECOMP_GUEST_LOCK) this long with another waiting hands it over at its next kernel call (default 4; 0: at every kernel call)") \
     X(GUEST_SCHED,       DEBUG, "guest_sched",     NULL,                       "=1: with the guest CPU lock on and guest_priority not 0, the guest CPU follows the title's thread priorities: a release goes to the highest-priority waiter, a holder that outranks every waiter keeps it, the priority query reads the stored value and another guest thread's suspend is counted guest-side (default 0: FIFO, priorities as guest_priority says)") \
     X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
     X(ASYNC_IO,          DEBUG, "async_io",        "RECOMP_ASYNC_IO",          "asynchronous file I/O") \
     X(UNIMPL_TRAP,       DEBUG, "unimpl_trap",     "RECOMP_UNIMPL_TRAP",       "stop at an unimplemented instruction") \
-    X(CPUID_MMX,         DEBUG, "cpuid_mmx",       NULL,                       "=1: cpuid reports MMX/FXSR/SSE (D3DX JPEG takes its MMX IDCT); default masked") \
     X(D3D11_MEMO,        DEBUG, "d3d11_memo",      "RECOMP_D3D11_MEMO",        "=0: no D3D11 state memo") \
     X(D3D11_NO_CULL,     DEBUG, "d3d11_no_cull",   "RECOMP_D3D11_NO_CULL",     "D3D11 culls nothing") \
     X(D3D11_CULL_FLIP,   DEBUG, "d3d11_cull_flip", "RECOMP_D3D11_CULL_FLIP",   "D3D11 culls the other winding") \
@@ -286,15 +298,14 @@ extern "C" {
     X(PROF,              TRACE, "prof",            NULL,                       "=hz (1: 250): sample every thread's pc in-process (Windows, Wine, macOS); report at exit, module offsets for the bench to symbolise (host_prof.h)") \
     X(PROF_DELAY,        TRACE, "prof_delay",      NULL,                       "=s: prof starts sampling after this many seconds (default 0)") \
     X(PROF_OUT,          TRACE, "prof_out",        NULL,                       "=path: prof's report (default recomp-prof.txt in the working directory)") \
-    X(GUEST_CPU_TRACE,   TRACE, "guest_cpu",       NULL,                       "=ms: [GUEST] each hold of the guest CPU (RECOMP_GUEST_LOCK) longer than ms and where it ended (first 50, then one a second)") \
+    X(GUEST_CPU_TRACE,   TRACE, "guest_cpu",       "RECOMP_GUEST_CPU_TRACE",   "=ms: [GUEST] each hold of the guest CPU (RECOMP_GUEST_LOCK) longer than ms and where it ended (first 50, then one a second)") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
-    X(FLIP_PACING,       DEBUG, "flip_pacing",     NULL,                       "=0: a FLIP_STALL completes at once and registered frame counters are bumped on every flip, as before (default: the walker and the KickOff ack hold after a flip until the guest vblank reaches the swap's interval, and a counter the title moves itself is left to it); =edge: D3D's rule, a late frame waits for the next vblank (A/B)") \
     X(MISSING,           TRACE, "missing",         "RECOMP_MISSING_FILES",     "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes, every FAILED repeat and NtOpenFile/IoCreateFile successes") \
     X(MISSING_LIST,      DEBUG, "missing_list",    "RECOMP_MISSING_FILES_LIST","=path: the unique missing files with their attempt counts, written once by the first summary") \
-    X(IRQ_SAFE_POINTS,   DEBUG, "irq_safe_points", NULL,                       "=0: device interrupts run beside the one-CPU gate holder after a hold-off, as before (default: posted, run by the holder at its next kernel call, spin-wait yield or gate release)") \
-    X(IRQ_SAFE_MS,       DEBUG, "irq_safe_ms",     NULL,                       "=ms: how long a posted interrupt waits for the holder's safe point before the [IRQ] wait log (default 250; again every second)") \
-    X(IRQ_SAFE_FORCE,    DEBUG, "irq_safe_force",  NULL,                       "=1: past irq_safe_ms, deliver beside the holder (A/B; reinstates the race)") \
-    X(DPC_ON_RAISE,      DEBUG, "dpc_on_raise",    NULL,                       "=0: DPCs queued by an interrupt wait for the timer thread's drain, as before (default: a guest thread runs them on its next raise to DISPATCH or at its gate release, and KeInsertQueueDpc wakes the timer thread)") \
+    X(IRQ_SAFE_POINTS,   DEBUG, "irq_safe_points", "RECOMP_IRQ_SAFE_POINTS",   "=0: with RECOMP_DISPATCH_GATE, device interrupts run beside the gate holder after a hold-off (default with the gate: posted, run by the holder at its next kernel call, spin-wait yield or gate release; without the gate: off)") \
+    X(IRQ_SAFE_MS,       DEBUG, "irq_safe_ms",     "RECOMP_IRQ_SAFE_MS",       "=ms: how long a posted interrupt waits for the holder's safe point before the [IRQ] wait log (default 250; again every second)") \
+    X(IRQ_SAFE_FORCE,    DEBUG, "irq_safe_force",  "RECOMP_IRQ_SAFE_FORCE",    "=1: past irq_safe_ms, deliver beside the holder (A/B; reinstates the race)") \
+    X(DPC_ON_RAISE,      DEBUG, "dpc_on_raise",    "RECOMP_DPC_ON_RAISE",      "=0: with RECOMP_DISPATCH_GATE, DPCs queued by an interrupt wait for the timer thread's drain (default with the gate: a guest thread runs them on its next raise to DISPATCH or at its gate release, and KeInsertQueueDpc wakes the timer thread; without the gate: off)") \
     X(PRESENT_STALE,     DEBUG, "present_stale",   NULL,                       "=n: a colour surface not drawn or cleared for n flips no longer sets the present size (default 120)") \
     X(TEX_CACHE,         DEBUG, "tex_cache",       NULL,                       "=n: GPU texture-cache entries in use, 1..512 (default 512 on D3D11, 256 on Metal)") \
     X(ZBUF_SLOTS,        DEBUG, "zbuf_slots",      NULL,                       "=n: CPU raster depth/stencil buffers kept, by zeta offset and clip extent, 1..16 (default 8)") \
