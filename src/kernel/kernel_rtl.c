@@ -260,12 +260,13 @@ static int g_cs_single_mode = -1;   /* 0 shadow, 1 single, 2 guest-struct */
  *
  * Not the NT layout: the state sits at +0x10, not +0x04. Structures that
  * do not read as critical sections at all (the XDK hands some over as
- * plain tokens) fall back to the shadow, classified once per address --
- * the fast path's writes keep its own classification true, and a shadow
- * address is never written by it. Waits sleep on a host semaphore, one
- * per lock, memoised like everything else in this file. The owner field
- * holds the taking thread's TIB address: a guest pointer every thread
- * that runs guest code has. Off by default (RECOMP_CS_MODE=guest). */
+ * plain tokens) fall back to the shadow; which is which is the header
+ * word at +0x00 -- the initialiser's own marker, written also by the
+ * statically-zeroed claim -- so the classification lives in the lock and
+ * cannot disagree with itself between threads. Waits sleep on a host
+ * semaphore, one per lock for the lock's life. The owner field holds the
+ * taking thread's TIB address: a guest pointer every thread that runs
+ * guest code has. Off by default (RECOMP_CS_MODE=guest). */
 extern ptrdiff_t g_xbox_mem_offset;   /* fully declared below */
 
 static uint32_t xbox_cs_guest_tid(void)
@@ -273,39 +274,70 @@ static uint32_t xbox_cs_guest_tid(void)
     return g_fs_base ? g_fs_base : (uint32_t)GetCurrentThreadId();
 }
 
-#define CS_SEM_TABLE 1024u
+/* A guest-bytes lock carries the header the XDK's own initialiser writes:
+ * Type 1, Size 4. That word is the classification -- it lives in the lock
+ * itself, so it cannot be evicted out from under a thread that holds the
+ * lock, which is what a memoised classification suffered from: an evicted
+ * entry sent the next Enter to the shadow path while another thread held
+ * the guest bytes, and the two paths then guarded the same lock
+ * independently. RtlInitializeCriticalSection writes the marker, the
+ * statically-zeroed claim below writes it, and nothing else does -- a
+ * token the XDK hands over that is not a critical section never carries
+ * it and always takes the shadow. */
+#define CS_GUEST_MARKER 0x00040001u
+
+static int cs_guest_is_cs(const uint8_t* g)
+{
+    return *(volatile const uint32_t*)(g + 0x00) == CS_GUEST_MARKER;
+}
+
+#define CS_SEM_TABLE 4096u
 static struct { uint32_t key; HANDLE sem; } g_cs_sem_memo[CS_SEM_TABLE];
+static CRITICAL_SECTION g_cs_sem_lock;
+static INIT_ONCE g_cs_sem_once = INIT_ONCE_STATIC_INIT;
 
-static HANDLE xbox_cs_sem(uint32_t cs_va)
+static BOOL CALLBACK xbox_cs_sem_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
-    uint32_t slot = (cs_va >> 4) & (CS_SEM_TABLE - 1u);
-    HANDLE h;
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_cs_sem_lock);
+    return TRUE;
+}
 
-    if (g_cs_sem_memo[slot].key == cs_va)
-        return g_cs_sem_memo[slot].sem;
-    h = CreateSemaphoreW(NULL, 0, 0x7FFFFFFF, NULL);
-    if (!h)
-        return NULL;
-    g_cs_sem_memo[slot].key = cs_va;
-    g_cs_sem_memo[slot].sem = h;
+/* One semaphore per lock, for the lock's life. Every path runs under one
+ * host lock, and the table is probed and insert-only: a slot is never
+ * re-keyed, so two racing first callers cannot each create a semaphore
+ * and then have a waiter sleep on one while the releaser signals the
+ * other, and a handle once handed out is the handle every future caller
+ * gets. Lookup-only (create == 0) never inserts; a lock the fast path
+ * runs on always has its entry, because the waiter that needed it passed
+ * here first. */
+static HANDLE xbox_cs_sem(uint32_t cs_va, int create)
+{
+    uint32_t home = (cs_va >> 4) & (CS_SEM_TABLE - 1u);
+    HANDLE h = NULL;
+    size_t i;
+
+    InitOnceExecuteOnce(&g_cs_sem_once, xbox_cs_sem_init, NULL, NULL);
+    EnterCriticalSection(&g_cs_sem_lock);
+    for (i = 0; i < CS_SEM_TABLE; i++) {
+        uint32_t slot = (home + (uint32_t)i) & (CS_SEM_TABLE - 1u);
+        if (g_cs_sem_memo[slot].key == cs_va) {
+            h = g_cs_sem_memo[slot].sem;
+            break;
+        }
+        if (g_cs_sem_memo[slot].key == 0) {
+            if (create) {
+                h = CreateSemaphoreW(NULL, 0, 0x7FFFFFFF, NULL);
+                if (h) {
+                    g_cs_sem_memo[slot].sem = h;
+                    g_cs_sem_memo[slot].key = cs_va;   /* published last */
+                }
+            }
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs_sem_lock);
     return h;
-}
-
-/* One classification bit per address: fast (guest bytes) or shadow. */
-#define CS_CLASS_SIZE 1024u
-static struct { uint32_t key; uint8_t fast; } g_cs_class[CS_CLASS_SIZE];
-
-static int cs_class_fast(uint32_t va)
-{
-    uint32_t slot = (va >> 4) & (CS_CLASS_SIZE - 1u);
-    return g_cs_class[slot].key == va && g_cs_class[slot].fast;
-}
-
-static void cs_class_mark(uint32_t va)
-{
-    uint32_t slot = (va >> 4) & (CS_CLASS_SIZE - 1u);
-    g_cs_class[slot].key = va;
-    g_cs_class[slot].fast = 1;
 }
 
 static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
@@ -322,16 +354,22 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
         g_cs_single_mode = !mode ? 0
                        : !strcmp(mode, "single") ? 1
                        : !strcmp(mode, "guest") ? 2 : 0;
-        if (g_cs_single_mode)
+        if (g_cs_single_mode == 1)
             fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
                             "shares one recursive lock\n");
     }
-    if (g_cs_single_mode) {
+    if (g_cs_single_mode == 1) {
         if (!guest)
             return NULL;
         InitOnceExecuteOnce(&g_cs_single_once, xbox_cs_single_init, NULL, NULL);
         return &g_cs_single;
     }
+    /* Mode 2 (guest bytes) falls through to the ordinary shadow: the fast
+     * path owns the guest bytes of the locks it classified, and everything
+     * else -- tokens the XDK hands over that are not critical sections --
+     * needs exactly the per-address shadow mode 0 provides. The one
+     * shared lock is wrong here: it serialises unrelated fallback objects
+     * against each other, which mode 0 never did. */
     uintptr_t key = (uintptr_t)guest;
     CRITICAL_SECTION* found = NULL;
     size_t home, i;
@@ -551,13 +589,12 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         volatile uint32_t* owner = (volatile uint32_t*)(g + 0x18);
         uint32_t me = xbox_cs_guest_tid();
         LONG v = InterlockedCompareExchange(lock, 0, -1);
-        if (v == -1) {                     /* was free: ours */
-            cs_class_mark(gva);
-            *owner = me;
-            *rec = 1;
-            return;
-        }
-        if (cs_class_fast(gva)) {
+        if (cs_guest_is_cs(g)) {
+            if (v == -1) {                 /* was free: ours */
+                *owner = me;
+                *rec = 1;
+                return;
+            }
             if (*owner == me) {            /* ours: recurse */
                 InterlockedIncrement(lock);
                 (*rec)++;
@@ -570,9 +607,17 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
                     else (*rec)++;
                     return;
                 }
-                HANDLE sem = xbox_cs_sem(gva);
+                HANDLE sem = xbox_cs_sem(gva, 1);
                 if (sem) {
                     WaitForSingleObject(sem, INFINITE);
+                    *owner = me;
+                    *rec = 1;
+                } else {
+                    /* No semaphore room (table full): the bytes are still
+                     * ours to wait on -- spin at yield priority rather than
+                     * split the lock with the shadow path. */
+                    while (InterlockedCompareExchange(lock, 0, -1) != -1)
+                        SwitchToThread();
                     *owner = me;
                     *rec = 1;
                 }
@@ -583,15 +628,20 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
                   && *(volatile uint32_t*)(g + 0x08) == 0) {
             /* Statically zeroed, never announced: claim by ownership. The
              * list entry being nulled too keeps the claim conservative --
-             * an initialised one is self-linked, not zero. */
+             * an initialised one is self-linked, not zero. The claim
+             * writes the marker, which is what makes it a guest-bytes
+             * lock from here on; the lock word goes to -1 first, so a
+             * racing Enter that reads the marker sees a free fast lock,
+             * not one frozen mid-claim. */
             if (InterlockedCompareExchange((volatile LONG*)owner,
                                            (LONG)me, 0) == 0) {
-                cs_class_mark(gva);
+                *(volatile LONG*)lock = -1;         /* free, fast layout */
+                *(volatile uint32_t*)(g + 0x00) = CS_GUEST_MARKER;
                 *rec = 1;
                 return;
             }
         }
-        /* Not ours and not a fast-classified lock: the shadow owns it. */
+        /* Not a guest-bytes lock and not claimable: the shadow owns it. */
     }
     {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
@@ -649,9 +699,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    if (g_cs_single_mode == 2
-        && cs_class_fast((uint32_t)((uintptr_t)CriticalSection
-                                    - (uintptr_t)g_xbox_mem_offset))) {
+    if (g_cs_single_mode == 2 && cs_guest_is_cs((const uint8_t*)CriticalSection)) {
         uint8_t* g = (uint8_t*)CriticalSection;
         uint32_t gva = (uint32_t)((uintptr_t)g - (uintptr_t)g_xbox_mem_offset);
         volatile LONG* lock = (volatile LONG*)(g + 0x10);
@@ -662,7 +710,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         if (--(*rec) == 0) {
             *owner = 0;
             if (InterlockedDecrement(lock) >= 0) {  /* waiters pending */
-                HANDLE sem = xbox_cs_sem(gva);
+                HANDLE sem = xbox_cs_sem(gva, 0);   /* inserted at first wait */
                 if (sem)
                     ReleaseSemaphore(sem, 1, NULL);
             }
