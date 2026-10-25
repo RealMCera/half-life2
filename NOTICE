@@ -18,6 +18,11 @@ LGPL-2.1-or-later — extracted from xemu
                           2019-2025 Matt Borgerson
     src/apu/apu_dsp.c     MCPX APU DSP (GP/EP)
                           (c) 2012 espes; 2019-2025 Matt Borgerson
+    src/apu/apu_dsp_emu.c MCPX APU GP/EP device on the dsp56300 JIT
+    src/apu/apu_dsp_emu.h (gp_ep.c and dsp_dma.c; the glue to the core
+                          is this project's own)
+                          (c) 2012, 2015 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
     src/apu/apu_vp.c      MCPX APU voice processor
                           (c) 2012 espes; 2018-2019 Jannik Vogel;
                           2019-2025 Matt Borgerson
@@ -54,6 +59,80 @@ LGPL-2.1-or-later — extracted from xemu
   satisfies that.
 
 
+MIT and permissive — dsp56300, optional (XBOXRECOMP_APU_DSP)
+------------------------------------------------------------
+
+  https://github.com/xemu-project/dsp56300  (v1.0.0)
+  (c) 2026 Matt Borgerson. MIT; the text is in LICENSES/MIT-dsp56300.txt.
+
+  A Motorola DSP56300 JIT in Rust with a C interface. It is not in this
+  repository: a build with -DXBOXRECOMP_APU_DSP=ON (default OFF) downloads
+  the project's prebuilt static library for its target, pinned by sha256
+  in cmake/dsp56300.cmake, and links it into the APU. Builds with the
+  option OFF contain none of it.
+
+  That library bundles the Rust standard library, copyright The Rust
+  Project Developers, used here under Apache-2.0 (it is MIT OR Apache-2.0;
+  the text is in LICENSES/Apache-2.0.txt), and these crates, the normal dependencies of dsp56300-emu-ffi in its
+  Cargo.lock at v1.0.0 (build-only tools such as cbindgen, MPL-2.0, are
+  not linked). None is GPL or LGPL.
+
+    Apache-2.0 WITH LLVM-exception
+      cranelift-assembler-x64, cranelift-bforest, cranelift-bitset,
+      cranelift-codegen, cranelift-codegen-shared, cranelift-control,
+      cranelift-entity, cranelift-frontend, cranelift-jit,
+      cranelift-module, cranelift-native, regalloc2, target-lexicon,
+      wasmtime-internal-core, wasmtime-internal-jit-icache-coherence
+    MIT
+      dsp56300-core, dsp56300-emu, dsp56300-emu-ffi, libm, region
+    Zlib
+      foldhash (c) 2024 Orson Peters
+    (MIT OR Apache-2.0) AND Unicode-3.0
+      unicode-ident
+    MIT OR Apache-2.0 (some also BSD-2-Clause)
+      allocator-api2, anyhow, arbitrary, bitflags, bumpalo, cfg-if,
+      equivalent, fnv, gimli, hashbrown, indexmap, libc, log, mach2,
+      memmap2, proc-macro2, quote, rustc-hash, serde, serde_core,
+      serde_derive, smallvec, stable_deref_trait, syn, windows-link,
+      windows-sys, windows-targets, windows_*_gnu, windows_*_gnullvm,
+      windows_*_msvc
+
+  The texts: LICENSES/Apache-2.0.txt, LICENSES/LLVM-exception.txt,
+  LICENSES/Unicode-3.0.txt, LICENSES/Zlib-foldhash.txt; MIT is the
+  licence of this repository. LICENSES/THIRDPARTY-dsp56300-emu.txt is the
+  archive's own third-party file, verbatim, with each crate's copyright.
+
+
+MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
+-------------------------------------------------------------------
+
+  Vendored unmodified under third_party/ and compiled only in builds with
+  -DXBOXRECOMP_ENHANCE=ON. Each directory's VERSION file names the
+  upstream commit and the sha256 of every file.
+
+  third_party/microui/  microui 2.02
+                        https://github.com/rxi/microui
+                        (c) 2024 rxi. MIT; the text is in
+                        LICENSES/MIT-microui.txt.
+
+  third_party/stb/      stb_truetype.h v1.26
+                        https://github.com/nothings/stb
+                        (c) 2017 Sean Barrett. MIT or public domain, at
+                        the user's choice; the text is in
+                        LICENSES/MIT-stb.txt.
+
+  third_party/fonts/atkinson-hyperlegible/
+                        Atkinson Hyperlegible Regular 1.006
+                        https://github.com/google/fonts (ofl/atkinsonhyperlegible)
+                        (c) 2020 Braille Institute of America, Inc.
+                        SIL Open Font License 1.1; the text is in OFL.txt
+                        beside the font and in
+                        LICENSES/OFL-1.1-atkinson-hyperlegible.txt.
+                        The fonts are embedded in the binary as they are.
+                        The OFL allows bundling them with software; they
+                        are not sold on their own and are not renamed.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 
@@ -67,12 +146,26 @@ Derived algorithms — credited, independently implemented
     NV2A register-combiner translation. Cites xemu's pgraph combiner
     implementation as a reference for the hardware's behaviour.
 
+  src/kernel/nv2a_vsh_fields.h
+    The NV2A vertex-program field table, as (word, shift, bits). Cites
+    xemu's hw/xbox/nv2a/pgraph/vsh.c as the reference for the layout.
+
+  src/kernel/nv2a_combiner.h
+    NV2A register-combiner field table and CPU evaluator. Cites xemu's
+    hw/xbox/nv2a/pgraph/glsl/psh.c as the reference for the encoding and
+    the combiner semantics.
+
+  src/kernel/nv2a_backend_common.h
+    Cube-map face selection and face stride. Cites xemu's
+    hw/xbox/nv2a/pgraph texture code (texture.c) as the reference for the
+    face order and the per-face layout.
+
   Algorithms and hardware behaviour are not themselves copyrightable, and
   these are our own implementations. They are listed here because the debt is
   real and should be visible even where no licence obligation attaches. If
-  anyone believes either file crosses from "implements the same algorithm"
-  into "copies the expression", raise an issue and we will rewrite or
-  relicense it — getting the credit right matters more to us than the licence
+  anyone believes any of these files crosses from "implements the same
+  algorithm" into "copies the expression", raise an issue and we will rewrite
+  or relicense it — getting the credit right matters more to us than the licence
   label.
 
 

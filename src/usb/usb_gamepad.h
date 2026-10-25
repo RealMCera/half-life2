@@ -36,6 +36,10 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
 /* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
 int usb_gamepad_report(int pad, uint8_t *out, int max);
 
+/* The executor's flip count, for flip-timed pad scripts and the pad
+ * recorder (pad_script.h). Called on each NV097_FLIP_INCREMENT_WRITE. */
+void usb_gamepad_flip(uint32_t flip);
+
 /* The address the host assigned pad `pad` with SET_ADDRESS, 0 until it does,
  * and whether it has been configured. */
 uint8_t usb_gamepad_address(int pad);

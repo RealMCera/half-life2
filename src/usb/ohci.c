@@ -7,6 +7,7 @@
  * that decides how the rest gets built.
  */
 #include "ohci.h"
+#include "recomp_env.h"
 #include "../platform/mmio_decode.h"
 #include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
@@ -21,10 +22,11 @@
 
 /* Where the registers can be trapped. They are answered by faulting on the
  * aperture and decoding the instruction that touched it: the x86-64 decoder
- * under a Win32 VEH, or the A64 decoder under a POSIX SIGBUS/SIGSEGV
- * handler. A host with neither leaves the model off (see xbox_OhciInit). */
-#if defined(_WIN32)
-#  define OHCI_TRAP_WIN32 1
+ * under a Win32 VEH or an x86-64 Linux SIGSEGV handler, or the A64 decoder
+ * under a POSIX SIGBUS/SIGSEGV handler. A host with neither leaves the model
+ * off (see xbox_OhciInit). */
+#if defined(MMIO_DECODE_X64)
+#  define OHCI_TRAP_X64 1
 #elif defined(__aarch64__)
 #  define OHCI_TRAP_POSIX_A64 1
 #endif
@@ -508,35 +510,167 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * never hands out contiguous memory that overlaps the image, so an address
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
-static uint32_t bus_resolve(uint32_t addr)
+ * again, forever.
+ *
+ * The image therefore comes first. The contiguous allocator here does hand
+ * out physical numbers inside the image's range (its window is separate
+ * storage, so nothing collides there), and asking its page map first, as
+ * mcpx_apu_phys (apu_core.c) does, sent 0x0041A904 to the window again:
+ * Burnout 3's boot allocates 0x803E7000..0x805E7000 before XPP enumerates,
+ * so page 0x41A is "contiguous", and enumeration retried the descriptor for
+ * ever with the pad never attached. Outside the image the page map is asked
+ * next: a page the first-fit allocator handed out -- or the reserved page 0,
+ * where XPP keeps its private arena -- is the window; then the high-water
+ * mark, for a page that was contiguous memory once and has since been
+ * freed.
+ *
+ * Except a heap page the title named through MmGetPhysicalAddress
+ * (xbox_PhysRamNameMap), which is RAM even when the arena has handed out
+ * the same number: Jet Set Radio Future's XAPI reads each input report into
+ * a heap buffer at 0x010DE0CA, on a page the arena also owns, so the reports
+ * went to the window, the title's buffer never changed, and the pad looked
+ * plugged in with nothing pressed. */
+/* Which rule resolved each address, counted apart for descriptor words and
+ * data buffers so RECOMP_USB_STATS (and RECOMP_USB_TRACE at exit) show what a
+ * title leans on. Plain counters: the controller thread does almost all the
+ * resolving, and a WDH acknowledgement on the title's thread can lose one
+ * increment, which a count read by eye does not miss. */
+enum {
+    RES_IMAGE,       /* inside the loaded image                         */
+    RES_RAMNAME,     /* a heap page the title named through Mm...Address */
+    RES_PAGEMAP,     /* a live contiguous page: the window              */
+    RES_HIGHWATER,   /* freed contiguous memory below the high-water    */
+    RES_PLAIN,       /* none of the above: RAM as given                 */
+    RES_DESC_WINDOW, /* descriptor on a live contiguous page            */
+    RES_TD_BLOCK,    /* buffer in its TD's own contiguous allocation    */
+    RES_N
+};
+static const char *const s_res_name[RES_N] = {
+    "image", "ramname", "pagemap", "highwater", "plain", "desc-window",
+    "td-block"
+};
+static unsigned long s_res_desc[RES_N], s_res_data[RES_N];
+
+static uint32_t bus_resolve(uint32_t addr, unsigned long *count)
 {
+    int cls;
+    uint32_t out = addr;
+
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
-        return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
-        return OHCI_CONTIG_BASE + addr;
-    return addr;
+        cls = RES_IMAGE;
+    else if (addr && addr < (64u << 20) && xbox_PhysRamNameMap()[addr >> 12])
+        cls = RES_RAMNAME;
+    else if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12])
+        cls = RES_PAGEMAP, out = OHCI_CONTIG_BASE + addr;
+    else if (addr && addr < xbox_ContiguousAllocatedBytes())
+        cls = RES_HIGHWATER, out = OHCI_CONTIG_BASE + addr;
+    else
+        cls = RES_PLAIN;
+    count[cls]++;
+    return out;
 }
 
+/* The controller's own structures -- the HCCA, EDs and TDs -- resolve the
+ * other way round: a live contiguous page first, then the image.
+ *
+ * The image-first rule above is for data buffers, which a class driver
+ * points at its statics. The descriptors are the host controller driver's,
+ * and XAPI's OHCD takes them from MmAllocateContiguousMemory, because the
+ * controller is a bus master that reads them by physical address. When that
+ * allocation's physical number falls inside the image (the window is
+ * separate storage here, so the allocator hands such numbers out), image
+ * first reads code. Jet Set Radio Future's XAPI (XDK 4134) gets its HCCA at
+ * 0x80082000 and writes HcHCCA = 0x00082000, inside an image that runs to
+ * 0x00288620: the walker read the interrupt table out of .text, found
+ * garbage EDs, never moved a transfer, and the pad never enumerated -- one
+ * root hub change, one done queue, then only start-of-frame interrupts.
+ *
+ * The cost: a descriptor a driver kept statically in its image, on a page
+ * the arena has also handed out, now reads the window copy. No title known
+ * here does that. The real fix is one physical space, where the window and
+ * RAM below 64 MB are the same bytes and none of these rules is needed. */
+static uint32_t bus_resolve_desc(uint32_t addr)
+{
+    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12]) {
+        s_res_desc[RES_DESC_WINDOW]++;
+        return OHCI_CONTIG_BASE + addr;
+    }
+    return bus_resolve(addr, s_res_desc);
+}
+
+/* Descriptor words (HCCA, ED, TD); td_resolve below is for data buffers. */
 static uint32_t rd32(uint32_t va)
 {
-    va = bus_resolve(va);
+    va = bus_resolve_desc(va);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
-    va = bus_resolve(va);
+    va = bus_resolve_desc(va);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
-static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+
+/* 1 if both physical addresses are live pages of one contiguous allocation.
+ * Two addresses in one block end at the same place. */
+static int same_contig_block(uint32_t a, uint32_t b)
 {
-    va = bus_resolve(va);
+    const volatile uint8_t *map = xbox_ContiguousPageMap();
+    uint32_t na, nb;
+
+    if (!a || !b || a >= (64u << 20) || b >= (64u << 20)
+            || !map[a >> 12] || !map[b >> 12])
+        return 0;
+    na = xbox_ContiguousBlockSize(OHCI_CONTIG_BASE + a);
+    nb = xbox_ContiguousBlockSize(OHCI_CONTIG_BASE + b);
+    return na && nb && a + na == b + nb;
+}
+
+/* A transfer's buffer, as a guest address. One inside the TD's own
+ * contiguous allocation is the OHCD's storage: XAPI keeps each SETUP packet
+ * in the pool its TDs come from, and JSRF's sits at 0x00083FB0 beside TDs at
+ * 0x00083Fxx, inside the image range, where the image-first rule read eight
+ * bytes of .text as the request. Only the TD's own block goes to the window
+ * this way: a contiguous page elsewhere can still be the image's. Burnout 3's
+ * first GET_DESCRIPTOR reads into its .data at 0x0041A904, a page inside a
+ * block its boot allocated (0x3E7000..0x5E7000), while its TDs are at
+ * 0x025B5xxx; sending every contiguous buffer to the window brought that bug
+ * back. Any other buffer can be a class driver's static, or a heap page the
+ * title named, and takes bus_resolve's order. */
+static uint32_t td_resolve(uint32_t td, uint32_t cbp)
+{
+    if (same_contig_block(td, cbp)) {
+        s_res_data[RES_TD_BLOCK]++;
+        return OHCI_CONTIG_BASE + cbp;
+    }
+    return bus_resolve(cbp, s_res_data);
+}
+static uint8_t *td_buf(uint32_t td, uint32_t cbp, uint32_t bytes)
+{
+    uint32_t va = td_resolve(td, cbp);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+}
+
+uint32_t xbox_OhciResolveForTest(int data, uint32_t td, uint32_t addr)
+{
+    return data ? td_resolve(td, addr) : bus_resolve_desc(addr);
+}
+
+static void ohci_print_res(void)
+{
+    int i;
+    fprintf(stderr, " resolve desc");
+    for (i = 0; i < RES_N; i++)
+        if (s_res_desc[i])
+            fprintf(stderr, " %s=%lu", s_res_name[i], s_res_desc[i]);
+    fprintf(stderr, " data");
+    for (i = 0; i < RES_N; i++)
+        if (s_res_data[i])
+            fprintf(stderr, " %s=%lu", s_res_name[i], s_res_data[i]);
 }
 
 /* Transfer counts for RECOMP_USB_STATS: input reports served, control
@@ -571,7 +705,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         /* Eight bytes of setup, kept for the data stage that follows. */
         s_n_ctrl++;
         if (len >= 8) {
-            const uint8_t *p = guest_ptr(cbp, 8);
+            const uint8_t *p = td_buf(td, cbp, 8);
             if (!p) return TD_CC_NOERROR;
             g_setup.bmRequestType = p[0];
             g_setup.bRequest      = p[1];
@@ -623,9 +757,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             n = g_ctrl_len - g_ctrl_sent;
             if (n > len) n = len;
             if (n < 0) n = 0;
-            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
-                memcpy(guest_ptr(cbp, (uint32_t)n),
-                       g_ctrl_buf + g_ctrl_sent, (size_t)n);
+            if (n > 0) {
+                uint8_t *d = td_buf(td, cbp, (uint32_t)n);
+                if (d)
+                    memcpy(d, g_ctrl_buf + g_ctrl_sent, (size_t)n);
+            }
             g_ctrl_sent += n;
             moved = n;
             if (s_trace && n > 0) {
@@ -639,8 +775,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             s_n_report++;
             int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
             if (n > len) n = len;
-            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
-                memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
+            if (n > 0) {
+                uint8_t *d = td_buf(td, cbp, (uint32_t)n);
+                if (d)
+                    memcpy(d, rep, (size_t)n);
+            }
             moved = n;
         }
     } else {
@@ -655,13 +794,13 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * (16-bit each) -- on the interrupt OUT endpoint, or as the data of
          * a SET_REPORT (21 09) on the control pipe. Forwarded to the host
          * pad; RECOMP_RUMBLE=0 ignores it. */
-        if (len >= 6 && guest_ptr(cbp, 6u)
+        if (len >= 6 && td_buf(td, cbp, 6u)
             && (endpoint != 0 || (g_setup_pending && g_setup.bmRequestType == 0x21
                                   && g_setup.bRequest == 0x09))) {
             static int rumble = -1;
-            const uint8_t *r = (const uint8_t *)guest_ptr(cbp, 6u);
+            const uint8_t *r = td_buf(td, cbp, 6u);
             if (rumble < 0) {
-                const char *e = getenv("RECOMP_RUMBLE");
+                const char *e = recomp_env(RENV_RUMBLE);
                 rumble = !(e && *e == '0');
             }
             if (rumble && r[0] == 0x00 && r[1] >= 6) {
@@ -828,7 +967,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
         unsigned long now;
         total += (unsigned)completed;
         if (stats < 0)
-            stats = getenv("RECOMP_USB_STATS") != NULL;
+            stats = recomp_env(RENV_USB_STATS) != NULL;
         now = (unsigned long)GetTickCount();
         if (stats && now - last >= 5000) {
             uint32_t seen[8] = {0};
@@ -841,6 +980,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
                     s_n_out_other, hc->reg[HcControl / 4],
                     hc->reg[HcInterruptEnable / 4],
                     hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
+            ohci_print_res();
             {
                 uint32_t c = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
                 int n;
@@ -917,7 +1057,16 @@ static int ohci_isr_call(int index)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    if (xbox_ProfOn()) {
+        void *prev = xbox_ProfBegin(XBOX_PROF_ISR_OHCI, routine);
+        int _irql = xbox_IrqlEnterInterrupt(16);
+        long long t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_IrqlLeaveInterrupt(_irql);
+    } else {
+        int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql);
+    }
     return (int)(g_eax & 1u);
 }
 
@@ -1049,6 +1198,7 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  */
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
+    xbox_log_thread_role("ohci", 0);
     /* This thread calls recompiled code, so it needs what any thread running
      * recompiled code needs: its own TIB. The guest register set is already
      * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH
@@ -1108,7 +1258,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * asking which port pressed Start looks at slot 0. The default is
              * root port 3 (index 2), controller port 1, when there are four;
              * RECOMP_USB_PORT (0..3) picks another. */
-            const char *pspec = getenv("RECOMP_USB_PORT");
+            const char *pspec = recomp_env(RENV_USB_PORT);
             unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
@@ -1332,19 +1482,21 @@ void xbox_OhciInit(void)
         return;
     done = 1;
 
-    /* Opt-in. Without a descriptor list walker behind it a driver that finds
-     * a port has nothing to enumerate, so this must not change how a title
-     * behaves until the rest of it exists. */
-    if (!getenv("RECOMP_USB"))
+    /* Opt-in per title: one that reaches its pad some other way (an XInput
+     * override, as BLiNX 2 does) must not also get a controller under its
+     * XAPI. A title whose statically linked XAPI drives these registers
+     * turns it on by default in its main.c. =0 (or empty) is off, so a
+     * default can be overridden from the environment. */
+    if (!recomp_env_on(RENV_USB))
         return;
 
     s_enabled = 1;
-    s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    s_trace   = recomp_env(RENV_USB_TRACE) != NULL;
     {
-        const char *hcspec = getenv("RECOMP_USB_HC");
-        const char *ndpspec = getenv("RECOMP_USB_NDP");
+        const char *hcspec = recomp_env(RENV_USB_HC);
+        const char *ndpspec = recomp_env(RENV_USB_NDP);
         s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
-        const char *padspec = getenv("RECOMP_USB_PADS");
+        const char *padspec = recomp_env(RENV_USB_PADS);
         if (ndpspec) {
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
@@ -1356,7 +1508,7 @@ void xbox_OhciInit(void)
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
-#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
+#if !defined(OHCI_TRAP_X64) && !defined(OHCI_TRAP_POSIX_A64)
     /* No decoder for this host's instructions, so a trapped access could not
      * be answered. Leave the aperture as plain memory -- the title then sees
      * no controller, exactly as with RECOMP_USB unset -- and say so. */
@@ -1432,7 +1584,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
-#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
+#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_X64)
 /* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
  * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
  * access is two of them. */
@@ -1473,16 +1625,17 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
         fflush(stderr);
     }
     return ok;
-#elif defined(OHCI_TRAP_WIN32)
+#elif defined(OHCI_TRAP_X64)
     OhciController *hc = hc_for(xbox_va);
     int ok;
 
     if (!hc)
         return 0;
-    ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
+    ok = mmio_emulate((mmio_ctx_t *)ctx, xbox_va - hc->base, hc,
                       ohci_read_split, ohci_write_split);
     if (!ok && hc->decode_fail++ < 20) {
-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
+        const uint8_t *ip =
+            (const uint8_t *)(uintptr_t)MMIO_RIP((mmio_ctx_t *)ctx);
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
                         "%02X %02X %02X %02X %02X %02X\n",
                 hc->index, xbox_va - hc->base,
@@ -1502,6 +1655,9 @@ void xbox_OhciReport(void)
 
     if (!s_enabled)
         return;
+    fprintf(stderr, "  [OHCI] address classes:");
+    ohci_print_res();
+    fputc('\n', stderr);
     for (i = 0; i < 2; i++)
         fprintf(stderr, "  [OHCI%d] %u reads, %u writes, %u undecoded; "
                         "HcControl=%08X HcIntStatus=%08X port1=%08X\n",

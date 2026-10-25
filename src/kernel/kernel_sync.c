@@ -194,13 +194,41 @@ static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
     }
 }
 
+/* With guest_sched a wait is a short call at its kernel call
+ * (kernel_guest_cpu.c): one whose object is already signalled returns
+ * without a context switch on the console, so a time-critical holder keeps
+ * the guest CPU through it. Poll first, and say the call blocks only when
+ * it is about to. */
+static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable)
+{
+    if (ms && xbox_GuestSchedOn()) {
+        DWORD r = WaitForSingleObjectEx(h, 0, alertable);
+        if (r != WAIT_TIMEOUT)
+            return r;
+        xbox_GuestCpuBlocked();
+    }
+    return WaitForSingleObjectEx(h, ms, alertable);
+}
+
+static DWORD sync_wait_many(DWORD n, const HANDLE *h, BOOL all, DWORD ms,
+                            BOOL alertable)
+{
+    if (ms && xbox_GuestSchedOn()) {
+        DWORD r = WaitForMultipleObjectsEx(n, h, all, 0, alertable);
+        if (r != WAIT_TIMEOUT)
+            return r;
+        xbox_GuestCpuBlocked();
+    }
+    return WaitForMultipleObjectsEx(n, h, all, ms, alertable);
+}
+
 NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     HANDLE Handle,
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    DWORD result = sync_wait_one(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -220,7 +248,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
-    result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    result = sync_wait_one(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -238,7 +266,7 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
-    result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+    result = sync_wait_many(Count, Handles, bWaitAll, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -259,7 +287,7 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    DWORD result = sync_wait_one(hObject, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -281,8 +309,8 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
 
     /* Objects[] is an array of PVOID which we treat as HANDLE[] */
-    DWORD result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
-                                            bWaitAll, ms, Alertable);
+    DWORD result = sync_wait_many(Count, (HANDLE*)Objects, bWaitAll, ms,
+                                  Alertable);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 

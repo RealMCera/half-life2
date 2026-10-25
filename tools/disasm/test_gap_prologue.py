@@ -60,6 +60,7 @@ class _Engine:
         self.instructions = {i.address: i for i in insns}
         self._prologues = set(prologues)
         self._stub = False
+        self.jump_tables = {}
 
     def probes_as_prologue(self, addr):
         return addr in self._prologues
@@ -79,6 +80,7 @@ def _detector(insns, functions, prologues):
     det.image = _Image()
     det.functions = {f.start: f for f in functions}
     det._candidates = {}
+    det._alias_entries = {}
     det.added = []
     det._add_candidate = lambda addr, conf, why: det.added.append((addr, why))
     return det

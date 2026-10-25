@@ -14,10 +14,8 @@
  * Cross-platform: Win32 backend on Windows and Proton, POSIX elsewhere, so
  * both forms of each rule (sub_win, sub_posix) are checked by the same cases.
  */
-#ifndef _WIN32
-#define _GNU_SOURCE     /* nftw, pthread_getaffinity_np under -std=c11 */
-#endif
 #include "kernel.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,15 +48,6 @@ static void check(int ok, const char *what)
 {
     printf("  %-66s %s\n", what, ok ? "PASS" : "FAIL");
     if (!ok) failures++;
-}
-
-static void set_env(const char *k, const char *v)
-{
-#if defined(_WIN32)
-    _putenv_s(k, v ? v : "");
-#else
-    if (v) setenv(k, v, 1); else unsetenv(k);
-#endif
 }
 
 static void make_dir(const char *p)
@@ -189,7 +178,7 @@ static void test_default_root(void)
     char want[1200];
 
     printf("user-data root = save dir\n");
-    set_env("RECOMP_SAVE_DIR", NULL);
+    recomp_env_set(RENV_SAVE_DIR, "");
     xbox_path_init(g_game, g_save);
 
     snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache08.bin", g_save);
@@ -197,6 +186,14 @@ static void test_default_root(void)
            "Partition1\\CACHE goes to <save>/TitleCache");
     check(!under(host("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin"), g_game),
           "Partition1\\CACHE is not under the game dir");
+
+    /* The host-side root the D3D11 shader cache sits under. */
+    {
+        char root[1200];
+        check(xbox_path_hdd_root(root, sizeof root) && same(root, g_save),
+              "xbox_path_hdd_root is the save dir");
+        check(!xbox_path_hdd_root(root, 2), "xbox_path_hdd_root refuses a short buffer");
+    }
 
     /* E:\CACHE and the utility-drive caches share the save root here, so
      * they must differ by more than case: <save>/CACHE was <save>/Cache on
@@ -220,34 +217,6 @@ static void test_default_root(void)
     }
 }
 
-/* Saves only in the game dir stay there (a build before the UDATA/TDATA
- * rules put them there); the cache never does, even with a CACHE left in
- * the game dir by such a build. */
-static void test_legacy_saves(void)
-{
-    char want[1200], dir[700];
-
-    printf("saves left in the game dir\n");
-    set_env("RECOMP_SAVE_DIR", NULL);
-    snprintf(dir, sizeof dir, "%s" SEP "UDATA", g_game);
-    make_dir(dir);
-    snprintf(dir, sizeof dir, "%s" SEP "TDATA", g_game);
-    make_dir(dir);
-    snprintf(dir, sizeof dir, "%s" SEP "CACHE", g_game);
-    make_dir(dir);
-    xbox_path_init(g_game, g_save);
-
-    snprintf(want, sizeof want, "%s" SEP "UDATA" SEP "4541005b", g_game);
-    expect("\\Device\\Harddisk0\\Partition1\\UDATA\\4541005b", want,
-           "UDATA only in the game dir stays there");
-    snprintf(want, sizeof want, "%s" SEP "TDATA" SEP "4541005b", g_game);
-    expect("\\Device\\Harddisk0\\Partition1\\TDATA\\4541005b", want,
-           "TDATA only in the game dir stays there");
-    snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache08.bin", g_save);
-    expect("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin", want,
-           "CACHE still goes to <save>/TitleCache");
-}
-
 /* RECOMP_SAVE_DIR moves CACHE with UDATA and TDATA. */
 static void test_save_dir_root(void)
 {
@@ -256,7 +225,7 @@ static void test_save_dir_root(void)
     const char *p;
 
     printf("user-data root = RECOMP_SAVE_DIR\n");
-    set_env("RECOMP_SAVE_DIR", g_user);
+    recomp_env_set(RENV_SAVE_DIR, g_user);
     xbox_path_init(g_game, g_save);
 
     /* Burnout 3's exact spelling: lower-case "partition1". */
@@ -325,6 +294,88 @@ static void test_save_dir_root(void)
     }
 }
 
+/* The Xbox file system ignores case and titles rely on it (MEDIA\Sound.xwb
+ * for media/sound.xwb). Windows and default macOS volumes resolve that by
+ * themselves; on a case-sensitive one (Linux, the Deck) the POSIX backend
+ * matches each missing component against its directory. Checked on every
+ * host by whether the result opens, and by its exact spelling where the
+ * host is case-sensitive. */
+static void test_case_fallback(void)
+{
+    char dir[700], file[800], probe[800], want[1200];
+    const char *p;
+    FILE *f;
+    int sensitive;
+
+    printf("case-insensitive guest paths\n");
+    recomp_env_set(RENV_SAVE_DIR, "");
+    xbox_path_init(g_game, g_save);
+
+    snprintf(dir, sizeof dir, "%s" SEP "Media", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "Media" SEP "Sound", g_game);
+    make_dir(dir);
+    snprintf(file, sizeof file, "%s" SEP "Bank.xwb", dir);
+    f = fopen(file, "wb");
+    if (f) fclose(f);
+    snprintf(probe, sizeof probe, "%s" SEP "MEDIA", g_game);
+    sensitive = !is_dir(probe);
+    printf("  (host file system is case-%s)\n", sensitive ? "sensitive" : "insensitive");
+
+    expect("\\Device\\Harddisk0\\Partition1\\Media\\Sound\\Bank.xwb", file,
+           "an exact path is left alone");
+
+    p = host("\\Device\\Harddisk0\\Partition1\\MEDIA\\sound\\BANK.XWB");
+    f = fopen(p, "rb");
+    check(f != NULL, "MEDIA\\sound\\BANK.XWB opens Media/Sound/Bank.xwb");
+    if (f) fclose(f);
+    if (sensitive)
+        check(same(p, file), "and is rewritten to the name on disk");
+
+    /* A create: the directories resolve, the new name is kept as written. */
+    p = host("\\Device\\Harddisk0\\Partition1\\media\\SOUND\\New.bin");
+    snprintf(want, sizeof want, "%s" SEP "New.bin", dir);
+    if (sensitive)
+        expect("\\Device\\Harddisk0\\Partition1\\media\\SOUND\\New.bin", want,
+               "a new file lands in the existing directory");
+    else
+        check(p[0] != '\0', "a new file lands in the existing directory");
+
+    /* A missing directory ends the walk; the rest stays as written. */
+    snprintf(want, sizeof want, "%s" SEP "Media" SEP "Nope" SEP "a.bin", g_game);
+    if (sensitive)
+        expect("\\Device\\Harddisk0\\Partition1\\MEDIA\\Nope\\a.bin", want,
+               "a missing directory keeps the rest as written");
+}
+
+/* Saves only in the game dir stay there (a build before the UDATA/TDATA
+ * rules put them there); the cache never does, even with a CACHE left in
+ * the game dir by such a build. */
+static void test_legacy_saves(void)
+{
+    char want[1200], dir[700];
+
+    printf("saves left in the game dir\n");
+    recomp_env_set(RENV_SAVE_DIR, NULL);
+    snprintf(dir, sizeof dir, "%s" SEP "UDATA", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "TDATA", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "CACHE", g_game);
+    make_dir(dir);
+    xbox_path_init(g_game, g_save);
+
+    snprintf(want, sizeof want, "%s" SEP "UDATA" SEP "4541005b", g_game);
+    expect("\\Device\\Harddisk0\\Partition1\\UDATA\\4541005b", want,
+           "UDATA only in the game dir stays there");
+    snprintf(want, sizeof want, "%s" SEP "TDATA" SEP "4541005b", g_game);
+    expect("\\Device\\Harddisk0\\Partition1\\TDATA\\4541005b", want,
+           "TDATA only in the game dir stays there");
+    snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache08.bin", g_save);
+    expect("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin", want,
+           "CACHE still goes to <save>/TitleCache");
+}
+
 int main(int argc, char **argv)
 {
     /* argv[1]: write the report there (Proton drops a console exe's stdout) */
@@ -354,6 +405,7 @@ int main(int argc, char **argv)
 
     test_default_root();
     test_save_dir_root();
+    test_case_fallback();
     test_legacy_saves();
     remove_root();
 

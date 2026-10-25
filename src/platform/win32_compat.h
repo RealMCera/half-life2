@@ -127,10 +127,16 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 /* fd-backed handle, used by the file-I/O HLE (kernel_file.c). Lets file
  * handles flow through the same CloseHandle path as every other object. */
 HANDLE      w32_open_handle(int fd, const char *host_path);
+/* -1 / NULL for anything but a live file handle: NULL, INVALID_HANDLE_VALUE,
+ * a closed or synthetic handle, or another kind of object. */
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
 /* After a rename: later path-based operations on h follow the file. */
 void        w32_handle_set_path(HANDLE h, const char *host_path);
+/* fd-backed handles open right now (each holds one host fd). */
+int         w32_open_file_handles(void);
+/* Raise the soft RLIMIT_NOFILE as far as the host allows; see the .c. */
+int         w32_raise_fd_limit(unsigned long long *before, unsigned long long *after);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -138,6 +144,9 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 BOOL   SetEvent(HANDLE h);
 BOOL   ResetEvent(HANDLE h);
 BOOL   PulseEvent(HANDLE h);
+/* Manual-reset waits also end on a SetEvent made during the wait, even if
+ * the event was reset again before the waiter ran (NT semantics). */
+void   w32_event_release_on_set(HANDLE h);
 
 /* ---- Semaphores ------------------------------------------------------- */
 HANDLE CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCSTR name);
@@ -552,7 +561,7 @@ BOOL FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st);
 
 /* ---- Multimedia (winmm) shim: waveOut stubs that always report failure.
  * The APU has a waveOut fallback path; on Linux it just stays inactive
- * and the (real) SDL2 audio path will replace it later. */
+ * and the (real) SDL audio path will replace it later. */
 typedef DWORD  MMRESULT;
 typedef void  *HWAVEOUT;
 #define MMSYSERR_NOERROR     0

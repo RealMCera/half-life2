@@ -10,25 +10,45 @@
  *
  *   default       No switch set. Pins what every title gets today, so a change
  *                 that alters the default shows up here.
+ *   reclaim-zero  RECOMP_HEAP_RECLAIM=0, which must mean off: a game can
+ *                 default the switch on, and 0 is how a run turns it back off.
+ *                 Same checks as default.
  *   heap-reclaim  RECOMP_HEAP_RECLAIM=1. Each check fails without the fix:
  *
  *   1. A small request after a large free takes only what it needs. Reuse used
  *      to hand over the whole block, so a 16-byte request could take 2 MB.
- *   2. Freeing three neighbours in an awkward order merges all three. Merging
+ *   2. Small requests spread over several freed blocks still leave room for a
+ *      large one inside them. Without the switch each small request takes a
+ *      whole freed block, which is how JSRF ran out of heap loading Misc.dat
+ *      with half the heap held as slack in reused blocks.
+ *   3. Freeing three neighbours in an awkward order merges all three. Merging
  *      left an empty slot behind that later frees did not step over, so the
  *      third block never joined the other two.
- *   3. NtFreeVirtualMemory(MEM_RELEASE) on memory NtAllocateVirtualMemory took
+ *   4. NtFreeVirtualMemory(MEM_RELEASE) on memory NtAllocateVirtualMemory took
  *      from the heap gives it back. It handed the 32-bit guest slot to the host
  *      VirtualFree as a pointer, which failed, so none of it ever returned.
  *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
- *      request of that size reuses it; the default never reuses one.
+ *      request of that size reuses it. In this fork that holds in every mode:
+ *      the contiguous arena is first-fit whatever the switch says.
  *   7. (default too) MmAllocateContiguousMemoryEx's physical range is
  *      honoured. A request limited to the low 16 MB still succeeds once
  *      unconstrained requests have filled up to it -- XDK D3D's visibility
  *      test report pages ask for exactly that, and a bump pointer refused
  *      every one -- and a request for a range above the pointer lands in it.
+ *   8. (every mode) NtAllocateVirtualMemory rounds the region to whole pages
+ *      and reports the rounded size, and the next small allocation starts
+ *      past them. It used to start in the last page, so when JSRF made its
+ *      0x46500-byte buffer read-only, the next block it zeroed faulted on
+ *      4 KB host pages (Proton).
+ *
+ *   heap-quarantine  RECOMP_HEAP_RECLAIM=1 with RECOMP_HEAP_QUARANTINE=64
+ *                 (KiB). Freed blocks wait before reuse, so a title that reads
+ *                 a record it has freed reads the record, not the next load
+ *                 (JSRF's DJ scene). The held amount is bounded, the oldest
+ *                 block goes back first, a block freed twice is held once, and
+ *                 the heap empties the quarantine before it runs out.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -184,6 +204,8 @@ int main(int argc, char **argv)
     const char *mode = argc > 1 ? argv[1] : "default";
     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
     int reclaim = !strcmp(mode, "heap-reclaim");
+    int quar = !strcmp(mode, "heap-quarantine");
+    int zero = !strcmp(mode, "reclaim-zero");
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int avoid = !strcmp(mode, "contig-avoid-image");
@@ -193,14 +215,20 @@ int main(int argc, char **argv)
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !avoid && strcmp(mode, "default")) {
+    if (!reclaim && !zero && !ext && !quar && !avoid && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
     if (reclaim)
         set_env("RECOMP_HEAP_RECLAIM", "1");
+    if (zero)
+        set_env("RECOMP_HEAP_RECLAIM", "0");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
+    if (quar) {
+        set_env("RECOMP_HEAP_RECLAIM", "1");
+        set_env("RECOMP_HEAP_QUARANTINE", "64");
+    }
     if (avoid)
         set_env("RECOMP_CONTIG_AVOID_IMAGE", "1");
     if (ext128)
@@ -245,6 +273,73 @@ int main(int argc, char **argv)
         xbox_ContiguousFree(c);
     }
 
+    /* The quarantine runs on a heap nothing else has freed into yet, so where
+     * each request lands is known. 64 KiB held at most. */
+    if (quar) {
+        const uint32_t K = 1024;
+        uint32_t x, y, z, x2, a, b, c, o, p, fill, r;
+
+        /* A block freed twice is held once. Held twice, its second entry
+         * would leave the quarantine after the heap had handed the block out
+         * again (x2 below) and free the new owner's memory. */
+        x = xbox_HeapAlloc(16 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(x);
+        xbox_HeapFree(x);
+        y = xbox_HeapAlloc(40 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(y);
+        x2 = xbox_HeapAlloc(16 * K, 4096);
+        z = xbox_HeapAlloc(16 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(z);
+        snprintf(d, sizeof d, "x 0x%08X, x2 0x%08X size %u", x, x2, xbox_HeapBlockSize(x2));
+        check(xbox_HeapBlockSize(x2) == 16 * K,
+              "a block freed twice is held once; its next owner keeps it", d);
+
+        /* A freed block keeps its contents and is not handed out. */
+        a = xbox_HeapAlloc(16 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        *G(a) = 0x5A5A5A5Au;
+        xbox_HeapFree(a);
+        b = xbox_HeapAlloc(16 * K, 4096);
+        snprintf(d, sizeof d, "freed 0x%08X, next 0x%08X, word 0x%08X", a, b, *G(a));
+        check(b != a && *G(a) == 0x5A5A5A5Au,
+              "a freed block is held: not reused, its contents kept", d);
+
+        /* Past the limit the oldest goes back first. */
+        c = xbox_HeapAlloc(64 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(c);
+        snprintf(d, sizeof d, "older 0x%08X size %u, newest 0x%08X size %u",
+                 a, xbox_HeapBlockSize(a), c, xbox_HeapBlockSize(c));
+        check(xbox_HeapBlockSize(a) == 0 && xbox_HeapBlockSize(c) == 64 * K,
+              "over 64 KiB the oldest blocks go back, the newest stays held", d);
+
+        /* A block larger than the limit is freed at once and the queue is
+         * left alone. Held, it would evict every older block first: one big
+         * teardown free would flush the record the quarantine keeps. 96 KiB,
+         * so the 128 KiB request below still cannot fit in it. */
+        o = xbox_HeapAlloc(96 * K, 4096);
+        (void)xbox_HeapAlloc(4096, 16);
+        xbox_HeapFree(o);
+        snprintf(d, sizeof d, "big 0x%08X size %u, held 0x%08X size %u",
+                 o, xbox_HeapBlockSize(o), c, xbox_HeapBlockSize(c));
+        check(xbox_HeapBlockSize(o) == 0 && xbox_HeapBlockSize(c) == 64 * K,
+              "a block over the limit is freed at once, the held ones stay", d);
+        (void)xbox_HeapAlloc(96 * K, 4096);    /* its room, so only c can fit 64 KiB below */
+
+        /* Out of heap, the quarantine is emptied before the request fails:
+         * fill the heap to 32 KiB short of the top, then ask for 64. */
+        p = xbox_HeapAlloc(128 * K, 4096);  /* larger than any free block: the top */
+        fill = (XBOX_HEAP_TOP - (p + 128 * K) - 32 * K) & ~4095u;
+        (void)xbox_HeapAlloc(fill, 4096);
+        r = xbox_HeapAlloc(64 * K, 4096);
+        snprintf(d, sizeof d, "got 0x%08X, held block 0x%08X", r, c);
+        check(r == c, "out of heap, the held blocks are given back and reused", d);
+        goto done;
+    }
+
     /* 1. A small request after a large free. */
     if (!ext) {
         const uint32_t big = 2u * 1024 * 1024;
@@ -271,7 +366,35 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 2. Three neighbours freed so that the third meets an empty slot. */
+    snprintf(d, sizeof d, "switch reads %d", xbox_HeapReclaimEnabled());
+    check(xbox_HeapReclaimEnabled() == reclaim, "the reclaim switch reads as the mode asks", d);
+
+    /* 2. Freed blocks shared out to small requests keep room for a large one. */
+    if (!ext) {
+        enum { N = 4 };
+        const uint32_t big = 1024u * 1024, want = 768u * 1024;
+        uint32_t blk[N], lo, hi, g;
+        int k;
+
+        for (k = 0; k < N; k++) {
+            blk[k] = xbox_HeapAlloc(big, 4096);
+            (void)xbox_HeapAlloc(4096, 16);     /* keeps the freed blocks apart */
+        }
+        for (k = 0; k < N; k++)
+            xbox_HeapFree(blk[k]);
+        for (k = 0; k < N; k++)
+            (void)xbox_HeapAlloc(256, 16);
+        lo = blk[0];
+        hi = blk[N - 1] + big;
+        g = xbox_HeapAlloc(want, 4096);
+        snprintf(d, sizeof d, "768 KB request at 0x%08X, freed blocks 0x%08X-0x%08X", g, lo, hi);
+        if (reclaim)
+            check(g >= lo && g + want <= hi, "a large request fits in the freed blocks", d);
+        else
+            check(g >= hi, "default: small requests hold every freed block", d);
+    }
+
+    /* 3. Three neighbours freed so that the third meets an empty slot. */
     if (reclaim) {
         uint32_t x = xbox_HeapAlloc(64, 16), y = xbox_HeapAlloc(64, 16);
         uint32_t z = xbox_HeapAlloc(64, 16), w = xbox_HeapAlloc(64, 16);
@@ -287,7 +410,7 @@ int main(int argc, char **argv)
               "three freed neighbours merge into one 192-byte block", d);
     }
 
-    /* 3. Releasing NtAllocateVirtualMemory memory returns it. */
+    /* 4. Releasing NtAllocateVirtualMemory memory returns it. */
     if (reclaim) {
         const uint32_t size = 2u * 1024 * 1024;
         uint32_t b1, b2, st;
@@ -330,12 +453,13 @@ int main(int argc, char **argv)
 
         snprintf(d, sizeof d, "free said %d", xbox_ContiguousFree(c1));
         c2 = xbox_ContiguousAlloc(0x20000, 4096);
-        if (reclaim) {
+        /* This fork's first-fit contiguous arena reuses freed blocks with or
+         * without the switch (it honours MmAllocateContiguousMemoryEx's
+         * physical range, which a title's visibility tests need). */
+        {
             char d2[160];
             snprintf(d2, sizeof d2, "%s, got 0x%08X, expected 0x%08X", d, c2, c1);
             check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
-        } else {
-            check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
         }
     }
 
@@ -375,7 +499,27 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
+    /* 8. A page allocation owns whole pages. */
+    {
+        uint32_t b, sz = 0x46500, small, st, nb = 0;
+
+        st = nt_alloc_at(&nb, &sz, 0x3000);
+        b = nb;
+        small = xbox_HeapAlloc(64, 16);
+        snprintf(d, sizeof d, "status 0x%08X, block 0x%08X size 0x%X, next 0x%08X",
+                 st, b, sz, small);
+        check(st == 0 && sz == 0x47000 && small && (small < b || small >= b + 0x47000),
+              "NtAllocateVirtualMemory rounds to pages; the next block starts past them", d);
+
+        /* The heap rounds a page-aligned request itself, whoever calls it. */
+        b = xbox_HeapAlloc(0x46500, 4096);
+        small = xbox_HeapAlloc(64, 16);
+        snprintf(d, sizeof d, "block 0x%08X, next 0x%08X", b, small);
+        check(b && small && (small < b || small >= b + 0x47000),
+              "a page-aligned heap block owns whole pages", d);
+    }
+
+    /* ext-vma. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
     {
         const uint32_t hi = 0x76000000u;
         uint32_t base, size, st, mbi[7];
@@ -468,6 +612,7 @@ int main(int argc, char **argv)
         }
     }
 
+done:
     xbox_MemoryLayoutShutdown();
     free(xbe);
     printf("\n%d failure(s)\n", failures);

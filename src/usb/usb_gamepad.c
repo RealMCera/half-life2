@@ -12,12 +12,23 @@
  * pad plugged into the PC drives this one.
  */
 #include "usb_gamepad.h"
+#include "pad_script.h"
+#include "recomp_env.h"
+#include "recomp_exit_hook.h"   /* the recorder's held steps at exit */
 
 #include <stdio.h>
 #include <stdlib.h>
 
 #include <string.h>
 #include <ctype.h>
+#include <signal.h>
+#ifdef _WIN32
+#include <io.h>
+#define pad_write _write
+#else
+#include <unistd.h>
+#define pad_write write
+#endif
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -220,6 +231,7 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 /* The host's own pad, through the layer that already maps one to XInput.
  * A real controller plugged into the PC drives this emulated one. */
 #include "../input/xinput_xbox.h"
+#include "../input/keyboard.h"   /* xbox_FramebufferKeyDown */
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -252,7 +264,7 @@ static uint8_t synthetic_buttons(void)
     unsigned long now, phase;
 
     if (configured < 0) {
-        const char *spec = getenv("RECOMP_PAD_PRESS");
+        const char *spec = recomp_env(RENV_PAD_PRESS);
         configured = 0;
         if (spec && *spec) {
             char *end;
@@ -290,11 +302,19 @@ static uint8_t synthetic_buttons(void)
  * Each entry is <ms>:<button>[+<button>...][:<hold ms>], with times measured
  * from the first report the title asks for (so from enumeration, not from
  * process start) and a default hold of 150 ms. RECOMP_PAD_SCRIPT=@file reads
- * the same syntax from a file, one entry per line or comma separated.
+ * the same syntax from a file, one entry per line or comma separated, "#"
+ * comments allowed.
+ *
+ * f<flip>:<button>...[:<hold flips>] times a step by the executor's flip
+ * count instead (pad_script.h), default hold 9 flips. A millisecond script
+ * replays on wall time, so it lands on a different screen on a slower or
+ * faster host; a flip-timed one lands on the same flip count, within about
+ * 1-2 flips on a steady screen and more across loading screens.
  *
  * Buttons: up down left right start back lthumb rthumb (the digital byte),
  * a b x y black white lt rt (the analog bytes, reported fully pressed), and
- * lleft lright lup ldown / rleft rright rup rdown (a stick at full throw).
+ * lleft lright lup ldown / rleft rright rup rdown (a stick at full throw),
+ * and lx=<v> ly rx ry (a stick axis at a value).
  * Every entry is printed as it fires, so a run log says what was pressed when.
  *
  * RECOMP_PAD_LIVE=<file> is the same thing driven while the title runs: each
@@ -303,130 +323,61 @@ static uint8_t synthetic_buttons(void)
  * RECOMP_PB_REPORT_MS that makes a loop: look at the frame, append a press,
  * look again. A fixed timeline cannot do that on a rasterised run, where
  * how long a screen takes to appear depends on how much the software
- * rasteriser has to draw.
+ * rasteriser has to draw. A live line may carry its own f<flip> time; it
+ * is pressed at that flip, or at once if the flip has passed.
  *
- * Like RECOMP_PAD_PRESS this is a bring-up tool, off unless set. */
-#define PAD_SCRIPT_MAX 256
-
-typedef struct {
-    unsigned long at_ms, hold_ms;
-    uint8_t digital;         /* report byte 2 */
-    uint8_t analog;          /* bit n = report byte 4 + n */
-    uint8_t pad;             /* which controller: "p2-a" is pad 1 */
-    uint8_t stick;           /* full deflection: 1 L-left 2 L-right 4 L-up
-                                8 L-down, then the same four for the right */
-    int announced;
-} PadStep;
-
+ * RECOMP_DEBUG=pad_record=<file> writes what each pad reports to the title,
+ * the script's presses and a person's alike, as flip-timed steps
+ * (pad_recorder_feed): a route played once by hand becomes a script that
+ * replays it. The sticks keep their values (lx=<v>); analog buttons are
+ * recorded as pressed or not, as a script presses them. The path cannot
+ * hold a comma: RECOMP_DEBUG is a comma list.
+ *
+ * Like RECOMP_PAD_PRESS these are bring-up tools, off unless set. */
 static PadStep s_script[PAD_SCRIPT_MAX];
 static int     s_script_len = -1;
 
-static int same_word(const char *a, const char *b, size_t n)
+/* The executor's flip count, for flip-timed steps and the recorder. Written
+ * by the walker's thread, read on the pad's: a stale read is a flip late. */
+static volatile uint32_t s_flip;
+
+void usb_gamepad_flip(uint32_t flip)
 {
-    size_t i;
-    for (i = 0; i < n; i++)
-        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
-            return 0;
-    return 1;
-}
-
-static int pad_button_bits(const char *name, size_t n, uint8_t *dig,
-                           uint8_t *ana, uint8_t *stick)
-{
-    /* Stick directions, for screens and games that read the stick and
-     * ignore the d-pad: Burnout 3 steers and picks map locations with it. */
-    static const struct { const char *name; uint8_t bit; } sk[] = {
-        {"lleft", 0x01}, {"lright", 0x02}, {"lup", 0x04}, {"ldown", 0x08},
-        {"rleft", 0x10}, {"rright", 0x20}, {"rup", 0x40}, {"rdown", 0x80},
-    };
-    static const struct { const char *name; uint8_t dig, ana; } k[] = {
-        {"up", 0x01, 0}, {"down", 0x02, 0}, {"left", 0x04, 0},
-        {"right", 0x08, 0}, {"start", 0x10, 0}, {"back", 0x20, 0},
-        {"lthumb", 0x40, 0}, {"rthumb", 0x80, 0},
-        {"a", 0, 0x01}, {"b", 0, 0x02}, {"x", 0, 0x04}, {"y", 0, 0x08},
-        {"black", 0, 0x10}, {"white", 0, 0x20}, {"lt", 0, 0x40}, {"rt", 0, 0x80},
-    };
-    size_t i;
-    for (i = 0; i < sizeof sk / sizeof sk[0]; i++) {
-        if (strlen(sk[i].name) == n && same_word(sk[i].name, name, n)) {
-            *stick |= sk[i].bit;
-            return 1;
-        }
-    }
-    for (i = 0; i < sizeof k / sizeof k[0]; i++) {
-        if (strlen(k[i].name) == n && same_word(k[i].name, name, n)) {
-            *dig |= k[i].dig;
-            *ana |= k[i].ana;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void pad_script_parse(const char *text)
-{
-    const char *p = text;
-
-    while (*p && s_script_len < PAD_SCRIPT_MAX) {
-        PadStep st;
-        char *end;
-        const char *b;
-
-        while (*p == ',' || *p == ' ' || *p == '\r' || *p == '\n' || *p == '\t')
-            p++;
-        if (!*p)
-            break;
-        memset(&st, 0, sizeof st);
-        st.hold_ms = 150;
-        st.at_ms = strtoul(p, &end, 0);
-        if (end == p || *end != ':') {
-            fprintf(stderr, "  PAD: script entry without <ms>: at \"%.20s\"\n", p);
-            break;
-        }
-        b = end + 1;
-        /* "p2-" .. "p4-": the step is for that controller, not the first. */
-        if ((b[0] == 'p' || b[0] == 'P') && b[1] >= '1' && b[1] <= '4'
-            && b[2] == '-') {
-            st.pad = (uint8_t)(b[1] - '1');
-            b += 3;
-        }
-        for (;;) {
-            size_t n = strcspn(b, "+:,\r\n ");
-            if (!pad_button_bits(b, n, &st.digital, &st.analog, &st.stick))
-                fprintf(stderr, "  PAD: unknown button \"%.*s\"\n", (int)n, b);
-            b += n;
-            if (*b != '+')
-                break;
-            b++;
-        }
-        if (*b == ':')
-            st.hold_ms = strtoul(b + 1, (char **)&b, 0);
-        s_script[s_script_len++] = st;
-        p = b;
-    }
+    s_flip = flip;
 }
 
 static void pad_script_load(void)
 {
-    const char *spec = getenv("RECOMP_PAD_SCRIPT");
+    const char *spec = recomp_env(RENV_PAD_SCRIPT);
 
     s_script_len = 0;
     if (!spec || !*spec)
         return;
     if (spec[0] == '@') {
         FILE *f = fopen(spec + 1, "rb");
-        static char buf[16384];
-        size_t n;
+        char *buf;
+        long n;
         if (!f) {
             fprintf(stderr, "  PAD: cannot open script %s\n", spec + 1);
             return;
         }
-        n = fread(buf, 1, sizeof buf - 1, f);
+        /* A recorded route runs to tens of kilobytes: read all of it. */
+        fseek(f, 0, SEEK_END);
+        n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        buf = n >= 0 ? (char *)malloc((size_t)n + 1) : NULL;
+        if (!buf) {
+            fclose(f);
+            fprintf(stderr, "  PAD: cannot read script %s\n", spec + 1);
+            return;
+        }
+        n = (long)fread(buf, 1, (size_t)n, f);
         fclose(f);
         buf[n] = 0;
-        pad_script_parse(buf);
+        s_script_len = pad_script_parse(buf, s_script, 0, PAD_SCRIPT_MAX);
+        free(buf);
     } else {
-        pad_script_parse(spec);
+        s_script_len = pad_script_parse(spec, s_script, 0, PAD_SCRIPT_MAX);
     }
     fprintf(stderr, "  PAD: script of %d step(s)\n", s_script_len);
     fflush(stderr);
@@ -437,7 +388,7 @@ static void pad_script_compact(unsigned long t)
 {
     int i, n = 0;
     for (i = 0; i < s_script_len; i++)
-        if (t < s_script[i].at_ms + s_script[i].hold_ms)
+        if (!pad_step_done(&s_script[i], t, s_flip))
             s_script[n++] = s_script[i];
     s_script_len = n;
 }
@@ -458,7 +409,7 @@ static void pad_live_poll(unsigned long t)
 
     if (!checked) {
         checked = 1;
-        path = getenv("RECOMP_PAD_LIVE");
+        path = recomp_env(RENV_PAD_LIVE);
         if (path && *path) {
             fprintf(stderr, "  PAD: live input from %s\n", path);
             fflush(stderr);
@@ -489,14 +440,31 @@ static void pad_live_poll(unsigned long t)
                          && pending[1] >= '1' && pending[1] <= '4'
                          && pending[2] == '-' ? pending[1] - '1' : 0;
                 unsigned long at = t > next_free[pd] ? t : next_free[pd];
+                /* "f<flip>:..." carries its own time: the line is a step of
+                 * a flip-timed script, not a press for now. */
+                int timed = (pending[0] == 'f' || pending[0] == 'F')
+                            && isdigit((unsigned char)pending[1]);
                 pending[npending] = 0;
-                snprintf(line, sizeof line, "%lu:%s", at, pending);
+                if (timed)
+                    snprintf(line, sizeof line, "%s", pending);
+                else
+                    snprintf(line, sizeof line, "%lu:%s", at, pending);
                 if (s_script_len >= PAD_SCRIPT_MAX - 1)
                     pad_script_compact(t);
-                pad_script_parse(line);
-                if (s_script_len > 0)
-                    next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
-                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
+                {
+                    int had = s_script_len;
+                    s_script_len = pad_script_parse(line, s_script, s_script_len,
+                                                    PAD_SCRIPT_MAX);
+                    if (s_script_len > had)
+                        pad_step_not_before(&s_script[s_script_len - 1], s_flip);
+                }
+                if (s_script_len > 0 && !timed)
+                    next_free[pd] = at + s_script[s_script_len - 1].hold + 200;
+                if (timed)
+                    fprintf(stderr, "  PAD: live \"%s\" (flip %u)\n", pending,
+                            (unsigned)s_flip);
+                else
+                    fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
                 fflush(stderr);
                 npending = 0;
             }
@@ -507,11 +475,12 @@ static void pad_live_poll(unsigned long t)
     fclose(f);
 }
 
-static void pad_script_apply(int pad, uint8_t *out)
+static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
 {
     static unsigned long t0;
+    static int warned;
     unsigned long now, t;
-    int i, j;
+    int i;
 
     if (s_script_len < 0)
         pad_script_load();
@@ -520,39 +489,122 @@ static void pad_script_apply(int pad, uint8_t *out)
         t0 = now;
     t = now - t0;
     pad_live_poll(t);
-    if (s_script_len == 0)
-        return;
+    /* Only the LLE pushbuffer walker counts flips (usb_gamepad_flip); a
+     * title on the HLE D3D8 present path would get every f-step at boot. */
+    if (!warned && !flip && t > 20000) {
+        for (i = 0; i < s_script_len; i++)
+            if (s_script[i].by_flip)
+                break;
+        if (i < s_script_len) {
+            fprintf(stderr, "  PAD: no flips counted after 20 s: f<flip> steps"
+                    " need the pushbuffer walker's flip count\n");
+            fflush(stderr);
+        }
+        warned = 1;
+    }
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
-        if (st->pad != pad)
-            continue;
-        if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
+        if (st->pad != pad || !pad_step_active(st, t, flip))
             continue;
         if (!st->announced) {
             st->announced = 1;
-            fprintf(stderr, "  PAD: t=%lu ms step %d (digital 0x%02X analog 0x%02X)\n",
-                    t, i, st->digital, st->analog);
+            fprintf(stderr, "  PAD: t=%lu ms flip %u step %d (digital 0x%02X analog 0x%02X)\n",
+                    t, (unsigned)flip, i, st->digital, st->analog);
             fflush(stderr);
         }
-        out[2] |= st->digital;
-        for (j = 0; j < 8; j++)
-            if (st->analog & (1u << j))
-                out[4 + j] = 0xFF;
-        if (st->stick) {
-            /* Axes at 12..19: LX LY RX RY, signed 16-bit, up positive. */
-            static const int16_t full = 32767;
-            int16_t ax[4];
-            memcpy(ax, &out[12], sizeof ax);
-            if (st->stick & 0x01) ax[0] = (int16_t)-full;
-            if (st->stick & 0x02) ax[0] = full;
-            if (st->stick & 0x04) ax[1] = full;
-            if (st->stick & 0x08) ax[1] = (int16_t)-full;
-            if (st->stick & 0x10) ax[2] = (int16_t)-full;
-            if (st->stick & 0x20) ax[2] = full;
-            if (st->stick & 0x40) ax[3] = full;
-            if (st->stick & 0x80) ax[3] = (int16_t)-full;
-            memcpy(&out[12], ax, sizeof ax);
+        pad_step_press(st, out);
+    }
+}
+
+/* RECOMP_DEBUG=pad_record=<file>: the report as the title gets it, after the
+ * script, as flip-timed steps. Each step is written when it ends and flushed,
+ * and the steps still held are written at exit (atexit, or the window's exit
+ * hook, since ExitProcess skips atexit). */
+static FILE *s_rec_file;
+static PadRecorder s_rec[USB_GAMEPAD_MAX];
+
+static void pad_record_end(void)
+{
+    char lines[512];
+    int i;
+
+    if (!s_rec_file)
+        return;
+    for (i = 0; i < USB_GAMEPAD_MAX; i++)
+        if (pad_recorder_end(&s_rec[i], s_flip, lines, sizeof lines))
+            fputs(lines, s_rec_file);
+    fflush(s_rec_file);
+}
+
+static void pad_record_exit_hook(const char *why)
+{
+    (void)why;
+    pad_record_end();
+}
+
+/* Benches and golden runs stop the game with SIGINT (or SIGTERM), which
+ * never reaches atexit, and a recording that ends on a held stick would lose
+ * that last step. The handler writes the held steps with write(2), not
+ * stdio: every fputs to the record is flushed at once, so its buffer is
+ * empty unless the signal lands mid-fputs, and write cannot deadlock on the
+ * FILE's lock. Then the signal's default runs, so the stop means what it
+ * did. Only installed while recording. */
+static void pad_record_signal(int sig)
+{
+    char lines[512];
+    int i, fd;
+
+    if (s_rec_file) {
+        fd = fileno(s_rec_file);
+        for (i = 0; i < USB_GAMEPAD_MAX; i++)
+            if (pad_recorder_end(&s_rec[i], s_flip, lines, sizeof lines))
+                (void)!pad_write(fd, lines, (unsigned)strlen(lines));
+        s_rec_file = NULL;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void pad_record(int pad, const uint8_t *out, uint32_t flip)
+{
+    static int state = -1;
+    FILE *f;
+    char lines[512];
+
+    if (state < 0) {
+        const char *path = recomp_env(RENV_PAD_RECORD);
+        int i;
+        state = 0;
+        if (path && *path) {
+            f = fopen(path, "w");
+            if (!f) {
+                fprintf(stderr, "  PAD: cannot write the pad record %s\n", path);
+            } else {
+                state = 1;
+                s_rec_file = f;
+                atexit(pad_record_end);
+                recomp_exit_hook_add(pad_record_exit_hook);
+                signal(SIGINT, pad_record_signal);
+                signal(SIGTERM, pad_record_signal);
+                fprintf(f, "# pad_record: pad_script steps timed by flip"
+                        " (f<flip>:<buttons>:<hold flips>, sticks lx=<v>)\n");
+                fflush(f);
+                fprintf(stderr, "  PAD: recording the pads to %s\n", path);
+            }
+            fflush(stderr);
         }
+        for (i = 0; i < USB_GAMEPAD_MAX; i++)
+            s_rec[i].pad = i;
+    }
+    if (!state || pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    f = s_rec_file;
+    if (!f)   /* the signal path has written the record's end */
+        return;
+    if (pad_recorder_feed(&s_rec[pad], pad_bits_from_report(out), flip, lines,
+                          sizeof lines)) {
+        fputs(lines, f);
+        fflush(f);
     }
 }
 
@@ -561,6 +613,9 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
     uint8_t synth = synthetic_buttons();
+    /* One flip for the script and the recorder: the walker may count one
+     * between two reads, and the record would then lag the press by a flip. */
+    uint32_t flip = s_flip;
     int i;
 
     if (max < 20)
@@ -585,18 +640,17 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     {
         static int diag = -1;
         if (diag < 0)
-            diag = getenv("RECOMP_INPUT_DIAG") != NULL;
+            diag = recomp_env(RENV_INPUT_DIAG) != NULL;
         if (diag) {
-            extern int xbox_FramebufferKeyDown(int vk);
             static unsigned long last;
             unsigned long now = (unsigned long)GetTickCount();
             if (now - last > 1000) {
                 XBOX_INPUT_STATE probe;
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+                fprintf(stderr, "  [INPUT] keyboard=%d window_has_RETURN=%d "
                         "InputGetState=%lu buttons=0x%04X\n",
-                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                        xbox_InputKeyboardOn(),
                         xbox_FramebufferKeyDown(0x0D),
                         (unsigned long)rc,
                         rc == 0 ? probe.Gamepad.wButtons : 0);
@@ -610,7 +664,8 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         synth = 0;
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
-        pad_script_apply(pad, out);
+        pad_script_apply(pad, out, flip);
+        pad_record(pad, out, flip);
         return 20;
     }
 
@@ -627,6 +682,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
-    pad_script_apply(pad, out);
+    pad_script_apply(pad, out, flip);
+    pad_record(pad, out, flip);
     return 20;
 }

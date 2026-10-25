@@ -49,6 +49,12 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
  * route to it) before it treats the fault as a crash. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
+/* How the model resolves a physical address the title handed it: a
+ * descriptor word (data = 0) or a transfer buffer of the TD at `td`
+ * (data = 1). Returns the guest address it reads. For the address
+ * resolution ctest; the model's own path is the same code. */
+uint32_t xbox_OhciResolveForTest(int data, uint32_t td, uint32_t addr);
+
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);
 

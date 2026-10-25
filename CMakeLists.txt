@@ -16,6 +16,11 @@ project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# macOS: the Metal render backend (src/d3d/nv2a_pb_metal.m) is Objective-C.
+if(APPLE)
+    enable_language(OBJC)
+endif()
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
@@ -24,12 +29,53 @@ add_compile_definitions(
 
 # Option to build examples
 
+# The umbrella target the game links (filled in below): made first so the
+# reproducible-build flags reach the libraries and, through it, the game.
+add_library(xboxrecomp INTERFACE)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/reproducible.cmake)
+xboxrecomp_reproducible(xboxrecomp ${CMAKE_CURRENT_SOURCE_DIR})
+
 # ── Runtime Libraries ─────────────────────────────────────────
 
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic
 # Win32 host primitives. Carries no Xbox semantics; provides the foundation
 # the kernel HLE and the graphics/audio/input layers build on.
 add_subdirectory(src/platform)
+
+# Enhancements (render scale, aspect, frame pacing, mods) and their config
+# files, config.toml over config.default.toml. Opt-in: off by default; a
+# title turns it on and calls it.
+# ON adds the xbox_enhance library and the layer's RECOMP_* config keys
+# (recomp_env.h, RECOMP_ENV_HAVE_ENHANCE_KEYS), and defines
+# XBOXRECOMP_ENHANCE for the runtime's few seams the layer's mods use (the
+# batch filter, the input capture); OFF compiles those out.
+option(XBOXRECOMP_ENHANCE "Build the opt-in enhancements layer (src/enhance)" OFF)
+if(XBOXRECOMP_ENHANCE)
+    target_compile_definitions(recomp_env PUBLIC RECOMP_ENV_HAVE_ENHANCE_KEYS XBOXRECOMP_ENHANCE)
+    add_subdirectory(src/enhance)
+endif()
+
+# MCPX APU DSP emulation: the GP and EP run the title's DSP56300 programs on
+# the MIT dsp56300 JIT (cmake/dsp56300.cmake, a pinned prebuilt archive per
+# target) instead of the stub's host-side ack and stereo fold. Opt-in: OFF
+# by default, and even ON the stub stays the run-time default until
+# RECOMP_APU_DSP=1. ON defines XBOXRECOMP_APU_DSP on recomp_env (PUBLIC, so
+# the APU and the key table agree) and links dsp56300 into xbox_apu.
+# A target without an archive (iPadOS, MSVC, universal macOS) builds as OFF,
+# with a warning; a failed download is an error. src/apu adds the device
+# model and defines XBOXRECOMP_APU_DSP_DEVICE with it.
+option(XBOXRECOMP_APU_DSP "Build the opt-in MCPX APU DSP emulation (dsp56300 JIT)" OFF)
+set(XBOXRECOMP_APU_DSP_TARGET "")
+if(XBOXRECOMP_APU_DSP)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dsp56300.cmake)
+    xboxrecomp_dsp56300(XBOXRECOMP_APU_DSP_TARGET _dsp56300_why)
+    if(XBOXRECOMP_APU_DSP_TARGET)
+        target_compile_definitions(recomp_env PUBLIC XBOXRECOMP_APU_DSP)
+    else()
+        message(WARNING "XBOXRECOMP_APU_DSP=ON but ${_dsp56300_why}: "
+            "building without the APU DSP (the stub only)")
+    endif()
+endif()
 
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
@@ -69,7 +115,10 @@ set(XBOXRECOMP_LIBS
     xbox_nv2a
     xbox_video
 )
-add_library(xboxrecomp INTERFACE)
+if(XBOXRECOMP_ENHANCE)
+    # In the list, so GNU ld sees it inside the group below.
+    list(APPEND XBOXRECOMP_LIBS xbox_enhance)
+endif()
 if(UNIX AND NOT APPLE)
     # The archives call each other both ways (the APU reaches the kernel's
     # memory map, the kernel raises the APU's interrupt). GNU ld scans each
@@ -79,4 +128,3 @@ if(UNIX AND NOT APPLE)
 else()
     target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
 endif()
-

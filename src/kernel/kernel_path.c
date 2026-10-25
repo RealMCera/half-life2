@@ -13,6 +13,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -117,33 +118,48 @@ static const path_rule s_rules[] = {
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
 
-/* Match a rule. The UDATA, TDATA and CACHE rules carry no trailing
- * separator, since a title opens the bare directories too, so they stop at
- * one: otherwise Partition1\UDATAx would be taken for Partition1\UDATA\x,
- * and an asset such as Partition1\cached.dat would move to the cache. */
-static int rule_match(const char* path, const path_rule* r)
-{
-    int skip = match_prefix(path, r->prefix);
-    if (skip && r->to_save == 2 && path[skip] && path[skip] != '\\')
-        return 0;
-    return skip;
-}
-
 /* Saves left in the game dir. Builds before the UDATA/TDATA rules sent all
  * of Partition1 there, so a player's saves may be in <game_dir>/UDATA. With
  * RECOMP_SAVE_DIR unset, no UDATA in the save dir and one in the game dir,
  * xbox_path_init keeps using that one (and says so); the same for TDATA.
- * Indexed 0 for UDATA, 1 for TDATA. CACHE never stays: a cache left in the
- * game dir is scratch the title rebuilds, and keeping it there is the write
- * into the game files that its rule exists to stop. */
+ * Indexed 0 for UDATA, 1 for TDATA. TitleCache never stays in the game dir:
+ * the title's E:\CACHE is scratch it rebuilds, and keeping it out of the
+ * dump is why its rule exists. */
 static int s_user_in_game[2];
 
-/* The root a to_save 2 rule maps under. By the whole name: TitleCache
- * starts with the same letter as TDATA and must not follow its saves. */
-#define USER_RULE_DIR(r)                                                    \
-    ((strcmp((r)->sub_posix, "/UDATA") == 0 && s_user_in_game[0]) ||        \
-     (strcmp((r)->sub_posix, "/TDATA") == 0 && s_user_in_game[1])           \
-         ? s_game_dir : s_user_dir)
+static int user_rule_in_game(const path_rule* r)
+{
+    if (strcmp(r->sub_posix, "/UDATA") == 0)
+        return s_user_in_game[0];
+    if (strcmp(r->sub_posix, "/TDATA") == 0)
+        return s_user_in_game[1];
+    return 0;
+}
+
+/*
+ * Match a rule against a path: the prefix, and then a boundary unless the
+ * prefix already ends in a separator. Without the boundary the bare
+ * directory rules matched any name that starts the same way, so an asset
+ * read through E: such as Partition1\cached.dat became <save>/CACHE/d.dat
+ * (before CACHE moved to TitleCache), and Partition1\UDATAX\a went to the
+ * saves. Wreckless loads every asset through z:, which it links to
+ * Partition1\, so such a name is reachable.
+ *
+ * Returns the number of chars consumed, or 0 if the rule does not apply.
+ */
+static int match_rule(const char* path, const path_rule* rule)
+{
+    int  n = match_prefix(path, rule->prefix);
+    char last, next;
+
+    if (!n)
+        return 0;
+    last = rule->prefix[n - 1];
+    next = path[n];
+    if (last == '\\' || last == '/' || next == '\0' || next == '\\' || next == '/')
+        return n;
+    return 0;
+}
 
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
@@ -210,7 +226,7 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     out[tlen + rlen] = '\0';
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (rule_match(out, &s_rules[i]))
+        if (match_rule(out, &s_rules[i]))
             return 1;           /* the target is somewhere we can place */
     }
     return 0;
@@ -366,7 +382,7 @@ int xbox_path_tree(const char *xbox_path)
     }
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (rule_match(p, &s_rules[i]))
+        if (match_rule(p, &s_rules[i]))
             return s_rules[i].to_save == 2 ? XBOX_TREE_USER
                  : s_rules[i].to_save     ? XBOX_TREE_HDD : XBOX_TREE_GAME;
     }
@@ -514,7 +530,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
      * created if missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
     {
-        const char *ov = getenv("RECOMP_SAVE_DIR");
+        const char *ov = recomp_env(RENV_SAVE_DIR);
         /* Room for the longest suffix the rules append (UDATA\<title id>\
          * <save>\<file>); a longer root would only truncate later. */
         int n = (ov && ov[0])
@@ -561,6 +577,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir, s_user_dir);
 }
 
+int xbox_path_hdd_root(char *out, size_t n)
+{
+    if (!s_initialized || !n)
+        return 0;
+    return WideCharToMultiByte(CP_UTF8, 0, s_save_dir, -1, out, (int)n,
+                               NULL, NULL) > 0;
+}
+
 /* The host path the last translation produced.
  *
  * A caller that wants to act on the file a title just opened -- playing an FMV
@@ -603,10 +627,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = rule_match(xbox_path, &s_rules[i]);
+        skip = match_rule(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save == 2 ? USER_RULE_DIR(&s_rules[i])
+            base_dir  = s_rules[i].to_save == 2
+                          ? (user_rule_in_game(&s_rules[i]) ? s_game_dir : s_user_dir)
                       : s_rules[i].to_save     ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
             goto translate;
@@ -670,6 +695,8 @@ translate:
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <strings.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -703,6 +730,90 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+/* The Xbox file system is case-insensitive and titles rely on it: a title
+ * opens MEDIA\Sound.xwb while the disc holds media/sound.xwb, and on
+ * Windows or an APFS default volume that resolves by itself. On a
+ * case-sensitive file system (ext4, btrfs: Linux, the Deck) it fails, so
+ * when the exact host path is missing each guest-supplied component past
+ * `fixed` (the host's own base and sub dir, never rewritten) is matched
+ * case-insensitively against its directory. A component with no match
+ * ends the walk and the rest stays as the title wrote it, so a create of
+ * a new file still lands in the right, existing directory. One warning per
+ * path: a title that polls a missing file must not flood the log. */
+#define CASE_WARNED_SLOTS 256
+static uint32_t s_case_warned[CASE_WARNED_SLOTS];
+
+static int case_warn_first(const char* path)
+{
+    uint32_t h = 2166136261u;
+    for (const char* p = path; *p; p++)
+        h = (h ^ (unsigned char)*p) * 16777619u;
+    if (!h) h = 1;
+    /* Open addressing; a full table only repeats warnings. Two threads
+     * racing on a slot can at worst warn twice. */
+    for (int i = 0; i < CASE_WARNED_SLOTS; i++) {
+        uint32_t* slot = &s_case_warned[(h + (uint32_t)i) % CASE_WARNED_SLOTS];
+        if (*slot == h) return 0;
+        if (*slot == 0) { *slot = h; return 1; }
+    }
+    return 1;
+}
+
+static void fix_case(char* path, size_t fixed)
+{
+    struct stat st;
+    char guest[MAX_PATH];
+    size_t pos = fixed;
+    BOOL changed = FALSE;
+
+    if (lstat(path, &st) == 0 || errno != ENOENT)
+        return;
+    snprintf(guest, sizeof(guest), "%s", path);
+
+    while (path[pos] == '/') pos++;
+    while (path[pos]) {
+        size_t end = pos;
+        char save;
+        DIR* d;
+        struct dirent* e;
+        BOOL found = FALSE;
+
+        while (path[end] && path[end] != '/') end++;
+        save = path[end];
+        path[end] = '\0';
+        if (lstat(path, &st) == 0) {
+            path[end] = save;
+        } else {
+            /* Open the parent: path[pos - 1] is the '/' before this one. */
+            path[pos - 1] = '\0';
+            d = opendir(pos > 1 ? path : "/");
+            path[pos - 1] = '/';
+            if (d) {
+                while ((e = readdir(d)) != NULL) {
+                    if (strlen(e->d_name) == end - pos
+                            && strcasecmp(e->d_name, path + pos) == 0) {
+                        memcpy(path + pos, e->d_name, end - pos);
+                        found = changed = TRUE;
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+            path[end] = save;
+            if (!found)
+                break;
+        }
+        pos = end;
+        while (path[pos] == '/') pos++;
+    }
+
+    /* Warn only when the corrected path is there: a miss further down still
+     * fails the open, and the missing-file report names it instead. */
+    if (changed && lstat(path, &st) == 0 && case_warn_first(guest))
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                 "%s: not found; opened %s (case differs)", guest, path);
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -785,7 +896,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
      * created if missing, so a scripted run can start from an empty save. */
     {
-        const char* ov = getenv("RECOMP_SAVE_DIR");
+        const char* ov = recomp_env(RENV_SAVE_DIR);
         if (ov && ov[0]) {
             snprintf(s_user_dir, sizeof(s_user_dir), "%s", ov);
             strip_trailing_slash(s_user_dir);
@@ -814,6 +925,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s, user data=%s",
              s_game_dir, s_save_dir, s_user_dir);
+}
+
+int xbox_path_hdd_root(char *out, size_t n)
+{
+    if (!s_initialized || !n || strlen(s_save_dir) >= n)
+        return 0;
+    memcpy(out, s_save_dir, strlen(s_save_dir) + 1);
+    return 1;
 }
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
@@ -847,10 +966,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = rule_match(xbox_path, &s_rules[i]);
+        skip = match_rule(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save == 2 ? USER_RULE_DIR(&s_rules[i])
+            base_dir  = s_rules[i].to_save == 2
+                          ? (user_rule_in_game(&s_rules[i]) ? s_game_dir : s_user_dir)
                       : s_rules[i].to_save     ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_posix;
             goto translate;
@@ -867,6 +987,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     {
         char remainder_posix[MAX_PATH];
+        size_t fixed;
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);
 
         /* Xbox paths use backslashes -> POSIX slashes. */
@@ -874,6 +995,8 @@ translate:
             if (*p == '\\') *p = '/';
 
         if (sub_dir) {
+            fixed = (size_t)snprintf(host_path_buf, buf_size, "%s%s",
+                                     base_dir, sub_dir);
             snprintf(host_path_buf, buf_size, "%s%s/%s",
                      base_dir, sub_dir, remainder_posix);
 
@@ -882,6 +1005,7 @@ translate:
             snprintf(dir_path, sizeof(dir_path), "%s%s", base_dir, sub_dir);
             mkdir_p(dir_path);
         } else {
+            fixed = strlen(base_dir);
             snprintf(host_path_buf, buf_size, "%s/%s", base_dir, remainder_posix);
         }
 
@@ -890,6 +1014,8 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        if (fixed < strlen(host_path_buf))
+            fix_case(host_path_buf, fixed);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path
