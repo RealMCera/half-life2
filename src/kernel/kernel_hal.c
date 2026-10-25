@@ -1849,9 +1849,25 @@ uint32_t xbox_PortIn(uint32_t port, int width)
     port &= 0xFFFFu;
     if (port == 0x80C0u) {
         static volatile LONG reads;
+        static DWORD last_tick;
         uint32_t n = xbox_VblankCount();
+        DWORD now;
+
         if (!n)
             n = (uint32_t)InterlockedIncrement(&reads);
+        /* A title's field loop polls this port in a tight spin, waiting for
+         * the pin to flip -- at 60 fields a second. On hardware the port
+         * read itself costs a microsecond and throttles the loop; here it
+         * is a function call, and Black's D3D worker burnt a whole core
+         * polling at megahertz between flips. Pacing the re-reader to one
+         * per millisecond is invisible to a 16.6 ms field and gives the
+         * core back: the loop still sees every transition, one tick later
+         * at worst. */
+        now = GetTickCount();
+        if (now == last_tick)
+            Sleep(1);
+        last_tick = now;
+
         v = (n & 1u) << 5;
         return v;
     }

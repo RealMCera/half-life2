@@ -7504,6 +7504,36 @@ static void bridge_RtlCaptureStackBackTrace(void)
 #define KE_SHADOW_SIZE 4096
 typedef struct { uint32_t guest_va; HANDLE host_handle; uint32_t in_use; } KE_SHADOW_SLOT;
 static KE_SHADOW_SLOT g_ke_shadow[KE_SHADOW_SIZE];
+
+/* A direct-mapped memo over the shadow table.
+ *
+ * The table itself is a linear scan under a lock, which was fine when waits
+ * were rare. Black's D3D worker parks on its vblank event tens of millions
+ * of times a run, and at 4096 slots that scan was a quarter of the process.
+ * A read of the memo costs one compare; insert and remove keep it coherent
+ * per slot, so a hit is authoritative (the handle value is pointer-sized and
+ * aligned -- a plain read, and the use-after-remove race is the one the
+ * locked lookup always had). KEVENTs are 16-byte aligned, so the low bits
+ * of the VA spread the slots. */
+#define KE_MEMO_SIZE 1024u
+/* One packed word per slot: (va << 32) | (table_index + 1), with a zero low
+ * half meaning "authoritative miss for this va". A single aligned 64-bit
+ * store, always made under g_ke_shadow_cs, so a reader can never pair one
+ * va with another's answer -- the two-field form could, and so could a
+ * memo written outside the lock (a racing insert's hit could then be
+ * overwritten by a stale miss, and nothing would ever correct it). */
+static volatile uint64_t g_ke_memo[KE_MEMO_SIZE];
+
+/* Caller holds g_ke_shadow_cs. table_index is a hit's g_ke_shadow index, or
+ * ~(uint32_t)0 for a miss. */
+static void ke_memo_write(uint32_t guest_va, uint32_t table_index)
+{
+    uint32_t mslot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
+    g_ke_memo[mslot] = table_index == ~(uint32_t)0
+        ? (uint64_t)guest_va << 32
+        : ((uint64_t)guest_va << 32) | (uint64_t)(table_index + 1u);
+}
+
 static CRITICAL_SECTION g_ke_shadow_cs;
 static int g_ke_shadow_init;
 
@@ -7536,6 +7566,7 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
             if (g_ke_shadow[i].host_handle && g_ke_shadow[i].host_handle != host)
                 CloseHandle(g_ke_shadow[i].host_handle);
             g_ke_shadow[i].host_handle = host;
+            ke_memo_write(guest_va, i);
             LeaveCriticalSection(&g_ke_shadow_cs);
             return;
         }
@@ -7545,8 +7576,9 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
         if (!g_ke_shadow[i].in_use) {
             g_ke_shadow[i].in_use      = 1;
-            g_ke_shadow[i].guest_va    = guest_va;
             g_ke_shadow[i].host_handle = host;
+            g_ke_shadow[i].guest_va    = guest_va;   /* published last */
+            ke_memo_write(guest_va, i);
             LeaveCriticalSection(&g_ke_shadow_cs);
             return;
         }
@@ -7569,15 +7601,37 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
     if (!guest_va)
         return NULL;
 
+    {
+        uint32_t mslot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
+        uint64_t m = g_ke_memo[mslot];
+        if ((uint32_t)(m >> 32) == guest_va) {
+            uint32_t ti = (uint32_t)m;
+            if (!ti)
+                return NULL;               /* an authoritative miss */
+            if (g_ke_shadow[ti - 1u].in_use
+                    && g_ke_shadow[ti - 1u].guest_va == guest_va)
+                return g_ke_shadow[ti - 1u].host_handle;
+        }
+    }
+
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             h = g_ke_shadow[i].host_handle;
-            break;
+            ke_memo_write(guest_va, i);
+            LeaveCriticalSection(&g_ke_shadow_cs);
+            return h;
         }
     }
+    /* A miss is memoised too, under the lock: most of a title's waits are on
+     * objects that never live in this table -- Black's D3D parks on its
+     * vblank event 165,000 times a second and that VA resolves by another
+     * path, so a memo that only remembered hits sent every one of those
+     * waits through the full scan. insert() and remove() rewrite the word
+     * under the same lock, so a negative entry cannot outlive the truth. */
+    ke_memo_write(guest_va, ~(uint32_t)0);
     LeaveCriticalSection(&g_ke_shadow_cs);
     return h;
 }
@@ -7600,6 +7654,7 @@ static void ke_shadow_remove(uint32_t guest_va)
             g_ke_shadow[i].in_use      = 0;
             g_ke_shadow[i].guest_va    = 0;
             g_ke_shadow[i].host_handle = NULL;
+            ke_memo_write(guest_va, ~(uint32_t)0);   /* back to a miss */
             break;
         }
     }
@@ -7652,6 +7707,10 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             h = g_ke_shadow[i].in_use == 2 ? g_ke_shadow[i].host_handle : NULL;
+            /* Publish through the memo too: an earlier negative entry for
+             * this va (a RECOMP_TITLE_KEVENTS pass that ran before the title
+             * built the event) would otherwise hide the new entry forever. */
+            ke_memo_write(guest_va, h ? i : ~(uint32_t)0);
             LeaveCriticalSection(&g_ke_shadow_cs);
             return h;                              /* a KeInitializeEvent shadow: old path */
         }
@@ -7661,8 +7720,9 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
             h = CreateEventA(NULL, *type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
             if (h) {
                 g_ke_shadow[i].in_use      = 2;
-                g_ke_shadow[i].guest_va    = guest_va;
                 g_ke_shadow[i].host_handle = h;
+                g_ke_shadow[i].guest_va    = guest_va;   /* published last */
+                ke_memo_write(guest_va, i);
             }
             break;
         }

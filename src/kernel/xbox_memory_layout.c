@@ -1439,6 +1439,14 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    /* The cheap acks (busy bits, idle bits) run every pass; the heavy ticks
+     * below run once a millisecond. In one block they set the latency of an
+     * XDK D3D kickoff's wait -- the worker sets 0x100410 bit 16 and spins
+     * until this thread clears it, and a pass that carries every mirror and
+     * counter before the next clear left the worker burning its core for
+     * the whole pass, tens of times a frame. Split apart, the ack answers
+     * within a yield and the heavy work keeps its own cadence. */
+    DWORD heavy_tick = 0;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
          * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
@@ -1460,6 +1468,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
             }
+        }
+        {
+            DWORD now = GetTickCount();
+            if (now == heavy_tick) {
+                Sleep(0);              /* yield: the waiter spins on us */
+                continue;              /* next cheap pass; heavy work waits */
+            }
+            heavy_tick = now;
         }
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
          * before the scan below had executed anything.
@@ -3225,6 +3241,30 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "(error %lu); D3D register access will fault\n",
                     XBOX_NV2A_BASE, GetLastError());
         }
+    }
+
+    /*
+     * The synthetic kernel thunk range, as readable guest memory.
+     *
+     * The bridge answers calls through the kernel thunks by VAs of its own
+     * (0xFE000000 + slot * 4, KERNEL_VA_BASE in kernel_bridge.c); the bytes
+     * there are never executed -- recomp_lookup_kernel intercepts the call
+     * before anything runs. They are read: XAPILIB fingerprints the kernel
+     * by loading a thunk and testing a byte of the code behind it. Black's
+     * USB stack loads IoCreateSymbolicLink's entry and compares byte 5
+     * against 0xA1 before it will register the host controller's interrupt,
+     * and the read faults if the range is not backed, which takes the
+     * title's whole input initialisation down with it. One zeroed page
+     * covers the table (0x378 slots = 0xDE0 bytes) with room to spare, and
+     * a zero reads as "not that kernel" -- the retail answer, whose
+     * consequences the titles were built for.
+     */
+    {
+        uintptr_t synth_native = 0xFE000000u + g_memory_offset;
+        void *synth = layout_commit_at((LPVOID)synth_native, 0x1000u);
+        if (!synth)
+            fprintf(stderr, "  WARNING: synthetic thunk range at 0xFE000000 "
+                            "unmapped; kernel fingerprint reads will fault\n");
     }
 
     /*

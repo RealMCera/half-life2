@@ -246,6 +246,15 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
+/* Direct-mapped memo over the CS shadow table (see the comment inside).
+ * The entry is the table slot's address, one aligned pointer: slots are
+ * never re-keyed, so the key check after loading it is the whole
+ * validation. An earlier design memoised {key, cs} as two stores and the
+ * reader could pair a fresh key with the previous entry's lock -- which
+ * breaks mutual exclusion, the one thing this table exists to provide. */
+#define CS_MEMO_SIZE 1024u
+static XBOX_CS_SLOT* g_cs_memo[CS_MEMO_SIZE];
+
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
     if (g_cs_single_mode < 0) {
@@ -267,20 +276,42 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 
     if (!key)
         return NULL;
+
+    /* A direct-mapped memo over the table. The table's entries are never
+     * removed and never re-keyed, so a memoised pointer is exactly as
+     * truthful as the table itself; and the lookup it replaces is a shared
+     * SRW lock plus a hash walk, which the title pays on every Enter and
+     * every Leave -- a level loader that takes its lock per block runs a
+     * million of those, and the lock in front of its locks was the cost.
+     * Guest critical sections live on 4-byte alignment at least, so the
+     * low bits of the VA spread the slots. */
+    {
+        uint32_t mslot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
+        XBOX_CS_SLOT* m = g_cs_memo[mslot];   /* one aligned pointer */
+        if (m && m->key == key)
+            return &m->cs;
+    }
+
     home = (size_t)((key >> 4) % XBOX_CS_TABLE_SIZE);
 
     /* Shared pass first: after start-up almost every call finds an existing
      * entry, and taking the table exclusively for each of those would put a
      * global serialisation point in front of the title's own locks. */
-    AcquireSRWLockShared(&g_cs_table_lock);
-    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
-        XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
-        if (slot->key == key) { found = &slot->cs; break; }
-        if (slot->key == 0) break;
+    {
+        XBOX_CS_SLOT* hit = NULL;
+        AcquireSRWLockShared(&g_cs_table_lock);
+        for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+            XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+            if (slot->key == key) { hit = slot; break; }
+            if (slot->key == 0) break;
+        }
+        ReleaseSRWLockShared(&g_cs_table_lock);
+        if (hit) {
+            uint32_t mslot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
+            g_cs_memo[mslot] = hit;      /* one store; slots are not re-keyed */
+            return &hit->cs;
+        }
     }
-    ReleaseSRWLockShared(&g_cs_table_lock);
-    if (found)
-        return found;
 
     AcquireSRWLockExclusive(&g_cs_table_lock);
     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
@@ -292,6 +323,10 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
                                           * that sees the key sees a live
                                           * lock behind it */
             found = &slot->cs;
+            {
+                uint32_t mslot = (uint32_t)((key >> 4) & (CS_MEMO_SIZE - 1u));
+                g_cs_memo[mslot] = slot; /* one store, published after the key */
+            }
             break;
         }
     }
@@ -475,7 +510,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (!cs)
         return;
-    InterlockedIncrement(&g_cs_enters);
+    g_cs_enters++; /* stat: plain -- an interlocked on a shared cache line per Enter cost more than the lock it counted */
     crt_lock_trace("take", CriticalSection);
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
@@ -528,7 +563,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (cs) {
-        InterlockedIncrement(&g_cs_leaves);
+        g_cs_leaves++;
         crt_lock_trace("drop", CriticalSection);
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
