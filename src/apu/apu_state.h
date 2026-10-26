@@ -499,6 +499,10 @@ struct MCPXAPUState {
     int frame_count;
     int64_t frame_count_time_ms;
     int64_t next_frame_time_us;
+    /* mcpx_apu_xcnt_running: when the setup engine was last switched off
+     * after running (0: not off), and whether it has run since reset. */
+    int64_t xcnt_off_since_us;
+    int xcnt_was_on;
     int pace_q_seen;            /* device queue at the last pacing decision */
     int64_t pace_drain_us;      /* when that queue last fell or sat below high */
     bool pace_stalled;          /* device stopped consuming: host-clock pacing,
@@ -552,6 +556,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d);
 /* Frame-thread pacing at an EP-period boundary: 0 = render the next period
  * now, else microseconds to wait before asking again. See apu_core.c. */
 int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
+bool mcpx_apu_xcnt_running(MCPXAPUState *d, int64_t now_us);
 /* The period pace_step admitted was rendered: spend its credit. A pass that
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);

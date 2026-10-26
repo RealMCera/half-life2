@@ -937,6 +937,36 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * accept (4096 samples, 85 ms) still fit. */
 #define PACE_STALL_US 200000
 
+/* Is the setup engine running (SECTL XCNTMODE not OFF), counting a short
+ * switch-off as running?
+ *
+ * DirectSound in XDK 5849 (SSX On Tour) turns XCNTMODE off and on again
+ * (SECTL 0xF -> 0x7 -> 0xF) about every 10 ms while it edits voice state.
+ * On the console that window lasts microseconds; here the guest code
+ * between the two writes takes 5-10 ms. The frame thread produced silent
+ * frames for the whole window, so every sound came in 8-frame runs with
+ * 8-16 silent frames between them, heard as noise. Holding the clock
+ * through the window instead drained the device queue into underruns. An
+ * off window under 50 ms after the engine has run now counts as running;
+ * longer, the title means it. */
+bool mcpx_apu_xcnt_running(MCPXAPUState *d, int64_t now_us)
+{
+    if (GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]), NV_PAPU_SECTL_XCNTMODE)
+            != NV_PAPU_SECTL_XCNTMODE_OFF) {
+        d->xcnt_was_on = 1;
+        d->xcnt_off_since_us = 0;
+        return true;
+    }
+    if (!d->xcnt_was_on || g_test_tone.active)
+        return false;
+    if (!d->xcnt_off_since_us)
+        d->xcnt_off_since_us = now_us;
+    if (now_us - d->xcnt_off_since_us < 50000)
+        return true;
+    d->xcnt_was_on = 0;
+    return false;
+}
+
 /* One pacing decision, taken at an EP-period boundary. Returns 0 to render
  * the next period now, or how many microseconds to wait before asking again.
  *
@@ -1152,8 +1182,8 @@ static void *mcpx_apu_frame_thread(void *arg)
          * sub_002F805E polling the same doorbell it was acked on at init. */
         mcpx_apu_dsp_ack_poll(d);
 
-        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
-                                NV_PAPU_SECTL_XCNTMODE);
+        int xcntmode = mcpx_apu_xcnt_running(d, qemu_clock_get_us(QEMU_CLOCK_REALTIME))
+                       ? 1 : NV_PAPU_SECTL_XCNTMODE_OFF;
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
@@ -1280,6 +1310,8 @@ static void mcpx_apu_resume(MCPXAPUState *d)
 static void mcpx_apu_reset_locked(MCPXAPUState *d)
 {
     memset(d->regs, 0, sizeof(d->regs));
+    d->xcnt_was_on = 0;
+    d->xcnt_off_since_us = 0;
     mcpx_apu_vp_reset(d);
 
     if (d->gp.dsp) {

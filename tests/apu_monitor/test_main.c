@@ -619,6 +619,31 @@ static void stall_fallback_case(void)
     free(d);
 }
 
+/* DirectSound in XDK 5849 turns XCNTMODE off and on about every 10 ms
+ * while it edits voices: a short off window after the engine has run
+ * counts as running; a long one, or one before it ever ran, does not. */
+static void xcnt_case(void)
+{
+    MCPXAPUState *d = loop_device();
+    if (!d) { failures++; return; }
+    d->regs[NV_PAPU_SECTL] = 0;
+    CHECK("off before it ever ran: not running", !mcpx_apu_xcnt_running(d, 1000));
+    d->regs[NV_PAPU_SECTL] = 0xF;
+    CHECK("on: running", mcpx_apu_xcnt_running(d, 2000));
+    d->regs[NV_PAPU_SECTL] = 0x7;
+    CHECK("off 0 ms: still running", mcpx_apu_xcnt_running(d, 10000));
+    CHECK("off 10 ms: still running", mcpx_apu_xcnt_running(d, 20000));
+    d->regs[NV_PAPU_SECTL] = 0xF;
+    CHECK("on again: running", mcpx_apu_xcnt_running(d, 25000));
+    d->regs[NV_PAPU_SECTL] = 0x7;
+    CHECK("next window starts fresh", mcpx_apu_xcnt_running(d, 70000));
+    CHECK("off 49 ms: still running", mcpx_apu_xcnt_running(d, 119000));
+    CHECK("off 50 ms: stopped", !mcpx_apu_xcnt_running(d, 120000));
+    CHECK("stays stopped", !mcpx_apu_xcnt_running(d, 121000));
+    dev_model = 0;
+    free(d);
+}
+
 /* ---- the switches ----
  * The reader against what the ctest set: on with =1, off unset or =0. */
 static void switch_case(void)
@@ -703,6 +728,7 @@ int main(int argc, char **argv)
     pacing_case();
     trapped_case();
     stall_fallback_case();
+    xcnt_case();
     starve_case();
     switch_case();
     voice_trace_case();                      /* last: they redirect stderr */
