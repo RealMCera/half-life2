@@ -416,7 +416,7 @@ Missing a project, or is a row out of date? Open a pull request that edits this 
 | Blood Wake | [@sp00nznet](https://github.com/sp00nznet) | [sp00nznet/bloodwake](https://github.com/sp00nznet/bloodwake) | main | Windows | Early |
 | Burnout 3: Takedown | [@sp00nznet](https://github.com/sp00nznet) | [sp00nznet/burnout3](https://github.com/sp00nznet/burnout3) | v0.12.0 | Windows | Playable |
 | Dead or Alive Xtreme Beach Volleyball | [@NoRain211](https://github.com/NoRain211) | [NoRain211/doaxvb-re](https://github.com/NoRain211/doaxvb-re) | v0.5 (fork) | Windows, macOS, Linux | Playable |
-| Def Jam: Fight for NY | [@vyanhursky](https://github.com/vyanhursky) | [vyanhursky/DefJamFFNY-recomp](https://github.com/vyanhursky/DefJamFFNY-recomp) | v0.13.0 (fork) | Windows, macOS, Linux / Steam Deck | Playable |
+| Def Jam: Fight for NY | [@vyanhursky](https://github.com/vyanhursky) | [vyanhursky/DefJamFFNY-recomp](https://github.com/vyanhursky/DefJamFFNY-recomp) | v0.16.0 (fork) | Windows, macOS, Linux / Steam Deck | Playable |
 | Jet Set Radio Future | [@andeecollard](https://github.com/andeecollard) | [andeecollard/jsrf-recomp](https://github.com/andeecollard/jsrf-recomp) | v0.8.0 (fork) | macOS (Apple Silicon); Windows experimental | Playable |
 | Mortal Kombat: Deadly Alliance | [@FOTLabs](https://github.com/FOTLabs) | [FOTLabs/mkda-nx](https://github.com/FOTLabs/mkda-nx) | v0.12.0 (fork) | Nintendo Switch | Playable |
 | SSX 3 | [@koenhendriks](https://github.com/koenhendriks) | [koenhendriks/SSX3-recomp](https://github.com/koenhendriks/SSX3-recomp) | v0.13.1 (fork) | Windows, Linux | Playable |
