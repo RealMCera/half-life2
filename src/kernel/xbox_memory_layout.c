@@ -4143,9 +4143,30 @@ static int contig_avoid_image(void)
     return on;
 }
 
+static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];   /* below */
+
+/* RECOMP_CONTIG_AVOID_NAMED (default on, =0: off): skip pages whose number
+ * the title has named for heap memory (xbox_PhysNoteRamName). The APU
+ * resolves such a number to the heap page, so contiguous memory there is
+ * never what it plays. Kung Fu Chaos reloads its menu music into contiguous
+ * memory; a page of it landed on a number DirectSound had named for a sound
+ * still alive in the heap, and the APU played that sound's bytes on every
+ * turn of the music's ring (a sharp noise every 600 ms). */
+static int contig_avoid_named(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CONTIG_AVOID_NAMED");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static int contig_page_free(uint32_t q, int avoid_image)
 {
     if (g_contig_used[q])
+        return 0;
+    if (g_phys_ram_named[q] && contig_avoid_named())
         return 0;
     return !(avoid_image && g_xbox_image_hi
              && q >= g_xbox_image_lo / CONTIG_PAGE
@@ -4369,7 +4390,7 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * pass late (or a cleared one a pass early); the title fills a buffer after
  * naming it and frees it after stopping the voice, so a stale read costs at
  * most one pass of one voice. */
-static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
+static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];   /* declared above */
 
 void xbox_PhysNoteRamName(uint32_t va)
 {
