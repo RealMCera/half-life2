@@ -511,6 +511,9 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    uint32_t h = xbox_PhysAliasTarget(addr);   /* a heap page's own number */
+    if (h)
+        return h;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
