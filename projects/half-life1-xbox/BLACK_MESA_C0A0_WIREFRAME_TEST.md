@@ -1,3 +1,49 @@
+# VERIFIED ON WINDOWS XENIA: FULL REAL BLACK MESA c0a0 LOAD & BMP EXPORT
+
+On October 28, 2026, the user executed our Xbox 360 `hl1_remaster_probe.xex`
+in Windows Xenia Canary with the **privately extracted actual Half-Life 1 c0a0
+worldspawn geometry**. The following **real user-provided Xenia title log**
+confirms the milestone:
+
+```text
+HL1_PROBE: XBOX_360_BOOT_BEGIN
+HL1_PROBE: H360 header verified: 46 groups 10378 vertices 7833 triangles
+HL1_PROBE: scene bytes = 298310
+HL1_PROBE: ASSET_HEADER_PASS
+HL1_PROBE: FULL_MESH_PASS: 46 groups 10378 vertices 7833 triangles
+HL1_PROBE: ASCII_PREVIEW_BEGIN: 64x24
+HL1_PROBE: ASCII_PREVIEW_PASS
+HL1_PROBE: BMP_PREVIEW_PASS: cache:\hl1_wireframe.bmp (640x360)
+HL1_PROBE: XBOX_360_BOOT_COMPLETE
+exit: status 0
+```
+
+The 64×24 ASCII preview in the same log shows a complex, nontrivial
+multi-area top-down mesh projection, rather than one triangle.
+
+**VERIFIED:** the actual first-map H360 v1 geometry loads in Xenia's
+PPC runtime, the vertex/group index data validates in the XEX,
+the CPU wireframe export reports success, and exit is clean. The
+BMP should be in:
+
+```
+C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_wireframe.bmp
+```
+
+**NEXT USER CHECK:** open that BMP and send a screenshot. This checks
+the actual image appearance of the entire Black Mesa map. The BMP
+was not uploaded in this user turn; **do not claim visual quality of
+its layout beyond what the ASCII preview reveals**.
+
+**REMAINING GAP:** No real-time screen display, textured GPU renderer,
+player/controller/camera, physics, weapons, enemies or game logic yet.
+This is an offline CPU geometry visualization produced by an Xbox
+360 executable in Xenia. Xbox Series S Xenia UWP still untested.
+No Linux or Debian installed on the user's PC, and proprietary
+derived map mesh remains private, outside this public repo.
+
+---
+
 # First actual Black Mesa level wireframe test
 
 ## 2026-10-28: confirmed Xenia wireframe BMP output
