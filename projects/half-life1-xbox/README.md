@@ -1,3 +1,27 @@
+# CONFIRMED: Xenia loaded our original H360 synthetic scene asset
+
+On October 28, the user tested the cloud-built Xbox 360 XEX in
+Windows Xenia Canary with an original synthetic 166-byte H360 v1
+asset (1 material, 3 vertices, 1 triangle). The emulator log proved:
+
+```text
+HL1_PROBE: H360 header verified: 1 groups 3 vertices 1 triangles
+HL1_PROBE: scene bytes = 166
+HL1_PROBE: ASSET_HEADER_PASS
+HL1_PROBE: XBOX_360_BOOT_COMPLETE
+exit: status 0
+```
+
+**Next version under CI:** `x360_probe/wireframe.c` verifies every
+mesh vertex and group-local index and uses a CPU renderer to export
+`hl1_wireframe.bmp` (640x360). This is a Windows-viewable OFFLINE
+image file, **not graphics displayed inside Xenia**. See
+[XENIA_WIREFRAME_PREVIEW.md](XENIA_WIREFRAME_PREVIEW.md) for testing
+and limitations. Do not claim a working bitmap export until the
+user runs that new XEX and shares its output.
+
+---
+
 # CONFIRMED SUCCESS — Windows Xenia Canary booted our native Xbox 360 XEX
 
 On October 28, 2026, the user ran the actual cloud-built
