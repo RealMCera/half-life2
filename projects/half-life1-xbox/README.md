@@ -1,3 +1,15 @@
+# Local Debian installation is OPTIONAL — GitHub cloud build available
+
+User preference: **DO NOT install Debian, WSL distributions, Docker or a local cross-compiler.**
+Keep Windows and existing Xenia Canary. See
+[NO_DEBIAN_CLOUD_BUILD.md](NO_DEBIAN_CLOUD_BUILD.md) and the
+[GitHub Actions build](https://github.com/RealMCera/half-life2/actions).
+The Github-hosted Linux runner compiles the public toolchain and a
+**log-only XEX startup probe**; do not interpret compiling as proof of
+Xenia compatibility or a playable remaster.
+
+---
+
 # Current step: Windows Xenia first — no Xbox access required
 
 The user is currently on a Windows PC with Xenia installed and is away
