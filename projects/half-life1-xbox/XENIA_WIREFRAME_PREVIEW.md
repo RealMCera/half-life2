@@ -1,3 +1,58 @@
+# Xenia write access fix — user-confirmed FULL_MESH_PASS
+
+The user's **actual 2026-10-28 Windows Xenia test** of the first
+wireframe XEX logged:
+
+```text
+HL1_PROBE: H360 header verified: 1 groups 3 vertices 1 triangles
+HL1_PROBE: ASSET_HEADER_PASS
+HL1_PROBE: FULL_MESH_PASS: 1 groups 3 vertices 1 triangles
+open: NtCreateFile(game:\hl1_wireframe.bmp) failed: 0xC0000022
+HL1_PROBE: BMP_PREVIEW_FAIL: could not write preview
+HL1_PROBE: XBOX_360_BOOT_COMPLETE
+exit: status 1
+```
+
+**The mesh decoded correctly; only the BMP write failed.**
+`0xC0000022` is `STATUS_ACCESS_DENIED`, because Xenia mounts
+standalone XEX content as a read-only `game:` host path.
+Xenia's own code mounts `cache:`, `cache0:` and `cache1:`
+as writable host paths.
+
+**New source version (needs fresh GitHub Actions XEX build, and actual
+emulator test):** try the writable `cache:` first, then `cache0:`,
+`cache1:`, finally `game:` for console compatibility. The CPU
+renderer additionally prints an easily inspected 64×24 text preview
+as `HL1_WIRE|...|` lines in the *existing Xenia title log*. Even
+if all BMP writes fail, the mesh check and ASCII preview remain
+successful, and it returns exit status 0.
+
+The BMP is expected in **Xenia's cache folder**, not necessarily next
+to the XEX. On the Windows PC:
+
+```powershell
+Get-ChildItem "C:\Users\FrontDesk\Downloads\xenia_canary_windows" -Recurse -File -Filter "hl1_wireframe.bmp" -ErrorAction SilentlyContinue | Select-Object FullName,Length
+```
+
+Check the exact output path and indicators in the **new** log:
+
+```text
+HL1_PROBE: FULL_MESH_PASS: 1 groups 3 vertices 1 triangles
+HL1_PROBE: ASCII_PREVIEW_BEGIN: 64x24
+HL1_PROBE: ASCII_PREVIEW_PASS
+HL1_PROBE: BMP_PREVIEW_PASS: cache:\hl1_wireframe.bmp (640x360)
+HL1_PROBE: XBOX_360_BOOT_COMPLETE
+exit: status 0
+```
+
+If there is no `BMP_PREVIEW_PASS`, look for
+`BMP_PREVIEW_UNAVAILABLE` instead and share the
+`HL1_WIRE|` lines as the fallback. **Do not download the older
+#40754365566 artifact** for this test; it always attempts to write
+to `game:` and cannot fix the access error.
+
+---
+
 # Next milestone: full H360 mesh parse and CPU wireframe BMP
 
 ### What the user verified (2026-10-28)
