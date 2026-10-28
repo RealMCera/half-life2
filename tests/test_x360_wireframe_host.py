@@ -80,6 +80,13 @@ class PreviewTest(unittest.TestCase):
             self.assertEqual(struct.unpack_from("<I", data, 18)[0], 640)
             self.assertEqual(struct.unpack_from("<I", data, 22)[0], 360)
             self.assertEqual(len(data), 54 + 640 * 360 * 3)
+            iso = root / r"cache:\\hl1_isometric.bmp"
+            self.assertTrue(iso.is_file())
+            iso_data = iso.read_bytes()
+            self.assertEqual(iso_data[:2], b"BM")
+            self.assertEqual(len(iso_data), len(data))
+            self.assertNotEqual(iso_data, data)
+            self.assertIn("ISO_PREVIEW_PASS", proc.stdout)
             self.assertTrue(any(data[i:i+3] != b"\x20\x18\x12"
                                 for i in range(54, len(data), 3)))
 
