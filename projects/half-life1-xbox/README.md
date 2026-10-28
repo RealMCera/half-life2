@@ -1,3 +1,18 @@
+# Current target: Xbox 360 game, tested in Xenia emulator
+
+The user will run the remaster using an **Xbox 360 emulator**, not a modded
+physical Xbox 360. We still need to compile a native 360 **XEX2** executable;
+the original Xbox XBE cannot boot in Xenia, and H360 asset meshes are not
+programs. A modded physical console is **not required** for the emulator route.
+
+Start with [XENIA_EMULATOR_TARGET.md](XENIA_EMULATOR_TARGET.md) for PC Xenia
+Canary and optional Xbox Series S Xenia UWP testing, then see
+[XBOX_360_TARGET.md](XBOX_360_TARGET.md) for hardware/asset plans.
+
+**No playable XEX exists yet and none has been emulator-tested.**
+
+---
+
 # Primary target changed: XBOX 360
 
 The user confirmed the remaster is for **Xbox 360**. The modern PC/UE5
