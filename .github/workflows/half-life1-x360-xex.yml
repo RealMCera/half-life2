@@ -1,0 +1,117 @@
+name: Build Half-Life 1 Xbox 360 XEX probe (cloud, no local Linux)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/half-life1-xbox-rebuild-prep-20261028
+    paths:
+      - .github/workflows/half-life1-x360-xex.yml
+      - projects/half-life1-xbox/x360_probe/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hl1-x360-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      XSDK_DIR: ${{ runner.temp }}/xsdk
+      XSDK_PREFIX: ${{ runner.temp }}/xsdk-gcc
+      XSDK_WORK: ${{ runner.temp }}/xsdk-gcc-work
+      PROBE_BUILD: ${{ runner.temp }}/hl1-probe-build
+
+    steps:
+      - name: Check out our original Half-Life 1 probe
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies on GitHub runner (not the user's computer)
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev \
+            curl xz-utils patch python3 cmake ninja-build git ca-certificates
+
+      - name: Fetch public open-source Xbox 360 SDK
+        run: |
+          git clone --depth 1 https://github.com/xenosworks/xsdk.git "$XSDK_DIR"
+          git -C "$XSDK_DIR" rev-parse HEAD | tee xsdk-upstream-commit.txt
+
+      - name: Build PowerPC Xbox 360 cross-compiler on GitHub runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$XSDK_DIR"
+          PREFIX="$XSDK_PREFIX" WORK="$XSDK_WORK" JOBS=3 tools/toolchain/build.sh
+          "$XSDK_PREFIX/bin/powerpc-xsdk-elf-gcc" --version
+
+      - name: Build the SDK runtime library
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C "$XSDK_DIR" -j3 TOOLCHAIN="$XSDK_PREFIX/bin/powerpc-xsdk-elf-" build/libxsdk.a
+          test -s "$XSDK_DIR/build/libxsdk.a"
+
+      - name: Build original C17 Half-Life startup probe as XEX2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake \
+            -S projects/half-life1-xbox/x360_probe \
+            -B "$PROBE_BUILD" \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$XSDK_DIR/cmake/xsdk.cmake" \
+            -DXSDK_TOOLCHAIN="$XSDK_PREFIX" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build "$PROBE_BUILD" --verbose
+          test -s "$PROBE_BUILD/hl1_remaster_probe.xex"
+
+      - name: Validate XEX2 file header and prepare download
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path(__import__('os').environ['PROBE_BUILD']) / 'hl1_remaster_probe.xex'
+          with p.open('rb') as f:
+              header = f.read(4)
+          if header != b'XEX2':
+              raise SystemExit(f'Not XEX2: {header!r}')
+          print(f'XEX2 header verified; {p.stat().st_size} bytes. Emulation has not been verified.')
+          PY
+          cp "$PROBE_BUILD/hl1_remaster_probe.xex" dist/
+          cp xsdk-upstream-commit.txt dist/
+          sha256sum dist/hl1_remaster_probe.xex > dist/SHA256SUMS.txt
+          cat > dist/README.txt <<'EOF'
+          Half-Life 1 Xbox 360 native startup probe.
+          NOT A PLAYABLE GAME OR GRAPHICS REMASTER.
+          Tested in CI only for compilation and XEX2 magic.
+          Download to Windows and try in Xenia Canary.
+          Inspect Xenia cache title log and xenia.log for HL1_PROBE entries.
+          No original Half-Life disc assets or SDK binaries are included.
+          Xbox Series S Xenia UWP support is not confirmed.
+          EOF
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload Windows Xenia test XEX
+        uses: actions/upload-artifact@v4
+        with:
+          name: HalfLife1-X360-XEX-StartupProbe
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload toolchain errors if compilation failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xbox360-Cloud-Build-Failure-Logs
+          path: ${{ runner.temp }}/xsdk-gcc-work/logs/
+          if-no-files-found: ignore
+          retention-days: 7
