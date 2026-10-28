@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$XSDK_DIR"
-          PREFIX="$XSDK_PREFIX" WORK="$XSDK_WORK" JOBS=3 tools/toolchain/build.sh
+          PREFIX="$XSDK_PREFIX" WORK="$XSDK_WORK" JOBS=3 bash tools/toolchain/build.sh
           "$XSDK_PREFIX/bin/powerpc-xsdk-elf-gcc" --version
 
       - name: Build the SDK runtime library
