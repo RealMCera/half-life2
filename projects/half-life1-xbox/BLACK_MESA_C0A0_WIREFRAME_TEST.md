@@ -1,3 +1,51 @@
+# VISUAL CONFIRMATION: user screenshot of real Black Mesa c0a0 map (2026-10-28)
+
+The user opened the **actual Xenia-generated** `hl1_wireframe.bmp`
+in Windows Live Photo Gallery and supplied a screenshot. The
+image visibly shows a coherent, multi-part **overhead projection**
+with two substantial room/complex areas connected by a long
+curving corridor, plus smaller adjoining structures. Distinct
+material groups are assigned different colored edges. The many
+diagonal crossings are the raw face triangulation, NOT proof of
+broken geometry. No obvious disconnected/misaligned vertex
+explosion is visible in the screenshot.
+
+**Confirmed:** our actual first Half-Life 1 Black Mesa map is no
+longer only a successful parser log. The user can view a full
+geometry diagram produced by a custom Xbox 360 XEX running under
+Windows Xenia Canary. The real game-derived H360 asset is retained
+privately and **not** in the public repository. The screenshot
+itself is not committed here.
+
+**Important:** This is a 2D overhead wireframe, **not** a textured,
+lit, real-time 3D scene. It does not depict a playable interior
+or establish that game logic, moving objects or enemies function.
+
+## Improved next experiment
+
+We added an **additional fixed isometric 3D-to-2D projection**
+with GoldSrc's Z-up convention. The source now attempts to
+write `cache:\hl1_isometric.bmp` while retaining
+`cache:\hl1_wireframe.bmp`. Its second view is also
+CPU-generated **offline** geometry. The new renderer is not
+emulator-verified yet; only the next *successful* cloud build
+containing this feature can be tested.
+
+From Windows PowerShell after loading that new XEX with the same
+`assets/hl1_c0a0_world.h360`:
+
+```powershell
+Start-Process "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_isometric.bmp"
+```
+
+Check `hl1_remaster_probe.log` for `ISO_PREVIEW_PASS` before
+expecting the new file. If the path isn't present or the new marker
+doesn't appear, make sure the downloaded XEX comes from the
+**latest successful run** under
+https://github.com/RealMCera/half-life2/actions
+
+---
+
 # VERIFIED ON WINDOWS XENIA: FULL REAL BLACK MESA c0a0 LOAD & BMP EXPORT
 
 On October 28, 2026, the user executed our Xbox 360 `hl1_remaster_probe.xex`
