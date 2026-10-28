@@ -1,3 +1,19 @@
+# FIXED IN SOURCE: Xenia decoded our full mesh, but blocked BMP output
+
+User's real Xenia log showed **`FULL_MESH_PASS`**, then `0xC0000022`
+(`STATUS_ACCESS_DENIED`) while trying to write
+`game:\hl1_wireframe.bmp`. Standalone XEX content mounts
+read-only in Xenia. The new source writes to the **writable cache
+mount** first and logs an ASCII preview even when all file output is
+blocked. See [XENIA_WIREFRAME_PREVIEW.md](XENIA_WIREFRAME_PREVIEW.md)
+for the updated test and how to locate the new output.
+
+The prior successful build `#40754365566` contains the broken
+write path; download a **new successful run** before retesting.
+No Debian or local compiler required.
+
+---
+
 # CONFIRMED: Xenia loaded our original H360 synthetic scene asset
 
 On October 28, the user tested the cloud-built Xbox 360 XEX in
