@@ -1,3 +1,21 @@
+# Confirmed: test Xbox 360 builds on BOTH Windows PC and Xbox Series S
+
+One native 360 XEX with identical content for **Windows Xenia Canary** and
+**Xenia UWP on Xbox Series S in Dev Mode**. Windows is the primary compiler
+and logging environment; custom homebrew XEX compatibility with the UWP
+port must still be demonstrated.
+
+Read [DUAL_XENIA_TESTING.md](DUAL_XENIA_TESTING.md) for the new tool,
+PowerShell commands, SHA-256 bundle verification and two-platform test matrix.
+The implementation lives in
+[tools/half_life1_xenia_bundle.py](../../tools/half_life1_xenia_bundle.py).
+
+The project **does not yet have a compiled, playable remaster XEX**.
+The existing Half-LifeX `.xbe` is original Xbox software and
+cannot run under the Xbox 360 emulator.
+
+---
+
 # Current target: Xbox 360 game, tested in Xenia emulator
 
 The user will run the remaster using an **Xbox 360 emulator**, not a modded
