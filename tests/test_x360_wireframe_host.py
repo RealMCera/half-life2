@@ -71,7 +71,9 @@ class PreviewTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("FULL_MESH_PASS", proc.stdout)
             self.assertIn("BMP_PREVIEW_PASS", proc.stdout)
-            bmp = root / r"game:\hl1_wireframe.bmp"
+            self.assertIn("ASCII_PREVIEW_PASS", proc.stdout)
+            self.assertEqual(proc.stdout.count("HL1_WIRE|"), 24)
+            bmp = root / r"cache:\hl1_wireframe.bmp"
             self.assertTrue(bmp.is_file())
             data = bmp.read_bytes()
             self.assertEqual(data[:2], b"BM")
@@ -80,6 +82,23 @@ class PreviewTest(unittest.TestCase):
             self.assertEqual(len(data), 54 + 640 * 360 * 3)
             self.assertTrue(any(data[i:i+3] != b"\x20\x18\x12"
                                 for i in range(54, len(data), 3)))
+
+    def test_ascii_preview_survives_bitmap_write_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = self.compile(root)
+            mesh = root / "triangle.h360"
+            mesh.write_bytes(self.fixture())
+            # On Linux these are literal filenames. Pre-create directories
+            # using each name to force fopen(...,"wb") to fail.
+            for name in ("cache:", "cache0:", "cache1:", "game:"):
+                (root / (name + "\\hl1_wireframe.bmp")).mkdir()
+            proc = subprocess.run(
+                [str(app), str(mesh)], cwd=root, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("FULL_MESH_PASS", proc.stdout)
+            self.assertIn("ASCII_PREVIEW_PASS", proc.stdout)
+            self.assertIn("BMP_PREVIEW_UNAVAILABLE", proc.stdout)
 
     def test_reject_invalid_group_index(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,7 +112,7 @@ class PreviewTest(unittest.TestCase):
             proc = subprocess.run([str(app), str(mesh)], cwd=root, capture_output=True, text=True)
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("FULL_MESH_FAIL", proc.stdout)
-            self.assertFalse((root / r"game:\hl1_wireframe.bmp").exists())
+            self.assertFalse((root / r"cache:\hl1_wireframe.bmp").exists())
 
 
 if __name__ == "__main__":
