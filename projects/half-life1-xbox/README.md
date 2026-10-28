@@ -1,3 +1,20 @@
+# VISUALLY CONFIRMED: real Black Mesa `c0a0` isometric map in Windows Xenia
+
+The user supplied a screenshot from their actual Xenia Canary run of
+`cache/hl1_isometric.bmp`. The image shows a coherent, elevated
+multi-level world structure with a connecting raised corridor,
+color-coded wireframe faces, and a smaller separate-looking cluster.
+The view is an **offline CPU image**, NOT real-time gameplay.
+Original game geometry remains private.
+
+**New in source (awaiting compilation and Xenia test):** a third
+`cache/hl1_shaded.bmp` preview showing filled, depth-buffered
+and directionally lit mesh surfaces rather than only wireframe
+edges. See [SHADED_PREVIEW.md](SHADED_PREVIEW.md).
+No Debian on the user's Windows machine.
+
+---
+
 # FIXED IN SOURCE: Xenia decoded our full mesh, but blocked BMP output
 
 User's real Xenia log showed **`FULL_MESH_PASS`**, then `0xC0000022`
