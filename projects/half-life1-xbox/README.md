@@ -1,3 +1,14 @@
+# Primary target changed: XBOX 360
+
+The user confirmed the remaster is for **Xbox 360**. The modern PC/UE5
+approach below is no longer the deployment target. Read the new
+[XBOX_360_TARGET.md](XBOX_360_TARGET.md) for the real 360 hardware
+limits, open homebrew toolchain options and the H360 model pipeline.
+
+**This project does not yet produce a playable Xbox 360 XEX.**
+
+---
+
 # Half-Life 1 Graphics Remaster — original campaign, upgraded visuals
 
 **Project intent (corrected October 28, 2026):** Preserve Half-Life 1's original maps, gameplay, NPCs, weapons and story, while modernizing textures, models, lighting and effects. Half-LifeX is our *starting version of Half-Life 1*, not a graphics-quality target. The user also owns an Xbox disc image of Half-Life 2, which is reference/possible licensed source material for compatible elements, **not a drop-in replacement engine**.
