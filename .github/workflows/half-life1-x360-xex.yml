@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: hl1-x360-probe-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
