@@ -37,6 +37,9 @@ jobs:
             build-essential bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev \
             curl xz-utils patch python3 cmake ninja-build git ca-certificates
 
+      - name: Test original H360 CPU wireframe renderer using runner GCC
+        run: python3 -m unittest discover -s tests -p 'test_x360_wireframe_host.py' -v
+
       - name: Fetch public open-source Xbox 360 SDK
         run: |
           git clone --depth 1 https://github.com/xenosworks/xsdk.git "$XSDK_DIR"
@@ -90,8 +93,14 @@ jobs:
           sha256sum dist/hl1_remaster_probe.xex > dist/SHA256SUMS.txt
           cat > dist/README.txt <<'EOF'
           Half-Life 1 Xbox 360 native startup probe.
-          NOT A PLAYABLE GAME OR GRAPHICS REMASTER.
-          Tested in CI only for compilation and XEX2 magic.
+          NOT A PLAYABLE GAME OR INTERACTIVE GRAPHICS REMASTER.
+          When assets/hl1_c0a0_world.h360 is next to this XEX,
+          it validates the entire H360 mesh and writes a CPU-generated
+          640x360 wireframe image as game:\hl1_wireframe.bmp.
+          Find that BMP beside the XEX after running in Xenia Canary.
+          No graphics are presented in the emulator window.
+          Host-side synthetic H360 validation and native XEX compilation
+          are tested in CI. Xenia behavior needs the user's real test.
           Download to Windows and try in Xenia Canary.
           Inspect Xenia cache title log and xenia.log for HL1_PROBE entries.
           No original Half-Life disc assets or SDK binaries are included.
