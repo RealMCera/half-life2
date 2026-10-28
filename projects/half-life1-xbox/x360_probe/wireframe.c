@@ -102,6 +102,86 @@ static void project(const uint8_t *data, uint32_t vi, int axis_a, int axis_b,
     *py = (int)(H * 0.5f - (b - center[axis_b]) * scale);
 }
 
+/* A second, fixed isometric projection of the SAME vertices. GoldSrc
+   uses Z as up. This is a 2D offline diagram, not 3D GPU presentation. */
+static void iso_coordinates(const uint8_t *vertex, float *u, float *v)
+{
+    const float x = be_float(vertex);
+    const float y = be_float(vertex + 4);
+    const float z = be_float(vertex + 8);
+    *u = 0.707106781f * (x - y);
+    *v = 0.408248290f * (x + y) - 0.816496581f * z;
+}
+
+static void clear_framebuffer(void)
+{
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            uint8_t *p = &framebuffer[y][3 * x];
+            p[0] = 32;
+            p[1] = 24;
+            p[2] = 18;
+        }
+    }
+}
+
+static void draw_isometric(const uint8_t *buffer,
+                           uint32_t groups, uint32_t vertices,
+                           uint32_t goff, uint32_t voff, uint32_t ioff)
+{
+    float lo_u = INFINITY, hi_u = -INFINITY;
+    float lo_v = INFINITY, hi_v = -INFINITY;
+    for (uint32_t i = 0; i < vertices; i++) {
+        float u, v;
+        iso_coordinates(buffer + voff + (size_t)i * H360_VERTEX, &u, &v);
+        if (u < lo_u) lo_u = u;
+        if (u > hi_u) hi_u = u;
+        if (v < lo_v) lo_v = v;
+        if (v > hi_v) hi_v = v;
+    }
+
+    float center_u = lo_u + (hi_u - lo_u) * 0.5f;
+    float center_v = lo_v + (hi_v - lo_v) * 0.5f;
+    float extent_u = hi_u - lo_u;
+    float extent_v = hi_v - lo_v;
+    float su = extent_u < 0.001f ? 1.0f : (float)(W - 40) / extent_u;
+    float sv = extent_v < 0.001f ? 1.0f : (float)(H - 40) / extent_v;
+    float scale = fminf(su, sv);
+    if (!isfinite(scale) || scale <= 0.0f) scale = 1.0f;
+    clear_framebuffer();
+
+    for (uint32_t g = 0; g < groups; g++) {
+        const uint8_t *row = buffer + goff + (size_t)g * H360_GROUP;
+        uint32_t vf = be32(row + 32);
+        uint32_t ix = be32(row + 40);
+        uint32_t ic = be32(row + 44);
+        uint32_t hash = 2166136261U;
+        for (int c = 0; c < 32 && row[c]; c++)
+            hash = (hash ^ row[c]) * 16777619U;
+        const uint8_t color[3] = {
+            (uint8_t)(85 + (hash & 0x7FU)),
+            (uint8_t)(90 + ((hash >> 8) & 0x7FU)),
+            (uint8_t)(95 + ((hash >> 16) & 0x7FU))
+        };
+        for (uint32_t k = 0; k < ic; k += 3) {
+            int px[3], py[3];
+            for (int j = 0; j < 3; j++) {
+                uint32_t local = be16(buffer + ioff +
+                    (size_t)(ix + k + (uint32_t)j) * 2U);
+                const uint8_t *vert = buffer + voff +
+                    (size_t)(vf + local) * H360_VERTEX;
+                float u, v;
+                iso_coordinates(vert, &u, &v);
+                px[j] = (int)((u - center_u) * scale + W * 0.5f);
+                py[j] = (int)(H * 0.5f - (v - center_v) * scale);
+            }
+            line(px[0], py[0], px[1], py[1], color);
+            line(px[1], py[1], px[2], py[2], color);
+            line(px[2], py[2], px[0], py[0], color);
+        }
+    }
+}
+
 static int save_bmp(const char *path)
 {
     uint8_t header[54] = {0};
@@ -125,6 +205,22 @@ static int save_bmp(const char *path)
     if (fclose(file) != 0)
         okay = 0;
     return okay;
+}
+
+/* Same write destinations as the proven top-down BMP. */
+static int save_to_xenia_cache(const char *filename)
+{
+    const char *roots[] = { "cache:\\", "cache0:\\", "cache1:\\", "game:\\" };
+    char path[120];
+    for (size_t i = 0; i < sizeof roots / sizeof roots[0]; i++) {
+        int n = snprintf(path, sizeof path, "%s%s", roots[i], filename);
+        if (n < 0 || (size_t)n >= sizeof path) continue;
+        if (save_bmp(path)) {
+            xsdk_log_write("HL1_PROBE: IMAGE_WRITE_PASS: %s", path);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int hl1_preview_h360(const char *path)
@@ -268,8 +364,6 @@ int hl1_preview_h360(const char *path)
             line(px[2], py[2], px[0], py[0], color);
         }
     }
-    free(buffer);
-
     /* Xenia launches a standalone XEX from a READ-ONLY game: mount.
        Unlike game:, cache: and cache0:/cache1: are writable host mounts.
        Keep an ASCII backup in the existing title log, which is known
@@ -296,20 +390,23 @@ int hl1_preview_h360(const char *path)
     }
     xsdk_log_write("HL1_PROBE: ASCII_PREVIEW_PASS");
 
-    const char *targets[] = {
-        "cache:\\hl1_wireframe.bmp",
-        "cache0:\\hl1_wireframe.bmp",
-        "cache1:\\hl1_wireframe.bmp",
-        "game:\\hl1_wireframe.bmp"
-    };
-    for (size_t i = 0; i < sizeof targets / sizeof targets[0]; i++) {
-        if (save_bmp(targets[i])) {
-            xsdk_log_write("HL1_PROBE: BMP_PREVIEW_PASS: %s (%ux%u)",
-                           targets[i], (unsigned)W, (unsigned)H);
-            return 1;
-        }
+    int topdown_saved = save_to_xenia_cache("hl1_wireframe.bmp");
+    if (topdown_saved) {
+        xsdk_log_write("HL1_PROBE: BMP_PREVIEW_PASS: top-down wireframe (%ux%u)",
+                       (unsigned)W, (unsigned)H);
+    } else {
+        xsdk_log_write("HL1_PROBE: BMP_PREVIEW_UNAVAILABLE: top-down BMP refused; ASCII preview logged");
     }
-    xsdk_log_write("HL1_PROBE: BMP_PREVIEW_UNAVAILABLE: all output mounts refused writes; ASCII preview logged");
+
+    draw_isometric(buffer, groups, vertices, goff, voff, ioff);
+    if (save_to_xenia_cache("hl1_isometric.bmp")) {
+        xsdk_log_write("HL1_PROBE: ISO_PREVIEW_PASS: hl1_isometric.bmp (%ux%u)",
+                       (unsigned)W, (unsigned)H);
+    } else {
+        xsdk_log_write("HL1_PROBE: ISO_PREVIEW_UNAVAILABLE: cache write refused");
+    }
+
+    free(buffer);
     return 1;
 
 fail:
