@@ -37,9 +37,19 @@ Another option is libxenon (bare-metal), but it is not a drop-in
 replacement for xsdk:
 https://github.com/Free60Project/libxenon
 
-An unmodified retail Xbox 360 cannot simply load arbitrary unsigned
-custom XEX titles. You need RGH/JTAG hardware or an authorized
-development environment for this original console game build.
+**The user's PRIMARY TEST TARGET is an Xbox 360 EMULATOR, not physical hardware.**
+Xenia Canary on Windows can load .xex files, including xsdk homebrew,
+and does not require an RGH/JTAG console. xsdk's own getting-started guide
+documents Xenia Canary as an emulator smoke check. The intended dev loop is
+build a PowerPC XEX, test it in desktop Xenia Canary, and subsequently try
+the Xbox Series S|X Xenia UWP port only after basic desktop launch works.
+That UWP port is third-party and compatibility with our future XEX is
+UNVERIFIED. Do not claim the original Half-LifeX .xbe runs in Xenia.
+See [XENIA_EMULATOR_TARGET.md](XENIA_EMULATOR_TARGET.md) for details.
+
+RGH/JTAG or official development hardware is ONLY necessary if we later
+elect to test on an actual Xbox 360. A regular retail 360 does not run
+unsigned homebrew XEX, but the user has chosen emulator testing instead.
 
 The Half-LifeX executable targets ORIGINAL Xbox hardware (XBE,
 x86, original Xbox graphics interfaces), not Xbox 360 (XEX, PPC,
@@ -117,8 +127,11 @@ These are validation limits, NOT proven frame-rate limits.
 
 ## Necessary next milestones
 
-1. Verify target RGH/JTAG Xbox 360 or authorized console dev access.
-2. Bring up an xsdk sample XEX on actual hardware.
+1. Verify Windows Xenia Canary can open a separately built xsdk
+   sample .xex, and record startup logs. Emulator smoke tests are
+   sufficient for the FIRST prototype; physical hardware is optional.
+2. Bring up an xsdk sample XEX in PC Xenia Canary (test-run pending);
+   if the user runs Xenia UWP on Series S, test that separately.
 3. Implement a 360 mesh viewer, H360 reader and Xenos shader path.
 4. Add properly compressed/tiled textures, baked lighting, visibility,
    culling and draw batching; benchmark console memory and FPS.
