@@ -1,3 +1,53 @@
+# Half-Life 1 Graphics Remaster — original campaign, upgraded visuals
+
+**Project intent (corrected October 28, 2026):** Preserve Half-Life 1's original maps, gameplay, NPCs, weapons and story, while modernizing textures, models, lighting and effects. Half-LifeX is our *starting version of Half-Life 1*, not a graphics-quality target. The user also owns an Xbox disc image of Half-Life 2, which is reference/possible licensed source material for compatible elements, **not a drop-in replacement engine**.
+
+**Target:** Prior user context prefers Xbox or Xbox 360. Prioritize an original Xbox-compatible detail-texture prototype using the supplied Half-LifeX ISO, then evaluate whether the Xbox 360 requires a distinct Source-engine port. Xbox 360 is faster, but a native 360 build cannot be produced merely by inserting Half-Life 2 files into Half-LifeX.
+
+## First concrete graphics prototype (implemented)
+
+Original Half-LifeX source (`Engine/client/gl_rmisc.c`) includes `R_ParseDetailTextures`, which loads map-specific `maps/<map>_detail.txt` definitions, reads images from `gfx/<image>`, and uses the `r_detailtextures` setting. The source also includes the `gl_rsurf.c` detail surface render path. This appears to provide a low-risk *experimental* enhancement path; **not yet validated with this actual Beta 1.4 XBE or hardware**.
+
+From this repository's root, on Windows with Python 3.10+:
+
+```powershell
+py -3 -m tools.half_life1_graphics inspect "C:path	oHalf-LifeX_Test_v2.iso" --map c0a0
+py -3 -m tools.half_life1_graphics stage "C:path	oHalf-LifeX_Test_v2.iso" --map c0a0 -o "localhl1-remaster"
+```
+
+The stage output is a **standalone mod overlay** to experiment with against your *existing*, legally obtained game installation, not a replacement executable or ISO. Its paths are:
+
+```text
+local/hl1-remaster/
+  valve/gfx/detail/hl1_concrete.tga
+  valve/gfx/detail/hl1_metal.tga
+  valve/maps/c0a0_detail.txt
+  remaster_report.json
+```
+
+- Source code parses original BSP30 texture names from `maps/c0a0.bsp` inside `valve/pak0.pak`.
+- It creates **two original, tileable, grayscale 128x128 procedural detail textures** for initial compatibility tests. These are *not* actual Half-Life 2 textures and do not create Half-Life 2-grade visuals alone.
+- Conservative matching currently selects **three of the first map's 77 texture names** (`crete4_flr03`, `frostgrate`, `drkmtlt_bord12`). More assignments are deliberately manual pending artist review.
+- To override or skip specific texture assignments, supply a JSON object such as `{"crete4_flr03":"concrete","frostgrate":"metal","poster14":"skip"}` through `--assignments path/to/file.json`.
+- Copy the `valve/` folder contents into a **backup/test copy** of your extracted Half-LifeX game, maintaining directories, then launch your existing game with `r_detailtextures 1` if the build accepts that cvar. Verify visually; absence of visible overlays or crashes means more renderer work is needed.
+- **Safety:** do not modify the source ISO, do not commit extracted assets, and do not call this a finished remaster.
+
+## Graphics roadmap
+
+1. **Prove first-level detail passes** and measure Xbox frame rate, texture VRAM and memory. Original Xbox 64 MB vs 128 MB limitations matter.
+2. **High-resolution base textures**: audit all map texture names; author or adapt suitable higher-resolution concrete, metal, wood and lab materials. Confirm how this Xash3D Xbox build loads base texture replacements; detail textures alone are insufficient.
+3. **Updated models and sprites**: update scientists, guards, creatures, hands, weapons, effects; GoldSrc MDL ≠ Source MDL, so conversion/rigging/animation must be done deliberately.
+4. **Lighting and renderer**: tune lightmaps and effects; true Source-like lighting requires substantial graphics-engine changes or moving original maps/content into the Source engine.
+5. **Xbox 360 feasibility**: a separate Source-engine port/rebuild may deliver more of the desired visuals than original-Xbox hardware, but compatibility, SDK and platform packaging are unproven. Stage and validate on PC first, then evaluate console targets.
+
+## Half-Life 2 ISO relationship
+
+Google Drive link supplied to the conversation identifies `Half-Life 2 (USA, Europe) (En,Fr,De,Es,It).xiso.iso`, 2.06 GB. Metadata was accessible but downloading the file failed, so **no Source materials from that file have been extracted or used**. Existing original Xbox Half-Life 2 content is not evidence of a working Half-Life 1 renderer or automatically compatible texture/model assets.
+
+---
+
+## Earlier preparation notes
+
 # Half-Life 1 original Xbox rebuild workspace
 
 This workspace concerns **Half-Life (1998)**, not Half-Life 2. The supplied
