@@ -270,16 +270,46 @@ int hl1_preview_h360(const char *path)
     }
     free(buffer);
 
-    const char *destination = "game:\\hl1_wireframe.bmp";
-    if (!save_bmp(destination)) {
-        destination = "hl1_wireframe.bmp";
-        if (!save_bmp(destination)) {
-            xsdk_log_write("HL1_PROBE: BMP_PREVIEW_FAIL: could not write preview");
-            return 0;
+    /* Xenia launches a standalone XEX from a READ-ONLY game: mount.
+       Unlike game:, cache: and cache0:/cache1: are writable host mounts.
+       Keep an ASCII backup in the existing title log, which is known
+       to work, even if every image file create is blocked. */
+    xsdk_log_write("HL1_PROBE: ASCII_PREVIEW_BEGIN: 64x24");
+    for (int by = 0; by < 24; by++) {
+        char linebuf[65];
+        for (int bx = 0; bx < 64; bx++) {
+            char mark = ' ';
+            for (int ry = 0; ry < 15 && mark == ' '; ry++) {
+                const uint8_t *pixels = framebuffer[by * 15 + ry];
+                for (int rx = 0; rx < 10; rx++) {
+                    const uint8_t *p = pixels + (bx * 10 + rx) * 3;
+                    if (p[0] != 32 || p[1] != 24 || p[2] != 18) {
+                        mark = '#';
+                        break;
+                    }
+                }
+            }
+            linebuf[bx] = mark;
+        }
+        linebuf[64] = '\0';
+        xsdk_log_write("HL1_WIRE|%s|", linebuf);
+    }
+    xsdk_log_write("HL1_PROBE: ASCII_PREVIEW_PASS");
+
+    const char *targets[] = {
+        "cache:\\hl1_wireframe.bmp",
+        "cache0:\\hl1_wireframe.bmp",
+        "cache1:\\hl1_wireframe.bmp",
+        "game:\\hl1_wireframe.bmp"
+    };
+    for (size_t i = 0; i < sizeof targets / sizeof targets[0]; i++) {
+        if (save_bmp(targets[i])) {
+            xsdk_log_write("HL1_PROBE: BMP_PREVIEW_PASS: %s (%ux%u)",
+                           targets[i], (unsigned)W, (unsigned)H);
+            return 1;
         }
     }
-    xsdk_log_write("HL1_PROBE: BMP_PREVIEW_PASS: %s (%ux%u)",
-                   destination, (unsigned)W, (unsigned)H);
+    xsdk_log_write("HL1_PROBE: BMP_PREVIEW_UNAVAILABLE: all output mounts refused writes; ASCII preview logged");
     return 1;
 
 fail:
