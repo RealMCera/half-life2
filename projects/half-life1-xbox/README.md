@@ -1,3 +1,18 @@
+# Current step: Windows Xenia first — no Xbox access required
+
+The user is currently on a Windows PC with Xenia installed and is away
+from the Xbox Series S. Start with the read-only
+[PC readiness script](../../tools/check_xenia_pc.ps1) and
+[PC_XENIA_FIRST.md](PC_XENIA_FIRST.md), then the
+[xsdk C17 startup probe](x360_probe/README.md).
+The startup probe can write useful boot and asset-header logs **without
+a display**. Upstream xsdk docs say its current graphics presentation
+calls are not supported in Xenia, so **rendered-scene testing is blocked
+until that emulator compatibility problem is solved**. The probe is
+source only and has NOT yet been built into an XEX with xsdk.
+
+---
+
 # Confirmed: test Xbox 360 builds on BOTH Windows PC and Xbox Series S
 
 One native 360 XEX with identical content for **Windows Xenia Canary** and
