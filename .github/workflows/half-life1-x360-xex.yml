@@ -21,10 +21,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     env:
-      XSDK_DIR: ${{ runner.temp }}/xsdk
-      XSDK_PREFIX: ${{ runner.temp }}/xsdk-gcc
-      XSDK_WORK: ${{ runner.temp }}/xsdk-gcc-work
-      PROBE_BUILD: ${{ runner.temp }}/hl1-probe-build
+      XSDK_DIR: /tmp/hl1-xsdk
+      XSDK_PREFIX: /tmp/hl1-xsdk-gcc
+      XSDK_WORK: /tmp/hl1-xsdk-gcc-work
+      PROBE_BUILD: /tmp/hl1-probe-build
 
     steps:
       - name: Check out our original Half-Life 1 probe
@@ -112,6 +112,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Xbox360-Cloud-Build-Failure-Logs
-          path: ${{ runner.temp }}/xsdk-gcc-work/logs/
+          path: /tmp/hl1-xsdk-gcc-work/logs/
           if-no-files-found: ignore
           retention-days: 7
