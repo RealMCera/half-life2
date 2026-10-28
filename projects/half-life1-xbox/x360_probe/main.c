@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "xsdk/log.h"
+#include "wireframe.h"
 
 #define H360_HEADER_BYTES 32U
 #define H360_MAX_BYTES (32UL * 1024UL * 1024UL)
@@ -75,12 +76,17 @@ int main(void)
 
     /* Xenia/retail game drives may differ; try a game:-absolute and a
        relative asset path, without touching system storage. */
-    int status = report_h360("game:\\assets\\hl1_c0a0_world.h360");
-    if (status == 0)
-        status = report_h360("assets/hl1_c0a0_world.h360");
+    const char *scene = "game:\\assets\\hl1_c0a0_world.h360";
+    int status = report_h360(scene);
+    if (status == 0) {
+        scene = "assets/hl1_c0a0_world.h360";
+        status = report_h360(scene);
+    }
 
     if (status == 1) {
         xsdk_log_write("HL1_PROBE: ASSET_HEADER_PASS");
+        if (!hl1_preview_h360(scene))
+            status = -1;
     } else if (status == 0) {
         xsdk_log_write("HL1_PROBE: NO_SCENE_ASSET (optional for first XEX test)");
     } else {
@@ -88,6 +94,6 @@ int main(void)
     }
 
     xsdk_log_write("HL1_PROBE: XBOX_360_BOOT_COMPLETE");
-    /* The image is not playable and intentionally does not open a display. */
+    /* This title exports an offline BMP; it does not present frames in Xenia. */
     return status < 0 ? 1 : 0;
 }
