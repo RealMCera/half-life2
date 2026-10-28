@@ -1,3 +1,19 @@
+# CONFIRMED SUCCESS — Windows Xenia Canary booted our native Xbox 360 XEX
+
+On October 28, 2026, the user ran the actual cloud-built
+`hl1_remaster_probe.xex` in Windows Xenia Canary and the emulator log
+confirmed `XBOX_360_BOOT_BEGIN`, `XBOX_360_BOOT_COMPLETE`, and
+`exit: status 0`. This **proves our basic XEX bootstrap works**,
+without any local Debian installation. The normal emulator message is
+"Game title requested exit to dashboard." The optional H360 scene
+was missing and therefore not loaded.
+
+See [XENIA_BOOT_CONFIRMED.md](XENIA_BOOT_CONFIRMED.md) for the exact
+observed log and next one-triangle H360 asset-loading smoke test.
+The test binary still has no graphics or Half-Life gameplay.
+
+---
+
 # Local Debian installation is OPTIONAL — GitHub cloud build available
 
 User preference: **DO NOT install Debian, WSL distributions, Docker or a local cross-compiler.**
