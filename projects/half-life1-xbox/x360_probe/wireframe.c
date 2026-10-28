@@ -5,6 +5,7 @@
  * This is asset verification and an offline preview, not interactive 3D.
  */
 #include "wireframe.h"
+#include "shaded.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -406,6 +407,9 @@ int hl1_preview_h360(const char *path)
         xsdk_log_write("HL1_PROBE: ISO_PREVIEW_UNAVAILABLE: cache write refused");
     }
 
+    /* This is an additional, non-fatal offline shaded-surface test.
+       Old top-down/isometric files remain available if it fails. */
+    (void)hl1_shaded_h360(buffer, groups, vertices, goff, voff, ioff);
     free(buffer);
     return 1;
 
