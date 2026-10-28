@@ -1,3 +1,32 @@
+# Latest PC test — cache BMP file located
+
+User reports Windows PowerShell now finds:
+
+```text
+C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_wireframe.bmp
+```
+
+This is the **intended writable location** introduced in the cache-path
+fix. The user first displayed a log from the *older* XEX, ending with
+`BMP_PREVIEW_FAIL` / `exit: status 1`, and later ran a file search
+that located the new BMP. The exact creation timestamp, BMP contents,
+and **new version's** `BMP_PREVIEW_PASS` log line have not yet been
+provided. Do not conflate the earlier failure log with the later
+successful file discovery. The user should open the BMP and share
+the newer log or screenshot to confirm the preview contents.
+
+Cloud build #40758925773 completed with **success**, including
+host-based synthetic renderer tests and PowerPC XEX compilation.
+The actual user-side file discovery is a promising indication that
+writing the BMP to Xenia's `cache:` mount works.
+
+Next technical milestone after verification: swap the synthetic
+one-triangle scene for the user's original privately exported
+Half-Life 1 `c0a0` H360 mesh, and inspect its CPU wireframe
+projection. This is not yet live on-screen 3D graphics.
+
+---
+
 # Xenia write access fix — user-confirmed FULL_MESH_PASS
 
 The user's **actual 2026-10-28 Windows Xenia test** of the first
