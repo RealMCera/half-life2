@@ -47,6 +47,7 @@ class PreviewTest(unittest.TestCase):
             [self.gcc, "-std=gnu17", "-Wall", "-Wextra", "-Werror", "-O1",
              "-I", str(root / "stub"), "-I", str(RENDER_DIR),
              str(testmain), str(RENDER_DIR / "wireframe.c"),
+             str(RENDER_DIR / "shaded.c"),
              "-lm", "-o", str(output)],
             check=True, capture_output=True, text=True,
         )
@@ -87,6 +88,15 @@ class PreviewTest(unittest.TestCase):
             self.assertEqual(len(iso_data), len(data))
             self.assertNotEqual(iso_data, data)
             self.assertIn("ISO_PREVIEW_PASS", proc.stdout)
+            shaded = root / r"cache:\hl1_shaded.bmp"
+            self.assertTrue(shaded.is_file())
+            shade_data = shaded.read_bytes()
+            self.assertEqual(shade_data[:2], b"BM")
+            self.assertEqual(len(shade_data), len(data))
+            self.assertNotEqual(shade_data, iso_data)
+            self.assertTrue(any(shade_data[i:i+3] != b"\x20\x18\x12"
+                                for i in range(54, len(shade_data), 3)))
+            self.assertIn("SHADED_PREVIEW_PASS", proc.stdout)
             self.assertTrue(any(data[i:i+3] != b"\x20\x18\x12"
                                 for i in range(54, len(data), 3)))
 
