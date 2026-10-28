@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/half-life1-x360-xex.yml
       - projects/half-life1-xbox/x360_probe/**
+      - tests/test_x360_wireframe_host.py
 
 permissions:
   contents: read
@@ -96,8 +97,11 @@ jobs:
           NOT A PLAYABLE GAME OR INTERACTIVE GRAPHICS REMASTER.
           When assets/hl1_c0a0_world.h360 is next to this XEX,
           it validates the entire H360 mesh and writes a CPU-generated
-          640x360 wireframe image as game:\hl1_wireframe.bmp.
-          Find that BMP beside the XEX after running in Xenia Canary.
+          640x360 wireframe image as cache:\hl1_wireframe.bmp.
+          Find that BMP under Xenia Canary's cache directory (not
+          necessarily beside the XEX) after running in the emulator.
+          Independently, the XEX always logs a 64x24 ASCII preview
+          as HL1_WIRE lines, even if all BMP writes are blocked.
           No graphics are presented in the emulator window.
           Host-side synthetic H360 validation and native XEX compilation
           are tested in CI. Xenia behavior needs the user's real test.
