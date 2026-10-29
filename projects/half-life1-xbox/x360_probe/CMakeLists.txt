@@ -42,6 +42,14 @@ if(HL1_EXPERIMENTAL_LUT_PROBE)
     xsdk_add_shaders(hl1_world_explore hl1_world.vert hl1_world.frag)
     xsdk_add_xex(hl1_world_explore)
 
+    # Isolated large Source-BSP H360 preview: split indexed draws at 65532.
+    # This does not modify the working HL1 viewer or collision prototypes.
+    add_executable(hl1_bms_world_probe bms_world_probe.c)
+    set_target_properties(hl1_bms_world_probe PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_options(hl1_bms_world_probe PRIVATE -Wall -Wextra -Werror)
+    xsdk_add_shaders(hl1_bms_world_probe hl1_world.vert hl1_world.frag)
+    xsdk_add_xex(hl1_bms_world_probe)
+
     # Separate first-person walking / physics proof-of-concept.
     # Triangulated mesh floor queries + basic wall segment blocking,
     # no original GoldSrc BSP hulls, triggers, or gameplay yet.
