@@ -1,3 +1,63 @@
+# CONFIRMED: Xenia bypass experiment reaches frame submission
+
+User's actual Windows Xenia Canary title log (2026-10-29):
+
+```text
+HL1_DISPLAY: EXPERIMENTAL_LUT_BYPASS_PROBE
+HL1_DISPLAY: gpu_open = 0x00000000
+HL1_DISPLAY_EXPERIMENT: ignoring LUT timeout for ONE diagnostic test
+display: 1280x720 shown 1:1 to the 1280x720 output
+HL1_DISPLAY: present_open = 0x00000000
+HL1_DISPLAY: display_dimensions = 1280x720
+HL1_DISPLAY: present_begin = 0x00000000
+HL1_DISPLAY: FRAME_SUBMITTED
+HL1_DISPLAY: BOOT_COMPLETE
+exit: status 0
+```
+
+**Verified:** the experimental *Xenia-only* SDK bypass lets the Xbox
+360 kernel/GPU APIs accept the initial display setup, frame-buffer
+acquisition and frame submission. **Not verified:** whether the
+emulated display actually flips or the user can see the color.
+The log also printed `display: the line counter reached 322668720
+after 0 us`, which is an unusual counter and not proof the display
+really scanned out a frame.
+
+## Next test: bounded, longer-lived frame visibility probe
+
+The current new source replaces the previous immediate-exit
+`hl1_display_lut_probe.xex` with an independent diagnostic that
+submits **at most 180 frames**, alternates blue-green/violet/amber
+solid colors across them, records frame counts and
+`xsdk_present_stats` (vblanks and flips), then holds briefly and
+exits. It always has finite timeouts. The goal is **visual observation
+of a frame inside Xenia**, not just successful API return codes.
+
+**This new multi-frame variant is NOT YET VERIFIED** in the user's
+Xenia version; the cloud build must pass first.
+
+After a new successful workflow run, download the artifact, open
+`hl1_display_lut_probe.xex` in Xenia Canary and note whether
+the window visibly changes color. Then paste the title log:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_display_lut_probe.log" -Tail 45
+```
+
+Expected useful markers:
+- `FRAME_SUBMITTED: 0`, `FRAME_SUBMITTED: 1` and later numbers,
+  if frames advance;
+- `FRAME_LOOP_BLOCKED` if the emulator lacks the required
+  flip/vblank callback;
+- `VBLANKS`, `FLIPS`, `MISSED` numbers;
+- `EMULATED_FLIPS_REPORTED` if the SDK observed flips, **which
+  is still not proof of a visible image**.
+
+If it hangs or crashes, close the emulator and share the error.
+**Never use the experimental LUT-bypass XEX on actual Xbox 360 hardware.**
+
+---
+
 # ACTUAL XENIA LOG: first display probe reached LUT timeout
 
 The user ran the cloud-built native 360 `hl1_display_probe.xex`
