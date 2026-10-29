@@ -17,4 +17,12 @@ xsdk_add_xex(hl1_display_probe)
 option(HL1_EXPERIMENTAL_LUT_PROBE "Label isolated Xenia-only LUT diagnostic" OFF)
 if(HL1_EXPERIMENTAL_LUT_PROBE)
     target_compile_definitions(hl1_display_probe PRIVATE HL1_EXPERIMENTAL_LUT_PROBE=1)
+
+    # Shader-drawn (not CPU BMP) RGB triangle diagnostic. Only build against
+    # the disposable emulator-only LUT diagnostic SDK; never ship to hardware.
+    add_executable(hl1_triangle_probe triangle_probe.c)
+    set_target_properties(hl1_triangle_probe PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_options(hl1_triangle_probe PRIVATE -Wall -Wextra -Werror)
+    xsdk_add_shaders(hl1_triangle_probe hl1_triangle.vert hl1_triangle.frag)
+    xsdk_add_xex(hl1_triangle_probe)
 endif()
