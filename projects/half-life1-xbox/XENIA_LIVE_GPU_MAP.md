@@ -1,3 +1,97 @@
+# FIRST WALK XENIA TEST: falls through mesh edges; stable-ground V2 (2026-10-29)
+
+The user ran real `hl1_world_walk.xex` on Windows Xenia Canary
+and pasted an 1,800-frame log. **The new first-person WALK mode
+has live camera coordinates and CPU floor gravity**, but repeated
+unsupported edge transitions caused `on_floor=0` and
+`FALL_RECOVERY` (at least nine visible in tail). It sometimes
+landed on lower floors, notably `LANDED ground_mm=-552`.
+Visible excerpts:
+
+```text
+HL1_WALK: PLAYER frame=260 x_mm=1 y_mm=888 z_mm=-250 on_floor=1
+HL1_WALK: PLAYER frame=282 x_mm=-380 y_mm=874 z_mm=-145 on_floor=0
+HL1_WALK: FALL_RECOVERY
+HL1_WALK: LANDED ground_mm=-552
+HL1_WALK: GPU_MAP_FRAME_SUBMITTED frame=1799 triangles=7833
+HL1_WALK: FRAMES=1800 VBLANKS=2030 FLIPS=1799 MISSED=228
+HL1_WALK: SUMMARY MODE=WALK
+HL1_WALK: BOOT_COMPLETE
+exit: status 0
+```
+
+**Confirmed:** the walking XEX booted, decoded the real
+`c0a0` H360 collision/rendering mesh, moved through its
+Xenia runtime and exited cleanly. The title log alone does
+not certify visual collision quality or full floor/wall
+correctness; user has not reported jumping successfully.
+
+**Problem:** old walker applied horizontal movement first and
+then discovered that no triangle supported the player's feet,
+setting `grounded=false`. It used a downward landing cap based
+on the *new* feet height, allowing a fast fall to cross a floor
+in one frame and miss it.
+
+## New experimental stable walking XEX (separate target)
+
+`hl1_world_walk_stable.xex` built from
+`x360_probe/world_walk_stable.c`:
+- Preserve the original working `hl1_world_walk.xex`,
+  `hl1_world_explore.xex`, and `hl1_world_gpu_probe.xex`.
+- Evaluate safe walkable surfaces around 16 ranked candidate
+  spawn faces; log `HL1_STABLE: SPAWN_SUPPORT neighbors=N/8`.
+- Before taking a grounded horizontal step, check BOTH
+  midpoint and destination have floor within the allowable
+  step delta. Block unsupported ledges instead of walking
+  through visible world geometry gaps.
+- Keep grounded feet snapped to the validated floor while
+  traversing it; use axis-separated sliding along edges/walls.
+- Retain falling when actually jumping or airborne; check
+  landing across previous-to-new feet height to reduce
+  tunneling through floors.
+- Report physics counters in
+  `HL1_STABLE: PHYSICS blocked_edges=... blocked_walls=...
+  jumps=... landings=... recoveries=...`.
+
+**NOT a full GoldSrc/Source physics implementation.** No
+collision-radius hulls, reliable ramps/stairs, brush entities,
+trace hulls, ladders, scripted movement, or enemies. These
+H360 triangles come from rendering and may not cover real
+collision geometry. The safety design temporarily disallows
+stepping off unsupported ledges while grounded; that is
+intentional in this prototype, not final gameplay behavior.
+
+The new experiment remains **uncompiled/unverified in Xenia**
+until GitHub Actions passes and user tests.
+
+After a successful build of the new target:
+
+```text
+HalfLife1-X360-XEX-StartupProbe/
+  hl1_world_walk_stable.xex
+  assets/
+    hl1_c0a0_world.h360
+```
+
+Run it in Xenia. Virtual Start toggles WALK; D-pad moves,
+LB/RB turns, virtual A or Y jumps, B resets, Back exits.
+Then inspect:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_world_walk_stable.log" -Tail 100
+```
+
+Check `SPAWN_SUPPORT`, `MODE=WALK`, `PLAYER`,
+`PHYSICS` and any `FALL_RECOVERY`. Compare behavior
+visually, not only via log counts.
+
+No private Valve-owned map assets or textures committed
+publicly. XEXs use Xenia-only LUT-timeout bypass;
+**NEVER run the experimental SDK builds on physical
+Xbox 360**. No local Debian/WSL installation required.
+
+---
+
 # CONFIRMED ACTUAL CAMERA TRANSLATION IN XENIA; walking XEX build pending (2026-10-29)
 
 The user pasted a **real Windows Xenia Canary** log for the
