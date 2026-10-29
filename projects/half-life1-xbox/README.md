@@ -1,3 +1,21 @@
+# REAL XENIA RESULT: 180 submitted frames, 179 flips, 0 misses
+
+The user ran the **emulator-only** 180-frame LUT-bypass diagnostic
+`hl1_display_lut_probe.xex` in Windows Xenia Canary.
+Their actual log confirmed `present_open=0`, 180 submitted frames,
+181 emulated vblanks, 179 flips, 0 missed and exit 0.
+**The user has not yet confirmed that colors appeared on-screen.**
+
+**Next experiment:** A separate native Xbox 360 GPU-shaded RGB
+triangle, `hl1_triangle_probe.xex`, compiled only in the cloud's
+temporary Xenia LUT-bypass SDK. It is **not** built for physical Xbox 360.
+See [XENIA_GPU_TRIANGLE_PROBE.md](XENIA_GPU_TRIANGLE_PROBE.md).
+The shader GPU draw experiment is **not yet confirmed** in Xenia.
+The private original Half-Life map and the three working offline
+BMP exports remain untouched.
+
+---
+
 # Verified on Windows Xenia: shaded Black Mesa c0a0 image
 
 The user provided a screenshot of `hl1_shaded.bmp` showing correctly
