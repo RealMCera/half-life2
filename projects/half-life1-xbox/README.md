@@ -1,3 +1,24 @@
+# Verified on Windows Xenia: shaded Black Mesa c0a0 image
+
+The user provided a screenshot of `hl1_shaded.bmp` showing correctly
+filled, flat-colored, depth-buffered static Black Mesa geometry.
+This completes the three **offline** CPU previews, not a playable
+real-time game. The small detached-looking structure is still
+unexplained.
+
+## NEXT: determine whether Xenia can DISPLAY a real-time Xbox 360 frame
+
+Added a separate source program `x360_probe/graphics_probe.c` that
+compiles to `hl1_display_probe.xex`, tests xsdk's GPU and 720p
+display API in desktop Xenia Canary, and writes exact status
+codes to `cache/hl1_display_probe.log`. See
+[XENIA_DISPLAY_PROBE.md](XENIA_DISPLAY_PROBE.md) for commands.
+This new XEX has **not yet been launched on user's Xenia**.
+The existing shaded-map XEX remains a separate downloadable program;
+no Debian installation is needed on Windows.
+
+---
+
 # VISUALLY CONFIRMED: real Black Mesa `c0a0` isometric map in Windows Xenia
 
 The user supplied a screenshot from their actual Xenia Canary run of
