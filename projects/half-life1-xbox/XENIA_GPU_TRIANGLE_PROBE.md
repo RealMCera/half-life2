@@ -1,3 +1,48 @@
+# VERIFIED: native RGB-triangle shader and frame submissions in Windows Xenia Canary
+
+The user ran the cloud-built `hl1_triangle_probe.xex` in Xenia Canary
+on October 29, 2026, and shared an actual title log:
+
+```text
+HL1_TRIANGLE: BOOT_BEGIN
+HL1_TRIANGLE: EMULATOR_ONLY_LUT_DIAGNOSTIC
+HL1_TRIANGLE: gpu_open = 0x00000000
+HL1_TRIANGLE: shaders_load = 0x00000000
+HL1_DISPLAY_EXPERIMENT: ignoring LUT timeout for ONE diagnostic test
+HL1_TRIANGLE: present_open = 0x00000000 (1280x720)
+HL1_TRIANGLE: GPU_DRAW_SUBMITTED frame=1
+HL1_TRIANGLE: GPU_DRAW_SUBMITTED frame=60
+HL1_TRIANGLE: GPU_DRAW_SUBMITTED frame=179
+HL1_TRIANGLE: SUBMITTED=180 VBLANKS=181 FLIPS=179 MISSED=1
+HL1_TRIANGLE: VISIBILITY_REQUIRES_USER_CONFIRMATION
+HL1_TRIANGLE: gpu_close = 0x00000000
+HL1_TRIANGLE: BOOT_COMPLETE
+exit: status 0
+```
+
+**Confirmed:** native Xenos vertex/pixel shader loading, GPU draw
+command submission, 180 frame submissions and 179 flips reported
+by the Xenia SDK, and successful exit. One missed flip occurred
+in this test; this alone does not indicate a meaningful failure.
+
+**Still unknown:** The user has not yet explicitly said whether the
+actual RGB triangle was VISIBLE inside Xenia. Shader load and flip
+numbers do **not** establish that the GPU rasterized the expected
+triangle correctly. The previous *solid-color* probe was visibly
+confirmed, but the triangle is a separate rendering pipeline.
+
+**Next checkpoint:** ask the user whether they saw a red-green-blue
+triangle on a dark background. If visible, proceed to a genuine
+on-screen first-person H360 map prototype. If not, debug the vertex
+shader, GPU rasterizer, depth/culling, or pixel shader/resolve path
+before assuming we can display Black Mesa GPU geometry.
+
+The XEX uses an experimental temporary-cloud xsdk modification
+which ignores a LUT autofill timeout for emulator diagnosis.
+NEVER use that workaround on physical Xbox 360 hardware.
+
+---
+
 # CONFIRMED: user actually SAW changing colors in Windows Xenia Canary
 
 On October 29, 2026, the user explicitly confirmed the
