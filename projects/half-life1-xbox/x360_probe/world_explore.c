@@ -191,7 +191,7 @@ static bool validate(World *w)
     w->draw_vertices = w->vertices;
     w->gpu_bytes = (size_t)w->vertices * STRIDE_BYTES;
     w->index_bytes = (size_t)((w->indices + 1U) / 2U) * 4U;
-    xsdk_log_write("HL1_WORLD: SCENE_VALID: %u groups %u vertices %u triangles",
+    xsdk_log_write("HL1_EXPLORE: SCENE_VALID: %u groups %u vertices %u triangles",
                    (unsigned)w->groups, (unsigned)w->vertices,
                    (unsigned)(w->indices / 3));
     return true;
@@ -297,6 +297,26 @@ static Matrix view_projection(float yaw, float pitch, float distance, float aspe
     Matrix placed = multiply(&away, &rotated);
     return multiply(&perspective, &placed);
 }
+/* Camera-space transform: P * pitch(-pitch) * yaw(-yaw) * T(-eye).
+   World+Y is upward. At yaw=0 the camera faces along world -Z. */
+static Matrix fly_projection(float yaw, float pitch, Vec3 eye, float aspect)
+{
+    const float focal = 1.f / tanf(FOV * 0.5f);
+    const float fz = FAR / (NEAR - FAR);
+    const Matrix perspective = {{ focal/aspect, 0, 0, 0,
+                                   0, focal, 0, 0,
+                                   0, 0, fz, -1,
+                                   0, 0, NEAR*fz, 0 }};
+    const Matrix translation = {{ 1,0,0,0, 0,1,0,0, 0,0,1,0,
+                                   -eye.x,-eye.y,-eye.z,1 }};
+    const float cy=cosf(yaw), sy=sinf(yaw);
+    const float cp=cosf(pitch), sp=sinf(pitch);
+    const Matrix turn_y = {{ cy,0,-sy,0, 0,1,0,0, sy,0,cy,0, 0,0,0,1 }};
+    const Matrix turn_x = {{ 1,0,0,0, 0,cp,-sp,0, 0,sp,cp,0, 0,0,0,1 }};
+    Matrix oriented = multiply(&turn_x, &turn_y);
+    Matrix view = multiply(&oriented, &translation);
+    return multiply(&perspective, &view);
+}
 static float stick(int16_t value)
 {
     return (value > STICK_DEADZONE || value < -STICK_DEADZONE)
@@ -317,11 +337,11 @@ int main(void)
     uint32_t width = 0, height = 0, submitted = 0;
     int gpu_open = 0, display_open = 0, exit_code = 1;
     if (!read_file(&world) || !validate(&world)) {
-        xsdk_log_write("HL1_WORLD: SCENE_LOAD_OR_VALIDATE_FAIL");
+        xsdk_log_write("HL1_EXPLORE: SCENE_LOAD_OR_VALIDATE_FAIL");
         goto cleanup;
     }
     NTSTATUS status = xsdk_gpu_open();
-    xsdk_log_write("HL1_WORLD: gpu_open = 0x%08X", (unsigned)status);
+    xsdk_log_write("HL1_EXPLORE: gpu_open = 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status)) goto cleanup;
     gpu_open = 1;
     status = xsdk_shader_load(&vertex, hl1_world_vert.container, hl1_world_vert.container_bytes);
@@ -330,10 +350,10 @@ int main(void)
     if (NT_SUCCESS(status))
         status = xsdk_shader_set_vertex_layout(&vertex, layout, 2,
                                                 (const uint32_t[]){STRIDE_BYTES});
-    xsdk_log_write("HL1_WORLD: shaders_load = 0x%08X", (unsigned)status);
+    xsdk_log_write("HL1_EXPLORE: shaders_load = 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status)) goto cleanup;
     if (!upload_geometry(&world)) {
-        xsdk_log_write("HL1_WORLD: GPU_MESH_UPLOAD_FAIL");
+        xsdk_log_write("HL1_EXPLORE: GPU_MESH_UPLOAD_FAIL");
         goto cleanup;
     }
 
@@ -344,35 +364,73 @@ int main(void)
     XsdkDepthStencilState depth_state;
     xsdk_gpu_depth_stencil_state(&depth_state, &depth);
     status = xsdk_present_open(XSDK_DISPLAY_720P, 2, 1, &width, &height);
-    xsdk_log_write("HL1_WORLD: present_open = 0x%08X (%ux%u)",
+    xsdk_log_write("HL1_EXPLORE: present_open = 0x%08X (%ux%u)",
                    (unsigned)status, (unsigned)width, (unsigned)height);
     if (!NT_SUCCESS(status)) goto cleanup;
     display_open = 1;
 
-    float yaw = 0.70f, pitch = 0.64f, distance = DISTANCE;
+    float orbit_yaw = 0.70f, orbit_pitch = 0.64f, distance = DISTANCE;
+    float fly_yaw = 0.f, fly_pitch = 0.f;
+    Vec3 eye = {0.f, 0.f, 2.7f};
+    bool flying = false;
+    bool last_a = false;
     exit_code = 0;
     for (uint32_t frame = 0; frame < MAX_FRAMES; frame++) {
         INPUT_STATE input = {0};
-        if (XamInputGetState(0, 0, &input) == ERROR_SUCCESS) {
-            if (input.gamepad.buttons & INPUT_GAMEPAD_BACK) break;
-            yaw += 0.030f * stick(input.gamepad.thumb_lx);
-            pitch -= 0.030f * stick(input.gamepad.thumb_ly);
-            pitch = clip(pitch, -1.15f, 1.15f);
-            distance = clip(distance + 0.05f * ((float)input.gamepad.left_trigger -
-                                              (float)input.gamepad.right_trigger) / 255.f, 2.f, 10.f);
+        const bool controller = XamInputGetState(0, 0, &input) == ERROR_SUCCESS;
+        if (controller && (input.gamepad.buttons & INPUT_GAMEPAD_BACK)) break;
+        const bool a_down = controller && (input.gamepad.buttons & INPUT_GAMEPAD_A);
+        if (a_down && !last_a) {
+            flying = !flying;
+            xsdk_log_write("HL1_EXPLORE: MODE=%s frame=%u",
+                           flying ? "FREE_FLY" : "ORBIT", (unsigned)frame);
+        }
+        last_a = a_down;
+        if (flying && controller) {
+            const float turn_speed = 0.055f;
+            fly_yaw += turn_speed * stick(input.gamepad.thumb_rx);
+            fly_pitch = clip(fly_pitch + turn_speed * stick(input.gamepad.thumb_ry),
+                             -1.35f, 1.35f);
+            const float forward = stick(input.gamepad.thumb_ly);
+            const float strafe = stick(input.gamepad.thumb_lx);
+            const float speed = (input.gamepad.buttons & INPUT_GAMEPAD_LEFT_SHOULDER)
+                ? 0.075f : 0.025f;
+            eye.x += speed * (sinf(fly_yaw) * forward + cosf(fly_yaw) * strafe);
+            eye.z += speed * (-cosf(fly_yaw) * forward + sinf(fly_yaw) * strafe);
+            eye.y += 0.026f * ((float)input.gamepad.right_trigger -
+                                (float)input.gamepad.left_trigger) / 255.f;
+            eye.x = clip(eye.x, -6.f, 6.f);
+            eye.y = clip(eye.y, -6.f, 6.f);
+            eye.z = clip(eye.z, -6.f, 6.f);
+            if (input.gamepad.buttons & INPUT_GAMEPAD_B) {
+                eye = (Vec3){0.f, 0.f, 2.7f};
+                fly_yaw = 0.f;
+                fly_pitch = 0.f;
+            }
         } else {
-            yaw += 0.007f;
+            if (controller) {
+                orbit_yaw += 0.028f * stick(input.gamepad.thumb_lx);
+                orbit_pitch = clip(orbit_pitch - 0.028f * stick(input.gamepad.thumb_ly),
+                                   -1.15f, 1.15f);
+                distance = clip(distance + 0.05f *
+                    ((float)input.gamepad.left_trigger - (float)input.gamepad.right_trigger) /
+                    255.f, 2.f, 10.f);
+            } else {
+                orbit_yaw += 0.007f;
+            }
         }
 
         uint32_t target = 0;
         status = xsdk_present_begin(&target, 2000);
         if (!NT_SUCCESS(status)) {
-            xsdk_log_write("HL1_WORLD: FRAME_BEGIN_FAIL frame=%u status=0x%08X",
+            xsdk_log_write("HL1_EXPLORE: FRAME_BEGIN_FAIL frame=%u status=0x%08X",
                            (unsigned)frame, (unsigned)status);
             exit_code = 3;
             break;
         }
-        Matrix matrix = view_projection(yaw, pitch, distance, (float)width / height);
+        Matrix matrix = flying
+            ? fly_projection(fly_yaw, fly_pitch, eye, (float)width / height)
+            : view_projection(orbit_yaw, orbit_pitch, distance, (float)width / height);
         xsdk_gpu_set_target(width, height);
         xsdk_gpu_set_depth_stencil(&depth_state);
         xsdk_gpu_set_shaders(&vertex, &pixel);
@@ -387,7 +445,7 @@ int main(void)
         submitted++;
         if (frame == 1 || frame == 60 || frame == 180 || frame == MAX_FRAMES-1)
             xsdk_log_write("HL1_EXPLORE: GPU_MAP_FRAME_SUBMITTED frame=%u triangles=%u",
-                           (unsigned)frame, (unsigned)(world.draw_vertices / 3));
+                           (unsigned)frame, (unsigned)(world.indices / 3));
     }
     XsdkPresentStats stats = {0};
     xsdk_present_stats(&stats);
@@ -405,7 +463,7 @@ cleanup:
     xsdk_shader_free(&vertex);
     if (gpu_open) {
         const NTSTATUS close_status = xsdk_gpu_close();
-        xsdk_log_write("HL1_WORLD: gpu_close = 0x%08X", (unsigned)close_status);
+        xsdk_log_write("HL1_EXPLORE: gpu_close = 0x%08X", (unsigned)close_status);
     }
     free(world.file);
     xsdk_log_write("HL1_EXPLORE: BOOT_COMPLETE");
