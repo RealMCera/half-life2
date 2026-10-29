@@ -1,3 +1,34 @@
+# CONFIRMED: user actually SAW changing colors in Windows Xenia Canary
+
+On October 29, 2026, the user explicitly confirmed the
+180-frame experimental XEX **visibly changed colors inside Xenia
+Canary**, beyond the previously captured numerical log. Combined
+with the logged 180 submitted frames / 179 flips / zero missed,
+this verifies actual display output for the SDK LUT-timeout-bypass
+experiment on the user's Windows Xenia version.
+
+**New cloud build run #40910943589 completed successfully** and
+uploaded `HalfLife1-X360-XEX-StartupProbe`, including
+`hl1_triangle_probe.xex` for testing native GPU vertex + pixel
+shader rasterization. The new triangle XEX has **not** yet been
+visually tested in Xenia; a successful compile does not establish
+GPU triangle correctness.
+
+Build: https://github.com/RealMCera/half-life2/actions/runs/40910943589
+
+The user should extract the artifact, launch
+`hl1_triangle_probe.xex` in Xenia Canary, observe whether an RGB
+triangle appears, and inspect:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_triangle_probe.log" -Tail 35
+```
+
+This experiment uses the disposable patched xsdk LUT diagnostic
+and must NOT be used on actual Xbox 360 hardware.
+
+---
+
 # Verified Xenia flips and next shader-drawn triangle diagnostic
 
 ## Real user result — October 29, 2026
