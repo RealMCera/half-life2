@@ -331,7 +331,8 @@ int main(void)
     xsdk_log_write("HL1_EXPLORE: BOOT_BEGIN");
     xsdk_log_write("HL1_EXPLORE: INDEXED_GPU_WORLD_AND_FREE_FLY");
     xsdk_log_write("HL1_EXPLORE: XENIA_ONLY_EXPERIMENTAL_LUT");
-    xsdk_log_write("HL1_EXPLORE: A toggles orbit/fly; left move, right look, triggers up/down, B reset, Back exit");
+    xsdk_log_write("HL1_EXPLORE: A or Start toggles orbit/fly; left move, right look, triggers up/down, B reset, Back exit");
+    xsdk_log_write("HL1_INPUT: DIAGNOSTIC_MODE all 4 virtual gamepad slots tested");
     World world = {0};
     XsdkShader vertex = {0}, pixel = {0};
     uint32_t width = 0, height = 0, submitted = 0;
@@ -373,19 +374,82 @@ int main(void)
     float fly_yaw = 0.f, fly_pitch = 0.f;
     Vec3 eye = {0.f, 0.f, 2.7f};
     bool flying = false;
-    bool last_a = false;
+    bool last_toggle = false;
+    uint32_t previous_slot = UINT32_MAX;
+    uint32_t previous_buttons = UINT32_MAX;
+    uint32_t input_success_frames = 0;
+    uint32_t input_active_frames = 0;
     exit_code = 0;
     for (uint32_t frame = 0; frame < MAX_FRAMES; frame++) {
         INPUT_STATE input = {0};
-        const bool controller = XamInputGetState(0, 0, &input) == ERROR_SUCCESS;
-        if (controller && (input.gamepad.buttons & INPUT_GAMEPAD_BACK)) break;
-        const bool a_down = controller && (input.gamepad.buttons & INPUT_GAMEPAD_A);
-        if (a_down && !last_a) {
-            flying = !flying;
-            xsdk_log_write("HL1_EXPLORE: MODE=%s frame=%u",
-                           flying ? "FREE_FLY" : "ORBIT", (unsigned)frame);
+        bool controller = false;
+        uint32_t controller_slot = UINT32_MAX;
+        uint32_t first_connected_slot = UINT32_MAX;
+        INPUT_STATE first_connected_input = {0};
+        /* Xenia may map a keyboard or a USB controller to a
+           different emulated player slot. Probe all four slots,
+           prefer an ACTIVE one, and report the raw kernel result. */
+        for (uint32_t slot = 0; slot < 4U; slot++) {
+            INPUT_STATE candidate = {0};
+            const uint32_t result = XamInputGetState(slot, 0, &candidate);
+            if (frame == 0U || frame == 240U || frame == 720U ||
+                frame == 1440U)
+                xsdk_log_write("HL1_INPUT: SLOT=%u frame=%u status=0x%08X buttons=0x%04X",
+                               (unsigned)slot, (unsigned)frame,
+                               (unsigned)result,
+                               (unsigned)(result == ERROR_SUCCESS ? candidate.gamepad.buttons : 0U));
+            if (result != ERROR_SUCCESS) continue;
+            if (first_connected_slot == UINT32_MAX) {
+                first_connected_slot = slot;
+                first_connected_input = candidate;
+            }
+            const bool active = candidate.gamepad.buttons ||
+                candidate.gamepad.left_trigger || candidate.gamepad.right_trigger ||
+                stick(candidate.gamepad.thumb_lx) != 0.f ||
+                stick(candidate.gamepad.thumb_ly) != 0.f ||
+                stick(candidate.gamepad.thumb_rx) != 0.f ||
+                stick(candidate.gamepad.thumb_ry) != 0.f;
+            if (active) {
+                input = candidate;
+                controller = true;
+                controller_slot = slot;
+                input_active_frames++;
+                break;
+            }
         }
-        last_a = a_down;
+        if (!controller && first_connected_slot != UINT32_MAX) {
+            controller = true;
+            input = first_connected_input;
+            controller_slot = first_connected_slot;
+        }
+        if (controller) input_success_frames++;
+        if (controller_slot != previous_slot) {
+            xsdk_log_write("HL1_INPUT: CONNECTED_SLOT=%d frame=%u",
+                           controller ? (int)controller_slot : -1, (unsigned)frame);
+            previous_slot = controller_slot;
+            previous_buttons = UINT32_MAX;
+        }
+        if (controller && (input.gamepad.buttons != previous_buttons ||
+                           frame == 240U || frame == 720U || frame == 1440U)) {
+            xsdk_log_write("HL1_INPUT: RAW slot=%u frame=%u buttons=0x%04X LX=%d LY=%d RX=%d RY=%d",
+                           (unsigned)controller_slot, (unsigned)frame,
+                           (unsigned)input.gamepad.buttons,
+                           (int)input.gamepad.thumb_lx,
+                           (int)input.gamepad.thumb_ly,
+                           (int)input.gamepad.thumb_rx,
+                           (int)input.gamepad.thumb_ry);
+            previous_buttons = input.gamepad.buttons;
+        }
+        if (controller && (input.gamepad.buttons & INPUT_GAMEPAD_BACK)) break;
+        const bool toggle = controller &&
+            (input.gamepad.buttons & (INPUT_GAMEPAD_A | INPUT_GAMEPAD_START));
+        if (toggle && !last_toggle) {
+            flying = !flying;
+            xsdk_log_write("HL1_EXPLORE: MODE=%s frame=%u player_slot=%u",
+                           flying ? "FREE_FLY" : "ORBIT", (unsigned)frame,
+                           (unsigned)controller_slot);
+        }
+        last_toggle = toggle;
         if (flying && controller) {
             const float turn_speed = 0.055f;
             fly_yaw += turn_speed * stick(input.gamepad.thumb_rx);
@@ -452,6 +516,10 @@ int main(void)
     xsdk_log_write("HL1_EXPLORE: FRAMES=%u VBLANKS=%u FLIPS=%u MISSED=%u",
                    (unsigned)submitted, (unsigned)stats.vblanks,
                    (unsigned)stats.flips, (unsigned)stats.missed);
+    xsdk_log_write("HL1_INPUT: SUMMARY success_frames=%u active_frames=%u",
+                   (unsigned)input_success_frames, (unsigned)input_active_frames);
+    xsdk_log_write("HL1_INPUT: SUMMARY A_OR_START_SWITCH=%s",
+                   flying ? "CURRENTLY_FREE_FLY" : "CURRENTLY_ORBIT");
     xsdk_log_write("HL1_EXPLORE: MAP_VISIBILITY_REQUIRES_USER_CONFIRMATION");
     if (submitted) (void)xsdk_thread_sleep(1500);
 
