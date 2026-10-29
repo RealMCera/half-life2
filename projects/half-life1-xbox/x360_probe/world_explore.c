@@ -493,9 +493,12 @@ int main(void)
             if ((forward != 0.f || strafe != 0.f ||
                  digital_turn != 0.f || digital_vertical != 0.f) &&
                 (frame % 60U == 0U || frame % 60U == 1U)) {
-                xsdk_log_write("HL1_EXPLORE: CAMERA_MOVED frame=%u x=%.3f y=%.3f z=%.3f yaw=%.3f",
-                               (unsigned)frame, (double)eye.x, (double)eye.y,
-                               (double)eye.z, (double)fly_yaw);
+                /* Avoid printf float formatting in this experimental
+                 * PowerPC build (Xenia skips some libc DTOA instructions). */
+                xsdk_log_write("HL1_EXPLORE: CAMERA_MOVED frame=%u x_milli=%d y_milli=%d z_milli=%d yaw_milli=%d",
+                               (unsigned)frame, (int)(eye.x * 1000.f),
+                               (int)(eye.y * 1000.f), (int)(eye.z * 1000.f),
+                               (int)(fly_yaw * 1000.f));
             }
         } else {
             if (controller) {
