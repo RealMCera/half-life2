@@ -1,3 +1,28 @@
+# Visual check: Xenia screenshot of Black Mesa geometry (2026-10-29)
+
+The user sent another screenshot showing a Xenia Canary **real-time
+window** displaying the recognizable `c0a0` map: raised walkway
+joining two structural clusters, curved/round central structure,
+blue-green/purple flat procedural surfaces, a detached rectangular
+piece, and the dark navy backdrop. This confirms that live GPU
+geometry still visibly renders with the current test environment,
+with no obvious missing geometry compared with the prior user
+screenshots. No screenshot was committed to this public repo.
+
+**Important limitation:** the screenshot itself does not identify the
+XEX basename, so it cannot prove the new indexed explorer was the
+program shown, nor that A-toggle, right-stick camera, or indexed
+draw are functioning. Those require the user's new
+`hl1_world_explore.log` and hands-on controls observation.
+
+GitHub [build run #40929369460](https://github.com/RealMCera/half-life2/actions/runs/40929369460)
+was checked and completed with **SUCCESS**, producing the
+`HalfLife1-X360-XEX-StartupProbe` artifact containing
+`hl1_world_explore.xex`. Compiling it is not proof of runtime
+correctness; distinguish from the known-good live orbit version.
+
+---
+
 # USER VERIFIED: REAL Black Mesa map rotating onscreen (2026-10-29)
 
 The user explicitly confirmed: **"I DID SEE IT ROTATING"**, and
