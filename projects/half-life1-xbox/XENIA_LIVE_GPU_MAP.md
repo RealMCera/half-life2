@@ -1,3 +1,64 @@
+# INPUT FIX ATTEMPT / DIAGNOSTIC (2026-10-29)
+
+User reported **“NOPE”** when asked whether Xbox 360 A button
+switched the live Black Mesa indexed viewer to free-fly mode.
+Previous `hl1_world_explore.log` had all 1,800 frames and
+**no `MODE=FREE_FLY` marker**, so there is no evidence
+that controller input was delivered or the toggle engaged.
+The GPU rendering and mesh loading remained successful.
+
+New source change (`x360_probe/world_explore.c`):
+- Polls **all 4 virtual Xbox 360 player slots**, not just
+  controller 0; if several slots return success, prefers
+  one with nonzero buttons/sticks/triggers.
+- Logs raw `XamInputGetState` status at frames 0, 240,
+  720 and 1440 for all slots as `HL1_INPUT: SLOT=... status=...`.
+- Logs detected slot, nonzero button transitions, stick values
+  and `success_frames` versus `active_frames`.
+- Allows **Xbox A OR Start** button to toggle the orbit/free-fly
+  camera; logs `HL1_EXPLORE: MODE=FREE_FLY frame=... player_slot=...`.
+- Keeps the original, visually verified
+  `hl1_world_gpu_probe.xex` untouched.
+
+This is a *diagnostic plus potential mapping fix*, not yet confirmed
+to make controls work. The new code must first compile and then
+be tested inside Windows Xenia Canary.
+
+**Xenia keyboard setup** from [official Xenia Canary Options
+wiki](https://github.com/xenia-canary/xenia-canary/wiki/Options):
+`keyboard_mode = 1` enables keyboard-as-gamepad,
+`keyboard_user_index = 0` maps keyboard to player slot 0.
+These are keys in Canary's active TOML config (commonly next to
+`xenia_canary.exe`). When keyboard mode is enabled, press
+the keyboard key mapped to virtual Xbox A or Start, **not
+necessarily the A key on the keyboard**. For physical Xbox
+controllers, Xenia's `hid="any"` or `hid="xinput"` are
+available; non-XInput controllers may need `hid="sdl"`.
+Always close Xenia before editing config and preserve a backup.
+
+After the new build succeeds and is installed, open
+`hl1_world_explore.xex` and run:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_world_explore.log" -Tail 75
+```
+
+Interpretation:
+- `SLOT=0 status=0x00000000` indicates XamInputGetState
+  was successful for slot 0.
+- All four slots nonzero status implies no usable virtual
+  controller mapped, and Xenia input configuration is
+  the likely issue.
+- `RAW ... buttons=0x1000` is virtual Xbox A,
+  `buttons=0x0010` is Start; these should toggle fly.
+- A `MODE=FREE_FLY` line definitively shows the camera
+  transition code ran (visibility still requires observation).
+
+The emulator-only LUT bypass remains an experiment; **never
+run on physical Xbox 360 hardware**.
+
+---
+
 # USER VERIFIED: indexed Black Mesa world runs through all 1,800 GPU frames (2026-10-29)
 
 User ran new `hl1_world_explore.xex` in Windows Xenia Canary and
