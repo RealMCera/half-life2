@@ -1,3 +1,64 @@
+# USER VERIFIED: Start button switches free-fly; analog axes appear ZERO (2026-10-29)
+
+Actual user Xenia title log from run #42:
+
+```text
+HL1_INPUT: SLOT=0 frame=0 status=0x00000000 buttons=0x0000
+HL1_INPUT: SLOT=1 frame=0 status=0x0000048F buttons=0x0000
+HL1_INPUT: SLOT=2 frame=0 status=0x0000048F buttons=0x0000
+HL1_INPUT: SLOT=3 frame=0 status=0x0000048F buttons=0x0000
+HL1_INPUT: CONNECTED_SLOT=0 frame=0
+HL1_INPUT: RAW slot=0 frame=803 buttons=0x0010 LX=0 LY=0 RX=0 RY=0
+HL1_EXPLORE: MODE=FREE_FLY frame=803 player_slot=0
+HL1_INPUT: RAW slot=0 frame=872 buttons=0x0010 LX=0 LY=0 RX=0 RY=0
+HL1_EXPLORE: MODE=ORBIT frame=872 player_slot=0
+HL1_INPUT: RAW slot=0 frame=899 buttons=0x0010 LX=0 LY=0 RX=0 RY=0
+HL1_EXPLORE: MODE=FREE_FLY frame=899 player_slot=0
+HL1_INPUT: RAW slot=0 frame=1399 buttons=0x0020 LX=0 LY=0 RX=0 RY=0
+HL1_EXPLORE: FRAMES=1399 VBLANKS=1400 FLIPS=1398 MISSED=0
+HL1_INPUT: SUMMARY success_frames=1400 active_frames=529
+HL1_INPUT: SUMMARY A_OR_START_SWITCH=CURRENTLY_FREE_FLY
+HL1_EXPLORE: BOOT_COMPLETE
+exit: status 0
+```
+
+The user additionally pressed digital D-pad directions (`0x0001`,
+`0x0002`, `0x0004`, `0x0008`) and shoulder buttons
+(`0x0100`, `0x0200`), all correctly delivered to virtual player 0.
+The samples consistently had `LX=LY=RX=RY=0` even while digital
+buttons changed. No `0x1000` virtual Xbox A was observed, but
+`0x0010` virtual Start was delivered and **correctly switched
+into and out of free-fly mode**. No user visual confirmation of
+actual camera movement (translation) yet.
+
+**Latest source fix:** the indexed XEX (but NOT the visually known-good
+unindexed orbit XEX) now translates **D-pad Up/Down into forward/back**,
+**D-pad Left/Right into strafe**, **LB/RB into yaw turning**.
+Analog sticks still work when Xenia exposes them. Triggers and
+virtual Xbox Y/X control elevation, B resets and Back exits.
+`HL1_EXPLORE: CAMERA_MOVED` logs position in integer milliscale
+units when a digital movement button transitions (avoiding float
+printf functions Xenia may miscompile). The new code is **not yet
+verified in user's Xenia**; compile and test are separate gates.
+
+After the next successful [Actions build](https://github.com/RealMCera/half-life2/actions),
+download `hl1_world_explore.xex` and keep the private
+`assets/hl1_c0a0_world.h360` beside it. In Xenia Canary:
+press virtual Start to enter FREE_FLY, hold D-pad Up to move
+forward, D-pad Left/Right to strafe, LB/RB to turn, and Back to
+exit. Then inspect:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_world_explore.log" -Tail 85
+```
+
+Look for `MODE=FREE_FLY` and `CAMERA_MOVED ... x_milli=...`,
+and report whether the scene visibly changes. These movement
+controls are a no-collision, no-gravity exploration debug aid,
+**not** fully playable Half-Life.
+
+---
+
 # INPUT FIX ATTEMPT / DIAGNOSTIC (2026-10-29)
 
 User reported **“NOPE”** when asked whether Xbox 360 A button
