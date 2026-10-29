@@ -11,3 +11,10 @@ add_executable(hl1_display_probe graphics_probe.c)
 set_target_properties(hl1_display_probe PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
 target_compile_options(hl1_display_probe PRIVATE -Wall -Wextra -Werror)
 xsdk_add_xex(hl1_display_probe)
+
+# Only the SECOND cloud compilation uses this flag and a patched
+# temporary copy of libxsdk; the first baseline XEX is unchanged.
+option(HL1_EXPERIMENTAL_LUT_PROBE "Label isolated Xenia-only LUT diagnostic" OFF)
+if(HL1_EXPERIMENTAL_LUT_PROBE)
+    target_compile_definitions(hl1_display_probe PRIVATE HL1_EXPERIMENTAL_LUT_PROBE=1)
+endif()
