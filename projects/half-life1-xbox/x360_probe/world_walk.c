@@ -551,10 +551,13 @@ int main(void)
     xsdk_log_write("HL1_WALK: BOOT_BEGIN");
     xsdk_log_write("HL1_WALK: INDEXED_GPU_WORLD_AND_FREE_FLY");
     xsdk_log_write("HL1_WALK: XENIA_ONLY_EXPERIMENTAL_LUT");
-    xsdk_log_write("HL1_WALK: Start toggles orbit/fly; D-pad moves, LB/RB turns, sticks also work");
-    xsdk_log_write("HL1_WALK: Triggers = vertical; X down/Y up; B reset; Back exit");
+    xsdk_log_write("HL1_WALK: Start toggles ORBIT/WALK; D-pad moves; LB/RB turns");
+    xsdk_log_write("HL1_WALK: A or Y jumps; B respawns; Back exits; right stick looks");
+    xsdk_log_write("HL1_WALK: mesh-floor gravity + simple wall segments, NO BSP hulls");
     xsdk_log_write("HL1_INPUT: DIAGNOSTIC_MODE all 4 virtual gamepad slots tested");
     World world = {0};
+    WalkScene scene = {0};
+    WalkPlayer player = {0};
     XsdkShader vertex = {0}, pixel = {0};
     uint32_t width = 0, height = 0, submitted = 0;
     int gpu_open = 0, display_open = 0, exit_code = 1;
@@ -578,6 +581,11 @@ int main(void)
         xsdk_log_write("HL1_WALK: GPU_MESH_UPLOAD_FAIL");
         goto cleanup;
     }
+    if (!walk_build(&world, &scene)) {
+        xsdk_log_write("HL1_WALK: COLLISION_BUILD_FAIL");
+        goto cleanup;
+    }
+    walk_reset(&scene, &player);
 
     const XsdkDepthStencil depth = {
         .depth_test = true, .depth_write = true,
@@ -592,9 +600,7 @@ int main(void)
     display_open = 1;
 
     float orbit_yaw = 0.70f, orbit_pitch = 0.64f, distance = DISTANCE;
-    float fly_yaw = 0.f, fly_pitch = 0.f;
-    Vec3 eye = {0.f, 0.f, 2.7f};
-    bool flying = false;
+    bool walking = false;
     bool last_toggle = false;
     uint32_t previous_slot = UINT32_MAX;
     uint32_t previous_buttons = UINT32_MAX;
@@ -663,72 +669,57 @@ int main(void)
             previous_buttons = input.gamepad.buttons;
         }
         if (controller && (input.gamepad.buttons & INPUT_GAMEPAD_BACK)) break;
-        const bool toggle = controller &&
-            (input.gamepad.buttons & (INPUT_GAMEPAD_A | INPUT_GAMEPAD_START));
+        const bool toggle = controller && (input.gamepad.buttons & INPUT_GAMEPAD_START);
         if (toggle && !last_toggle) {
-            flying = !flying;
+            walking = !walking;
+            if (walking) walk_reset(&scene, &player);
             xsdk_log_write("HL1_WALK: MODE=%s frame=%u player_slot=%u",
-                           flying ? "FREE_FLY" : "ORBIT", (unsigned)frame,
+                           walking ? "WALK" : "ORBIT", (unsigned)frame,
                            (unsigned)controller_slot);
         }
         last_toggle = toggle;
-        if (flying && controller) {
-            /* Xenia Canary's keyboard/gamepad bridge may report only
-             * digital D-pad/shoulder buttons, with all analog axes zero.
-             * Translate digital input into movement as a fallback. */
-            const uint16_t buttons = input.gamepad.buttons;
+        if (walking) {
+            const uint16_t buttons = controller ? input.gamepad.buttons : 0U;
             const float digital_forward =
                 ((buttons & INPUT_GAMEPAD_DPAD_UP) ? 1.f : 0.f) -
                 ((buttons & INPUT_GAMEPAD_DPAD_DOWN) ? 1.f : 0.f);
             const float digital_strafe =
                 ((buttons & INPUT_GAMEPAD_DPAD_RIGHT) ? 1.f : 0.f) -
                 ((buttons & INPUT_GAMEPAD_DPAD_LEFT) ? 1.f : 0.f);
-            const float digital_turn =
+            const float turn =
                 ((buttons & INPUT_GAMEPAD_RIGHT_SHOULDER) ? 1.f : 0.f) -
                 ((buttons & INPUT_GAMEPAD_LEFT_SHOULDER) ? 1.f : 0.f);
-            const float forward_stick = stick(input.gamepad.thumb_ly);
-            const float strafe_stick = stick(input.gamepad.thumb_lx);
-            const float forward = forward_stick != 0.f ? forward_stick : digital_forward;
-            const float strafe = strafe_stick != 0.f ? strafe_stick : digital_strafe;
-            const float speed = 0.026f;
-            fly_yaw += 0.055f * (stick(input.gamepad.thumb_rx) + digital_turn);
-            fly_pitch = clip(fly_pitch + 0.055f * stick(input.gamepad.thumb_ry),
-                             -1.35f, 1.35f);
-            eye.x += speed * (sinf(fly_yaw) * forward + cosf(fly_yaw) * strafe);
-            eye.z += speed * (-cosf(fly_yaw) * forward + sinf(fly_yaw) * strafe);
-            const float digital_vertical =
-                ((buttons & INPUT_GAMEPAD_Y) ? 1.f : 0.f) -
-                ((buttons & INPUT_GAMEPAD_X) ? 1.f : 0.f);
-            eye.y += 0.026f * (
-                ((float)input.gamepad.right_trigger -
-                 (float)input.gamepad.left_trigger) / 255.f +
-                digital_vertical);
-            eye.x = clip(eye.x, -6.f, 6.f);
-            eye.y = clip(eye.y, -6.f, 6.f);
-            eye.z = clip(eye.z, -6.f, 6.f);
-            if (input.gamepad.buttons & INPUT_GAMEPAD_B) {
-                eye = (Vec3){0.f, 0.f, 2.7f};
-                fly_yaw = 0.f;
-                fly_pitch = 0.f;
+            const float forward_stick=stick(input.gamepad.thumb_ly);
+            const float strafe_stick=stick(input.gamepad.thumb_lx);
+            const float forward=forward_stick != 0.f ? forward_stick : digital_forward;
+            const float strafe=strafe_stick != 0.f ? strafe_stick : digital_strafe;
+            const bool jump=(buttons & (INPUT_GAMEPAD_A|INPUT_GAMEPAD_Y)) != 0U;
+            const Vec3 old=player.eye;
+            const bool old_grounded=player.grounded;
+            if (buttons & INPUT_GAMEPAD_B) {
+                walk_reset(&scene,&player);
+                xsdk_log_write("HL1_WALK: RESET frame=%u",(unsigned)frame);
+            } else {
+                walk_tick(&scene,&player,forward,strafe,
+                          turn+stick(input.gamepad.thumb_rx),
+                          stick(input.gamepad.thumb_ry),jump);
             }
             const uint16_t motion_buttons = buttons &
                 (INPUT_GAMEPAD_DPAD_UP | INPUT_GAMEPAD_DPAD_DOWN |
                  INPUT_GAMEPAD_DPAD_LEFT | INPUT_GAMEPAD_DPAD_RIGHT |
                  INPUT_GAMEPAD_LEFT_SHOULDER | INPUT_GAMEPAD_RIGHT_SHOULDER |
-                 INPUT_GAMEPAD_X | INPUT_GAMEPAD_Y);
-            if ((forward != 0.f || strafe != 0.f ||
-                 digital_turn != 0.f || digital_vertical != 0.f) &&
-                (motion_buttons != previous_motion_buttons || frame % 120U == 0U)) {
-                /* Avoid printf float formatting in this experimental
-                 * PowerPC build (Xenia skips some libc DTOA instructions). */
-                xsdk_log_write("HL1_WALK: CAMERA_MOVED frame=%u x_milli=%d y_milli=%d z_milli=%d yaw_milli=%d",
-                               (unsigned)frame, (int)(eye.x * 1000.f),
-                               (int)(eye.y * 1000.f), (int)(eye.z * 1000.f),
-                               (int)(fly_yaw * 1000.f));
+                 INPUT_GAMEPAD_A | INPUT_GAMEPAD_Y);
+            if ((motion_buttons != previous_motion_buttons || frame % 120U == 0U) &&
+                (motion_buttons || old.x!=player.eye.x || old.z!=player.eye.z ||
+                 old_grounded!=player.grounded)) {
+                xsdk_log_write("HL1_WALK: PLAYER frame=%u x_mm=%d y_mm=%d z_mm=%d on_floor=%u",
+                               (unsigned)frame, (int)(player.eye.x*1000.f),
+                               (int)(player.eye.y*1000.f), (int)(player.eye.z*1000.f),
+                               (unsigned)player.grounded);
             }
-            previous_motion_buttons = motion_buttons;
+            previous_motion_buttons=motion_buttons;
         } else {
-            previous_motion_buttons = 0;
+            previous_motion_buttons=0;
             if (controller) {
                 orbit_yaw += 0.028f * stick(input.gamepad.thumb_lx);
                 orbit_pitch = clip(orbit_pitch - 0.028f * stick(input.gamepad.thumb_ly),
@@ -749,8 +740,8 @@ int main(void)
             exit_code = 3;
             break;
         }
-        Matrix matrix = flying
-            ? fly_projection(fly_yaw, fly_pitch, eye, (float)width / height)
+        Matrix matrix = walking
+            ? fly_projection(player.yaw, player.pitch, player.eye, (float)width / height)
             : view_projection(orbit_yaw, orbit_pitch, distance, (float)width / height);
         xsdk_gpu_set_target(width, height);
         xsdk_gpu_set_depth_stencil(&depth_state);
@@ -775,12 +766,13 @@ int main(void)
                    (unsigned)stats.flips, (unsigned)stats.missed);
     xsdk_log_write("HL1_INPUT: SUMMARY success_frames=%u active_frames=%u",
                    (unsigned)input_success_frames, (unsigned)input_active_frames);
-    xsdk_log_write("HL1_INPUT: SUMMARY A_OR_START_SWITCH=%s",
-                   flying ? "CURRENTLY_FREE_FLY" : "CURRENTLY_ORBIT");
+    xsdk_log_write("HL1_WALK: SUMMARY MODE=%s",
+                   walking ? "WALK" : "ORBIT");
     xsdk_log_write("HL1_WALK: MAP_VISIBILITY_REQUIRES_USER_CONFIRMATION");
     if (submitted) (void)xsdk_thread_sleep(1500);
 
 cleanup:
+    free(scene.faces);
     if (display_open) xsdk_present_close();
     if (world.gpu_indices) xsdk_gpu_free(world.gpu_indices);
     if (world.gpu_vertices) xsdk_gpu_free(world.gpu_vertices);
