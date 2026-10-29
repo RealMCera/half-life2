@@ -380,6 +380,7 @@ int main(void)
     uint32_t previous_buttons = UINT32_MAX;
     uint32_t input_success_frames = 0;
     uint32_t input_active_frames = 0;
+    uint16_t previous_motion_buttons = 0;
     exit_code = 0;
     for (uint32_t frame = 0; frame < MAX_FRAMES; frame++) {
         INPUT_STATE input = {0};
@@ -490,9 +491,14 @@ int main(void)
                 fly_yaw = 0.f;
                 fly_pitch = 0.f;
             }
+            const uint16_t motion_buttons = buttons &
+                (INPUT_GAMEPAD_DPAD_UP | INPUT_GAMEPAD_DPAD_DOWN |
+                 INPUT_GAMEPAD_DPAD_LEFT | INPUT_GAMEPAD_DPAD_RIGHT |
+                 INPUT_GAMEPAD_LEFT_SHOULDER | INPUT_GAMEPAD_RIGHT_SHOULDER |
+                 INPUT_GAMEPAD_X | INPUT_GAMEPAD_Y);
             if ((forward != 0.f || strafe != 0.f ||
                  digital_turn != 0.f || digital_vertical != 0.f) &&
-                (frame % 60U == 0U || frame % 60U == 1U)) {
+                (motion_buttons != previous_motion_buttons || frame % 120U == 0U)) {
                 /* Avoid printf float formatting in this experimental
                  * PowerPC build (Xenia skips some libc DTOA instructions). */
                 xsdk_log_write("HL1_EXPLORE: CAMERA_MOVED frame=%u x_milli=%d y_milli=%d z_milli=%d yaw_milli=%d",
@@ -500,7 +506,9 @@ int main(void)
                                (int)(eye.y * 1000.f), (int)(eye.z * 1000.f),
                                (int)(fly_yaw * 1000.f));
             }
+            previous_motion_buttons = motion_buttons;
         } else {
+            previous_motion_buttons = 0;
             if (controller) {
                 orbit_yaw += 0.028f * stick(input.gamepad.thumb_lx);
                 orbit_pitch = clip(orbit_pitch - 0.028f * stick(input.gamepad.thumb_ly),
