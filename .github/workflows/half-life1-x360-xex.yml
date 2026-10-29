@@ -61,7 +61,7 @@ jobs:
           make -C "$XSDK_DIR" -j3 TOOLCHAIN="$XSDK_PREFIX/bin/powerpc-xsdk-elf-" build/libxsdk.a
           test -s "$XSDK_DIR/build/libxsdk.a"
 
-      - name: Build original C17 Half-Life startup probe as XEX2
+      - name: Build H360 scene and Xenia display-compatibility XEX probes
         shell: bash
         run: |
           set -euo pipefail
@@ -74,6 +74,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build "$PROBE_BUILD" --verbose
           test -s "$PROBE_BUILD/hl1_remaster_probe.xex"
+          test -s "$PROBE_BUILD/hl1_display_probe.xex"
 
       - name: Validate XEX2 file header and prepare download
         shell: bash
@@ -82,27 +83,36 @@ jobs:
           mkdir -p dist
           python3 - <<'PY'
           from pathlib import Path
-          p = Path(__import__('os').environ['PROBE_BUILD']) / 'hl1_remaster_probe.xex'
-          with p.open('rb') as f:
-              header = f.read(4)
-          if header != b'XEX2':
-              raise SystemExit(f'Not XEX2: {header!r}')
-          print(f'XEX2 header verified; {p.stat().st_size} bytes. Emulation has not been verified.')
+          for name in ('hl1_remaster_probe.xex', 'hl1_display_probe.xex'):
+              p = Path(__import__('os').environ['PROBE_BUILD']) / name
+              with p.open('rb') as f:
+                  header = f.read(4)
+              if header != b'XEX2':
+                  raise SystemExit(f'{name} is not XEX2: {header!r}')
+              print(f'{name}: XEX2 header verified; {p.stat().st_size} bytes. Xenia startup is not verified by CI.')
           PY
           cp "$PROBE_BUILD/hl1_remaster_probe.xex" dist/
+          cp "$PROBE_BUILD/hl1_display_probe.xex" dist/
           cp xsdk-upstream-commit.txt dist/
-          sha256sum dist/hl1_remaster_probe.xex > dist/SHA256SUMS.txt
+          sha256sum dist/hl1_remaster_probe.xex dist/hl1_display_probe.xex > dist/SHA256SUMS.txt
           cat > dist/README.txt <<'EOF'
-          Half-Life 1 Xbox 360 native startup probe.
+          Half-Life 1 Xbox 360 native H360 scene and display probes.
+          hl1_remaster_probe.xex: original map / BMP geometry preview.
+          hl1_display_probe.xex: separate ONE-FRAME kernel/GPU/720p
+          display capability diagnostic, with NO game asset requirement.
+          The display probe may only log RESULT_DISPLAY_UNAVAILABLE
+          because the desktop Xenia build can reject xsdk present_open.
+          The display probe title log is cache/hl1_display_probe.log.
           NOT A PLAYABLE GAME OR INTERACTIVE GRAPHICS REMASTER.
           When assets/hl1_c0a0_world.h360 is next to this XEX,
           it validates the entire H360 mesh and writes a CPU-generated
-          640x360 wireframe image as cache:\hl1_wireframe.bmp.
+          640x360 top-down, isometric, and filled-shaded BMPs in cache:.
           Find that BMP under Xenia Canary's cache directory (not
           necessarily beside the XEX) after running in the emulator.
           Independently, the XEX always logs a 64x24 ASCII preview
           as HL1_WIRE lines, even if all BMP writes are blocked.
-          No graphics are presented in the emulator window.
+          The H360 title does not display live graphics in Xenia.
+          The display title only attempts to present one solid color frame.
           Host-side synthetic H360 validation and native XEX compilation
           are tested in CI. Xenia behavior needs the user's real test.
           Download to Windows and try in Xenia Canary.
