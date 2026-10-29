@@ -33,4 +33,12 @@ if(HL1_EXPERIMENTAL_LUT_PROBE)
     target_compile_options(hl1_world_gpu_probe PRIVATE -Wall -Wextra -Werror)
     xsdk_add_shaders(hl1_world_gpu_probe hl1_world.vert hl1_world.frag)
     xsdk_add_xex(hl1_world_gpu_probe)
+
+    # New EXPERIMENTAL indexed geometry + free-flight camera.
+    # Keeps the original visually verified orbit XEX unchanged.
+    add_executable(hl1_world_explore world_explore.c)
+    set_target_properties(hl1_world_explore PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_options(hl1_world_explore PRIVATE -Wall -Wextra -Werror)
+    xsdk_add_shaders(hl1_world_explore hl1_world.vert hl1_world.frag)
+    xsdk_add_xex(hl1_world_explore)
 endif()
