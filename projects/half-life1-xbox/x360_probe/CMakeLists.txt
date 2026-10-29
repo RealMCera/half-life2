@@ -50,4 +50,11 @@ if(HL1_EXPERIMENTAL_LUT_PROBE)
     target_compile_options(hl1_world_walk PRIVATE -Wall -Wextra -Werror)
     xsdk_add_shaders(hl1_world_walk hl1_world.vert hl1_world.frag)
     xsdk_add_xex(hl1_world_walk)
+
+    # Stable-ground V2 separate XEX; keep prior physics test for comparison.
+    add_executable(hl1_world_walk_stable world_walk_stable.c)
+    set_target_properties(hl1_world_walk_stable PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_options(hl1_world_walk_stable PRIVATE -Wall -Wextra -Werror)
+    xsdk_add_shaders(hl1_world_walk_stable hl1_world.vert hl1_world.frag)
+    xsdk_add_xex(hl1_world_walk_stable)
 endif()
