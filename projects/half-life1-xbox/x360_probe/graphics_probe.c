@@ -20,7 +20,13 @@
 int main(void)
 {
     xsdk_log_write("HL1_DISPLAY: BOOT_BEGIN");
-    xsdk_log_write("HL1_DISPLAY: probe version 1 (single 720p frame)");
+#ifdef HL1_EXPERIMENTAL_LUT_PROBE
+    xsdk_log_write("HL1_DISPLAY: EXPERIMENTAL_LUT_BYPASS_PROBE");
+    xsdk_log_write("HL1_DISPLAY: LUT_TIMEOUT_BYPASSED_IN_SDK_DIAGNOSTIC_ONLY");
+#else
+    xsdk_log_write("HL1_DISPLAY: BASELINE_UNMODIFIED_SDK");
+#endif
+    xsdk_log_write("HL1_DISPLAY: single 720p frame attempt");
     xsdk_log_set_dbgprint(true);
 
     NTSTATUS status = xsdk_gpu_open();
