@@ -41,4 +41,13 @@ if(HL1_EXPERIMENTAL_LUT_PROBE)
     target_compile_options(hl1_world_explore PRIVATE -Wall -Wextra -Werror)
     xsdk_add_shaders(hl1_world_explore hl1_world.vert hl1_world.frag)
     xsdk_add_xex(hl1_world_explore)
+
+    # Separate first-person walking / physics proof-of-concept.
+    # Triangulated mesh floor queries + basic wall segment blocking,
+    # no original GoldSrc BSP hulls, triggers, or gameplay yet.
+    add_executable(hl1_world_walk world_walk.c)
+    set_target_properties(hl1_world_walk PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_options(hl1_world_walk PRIVATE -Wall -Wextra -Werror)
+    xsdk_add_shaders(hl1_world_walk hl1_world.vert hl1_world.frag)
+    xsdk_add_xex(hl1_world_walk)
 endif()
