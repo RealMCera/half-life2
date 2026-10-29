@@ -331,7 +331,8 @@ int main(void)
     xsdk_log_write("HL1_EXPLORE: BOOT_BEGIN");
     xsdk_log_write("HL1_EXPLORE: INDEXED_GPU_WORLD_AND_FREE_FLY");
     xsdk_log_write("HL1_EXPLORE: XENIA_ONLY_EXPERIMENTAL_LUT");
-    xsdk_log_write("HL1_EXPLORE: A or Start toggles orbit/fly; left move, right look, triggers up/down, B reset, Back exit");
+    xsdk_log_write("HL1_EXPLORE: Start toggles orbit/fly; D-pad moves, LB/RB turns, sticks also work");
+    xsdk_log_write("HL1_EXPLORE: Triggers = vertical; X down/Y up; B reset; Back exit");
     xsdk_log_write("HL1_INPUT: DIAGNOSTIC_MODE all 4 virtual gamepad slots tested");
     World world = {0};
     XsdkShader vertex = {0}, pixel = {0};
@@ -451,18 +452,36 @@ int main(void)
         }
         last_toggle = toggle;
         if (flying && controller) {
-            const float turn_speed = 0.055f;
-            fly_yaw += turn_speed * stick(input.gamepad.thumb_rx);
-            fly_pitch = clip(fly_pitch + turn_speed * stick(input.gamepad.thumb_ry),
+            /* Xenia Canary's keyboard/gamepad bridge may report only
+             * digital D-pad/shoulder buttons, with all analog axes zero.
+             * Translate digital input into movement as a fallback. */
+            const uint16_t buttons = input.gamepad.buttons;
+            const float digital_forward =
+                ((buttons & INPUT_GAMEPAD_DPAD_UP) ? 1.f : 0.f) -
+                ((buttons & INPUT_GAMEPAD_DPAD_DOWN) ? 1.f : 0.f);
+            const float digital_strafe =
+                ((buttons & INPUT_GAMEPAD_DPAD_RIGHT) ? 1.f : 0.f) -
+                ((buttons & INPUT_GAMEPAD_DPAD_LEFT) ? 1.f : 0.f);
+            const float digital_turn =
+                ((buttons & INPUT_GAMEPAD_RIGHT_SHOULDER) ? 1.f : 0.f) -
+                ((buttons & INPUT_GAMEPAD_LEFT_SHOULDER) ? 1.f : 0.f);
+            const float forward_stick = stick(input.gamepad.thumb_ly);
+            const float strafe_stick = stick(input.gamepad.thumb_lx);
+            const float forward = forward_stick != 0.f ? forward_stick : digital_forward;
+            const float strafe = strafe_stick != 0.f ? strafe_stick : digital_strafe;
+            const float speed = 0.026f;
+            fly_yaw += 0.055f * (stick(input.gamepad.thumb_rx) + digital_turn);
+            fly_pitch = clip(fly_pitch + 0.055f * stick(input.gamepad.thumb_ry),
                              -1.35f, 1.35f);
-            const float forward = stick(input.gamepad.thumb_ly);
-            const float strafe = stick(input.gamepad.thumb_lx);
-            const float speed = (input.gamepad.buttons & INPUT_GAMEPAD_LEFT_SHOULDER)
-                ? 0.075f : 0.025f;
             eye.x += speed * (sinf(fly_yaw) * forward + cosf(fly_yaw) * strafe);
             eye.z += speed * (-cosf(fly_yaw) * forward + sinf(fly_yaw) * strafe);
-            eye.y += 0.026f * ((float)input.gamepad.right_trigger -
-                                (float)input.gamepad.left_trigger) / 255.f;
+            const float digital_vertical =
+                ((buttons & INPUT_GAMEPAD_Y) ? 1.f : 0.f) -
+                ((buttons & INPUT_GAMEPAD_X) ? 1.f : 0.f);
+            eye.y += 0.026f * (
+                ((float)input.gamepad.right_trigger -
+                 (float)input.gamepad.left_trigger) / 255.f +
+                digital_vertical);
             eye.x = clip(eye.x, -6.f, 6.f);
             eye.y = clip(eye.y, -6.f, 6.f);
             eye.z = clip(eye.z, -6.f, 6.f);
@@ -470,6 +489,13 @@ int main(void)
                 eye = (Vec3){0.f, 0.f, 2.7f};
                 fly_yaw = 0.f;
                 fly_pitch = 0.f;
+            }
+            if ((forward != 0.f || strafe != 0.f ||
+                 digital_turn != 0.f || digital_vertical != 0.f) &&
+                (frame % 60U == 0U || frame % 60U == 1U)) {
+                xsdk_log_write("HL1_EXPLORE: CAMERA_MOVED frame=%u x=%.3f y=%.3f z=%.3f yaw=%.3f",
+                               (unsigned)frame, (double)eye.x, (double)eye.y,
+                               (double)eye.z, (double)fly_yaw);
             }
         } else {
             if (controller) {
