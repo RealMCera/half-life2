@@ -1,3 +1,58 @@
+# VERIFIED XENIA RUNTIME: full c0a0 GPU mesh submissions (2026-10-29)
+
+User tested the GPU world XEX from successful [GitHub cloud run
+#40924364581](https://github.com/RealMCera/half-life2/actions/runs/40924364581)
+and pasted this real Windows Xenia Canary title-log excerpt:
+
+```text
+HL1_WORLD: BOOT_BEGIN
+HL1_WORLD: REAL_BLACK_MESA_GPU_ORBIT_PROTOTYPE
+HL1_WORLD: SCENE_VALID: 46 groups 10378 vertices 7833 triangles
+HL1_WORLD: gpu_open = 0x00000000
+HL1_WORLD: shaders_load = 0x00000000
+HL1_WORLD: GPU_VERTICES_READY: 23499 expanded vertices 563976 bytes
+HL1_DISPLAY_EXPERIMENT: ignoring LUT timeout for ONE diagnostic test
+HL1_WORLD: present_open = 0x00000000 (1280x720)
+HL1_WORLD: GPU_MAP_FRAME_SUBMITTED frame=1 triangles=7833
+HL1_WORLD: GPU_MAP_FRAME_SUBMITTED frame=60 triangles=7833
+HL1_WORLD: GPU_MAP_FRAME_SUBMITTED frame=180 triangles=7833
+HL1_WORLD: GPU_MAP_FRAME_SUBMITTED frame=359 triangles=7833
+HL1_WORLD: FRAMES=360 VBLANKS=629 FLIPS=359 MISSED=268
+HL1_WORLD: MAP_VISIBILITY_REQUIRES_USER_CONFIRMATION
+HL1_WORLD: gpu_close = 0x00000000
+HL1_WORLD: BOOT_COMPLETE
+exit: status 0
+```
+
+**Confirmed:** user-private real `c0a0` H360 mesh parsed and validated;
+46 material groups, 10,378 source vertices, 7,833 triangles, 23,499
+expanded GPU vertices (563,976 bytes) allocated and uploaded; native
+Xbox 360 GPU shaders loaded and 360 map draw/resolve/present frames were
+submitted; the SDK reported 359 flips; program exited cleanly.
+
+**NOT YET CONFIRMED:** user has not said whether the real Black Mesa
+geometry was visible or looked correct *inside the Xenia window*.
+Previous RGB triangle was visually confirmed; this new scene still
+requires separate on-screen visual confirmation / screenshot.
+
+**Performance observation:** 268 missed flips across 629 vblanks is a
+substantial count and deserves measurement/optimization; do not
+conflate raw counters with a frame-rate benchmark or claim a specific
+FPS without elapsed time and capture. The experiment can be expensive:
+each frame submits an unindexed list of 23,499 vertices.
+
+**Next step:** Ask user whether Black Mesa visibly appeared and ideally
+request a screenshot. If yes, work on accurate camera controls,
+index-buffer draw optimization and texture/material mapping. If
+no, inspect on-screen output and capture logs before asserting
+the map renderer works visually.
+
+**Safety/portability:** LUT bypass is experimental and intended
+strictly for Xenia Canary. NEVER run on physical Xbox 360 hardware.
+All user-derived original Half-Life assets remain private.
+
+---
+
 # BUILD FIX — Shader header mismatch (2026-10-29)
 
 GitHub Actions run [#40918892542](https://github.com/RealMCera/half-life2/actions/runs/40918892542) **failed during compilation**, before producing the new live map XEX. The exact compiler error was:
