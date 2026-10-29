@@ -1,3 +1,84 @@
+# Fix for BMS preview not opening — oversized indexed draw (2026-10-29)
+
+User reported that the previously supplied private Black Mesa Alpha 5
+H360 preview **"IT DIDNT OPEN"**. No crash/title-log was supplied, so
+the exact failure point is **not confirmed**.
+
+**Static audit of the user's private preview archive:**
+
+- ZIP contains ONLY `C0A0/assets/hl1_c0a0_world.h360`,
+  `C1A0/assets/hl1_c0a0_world.h360`, manifests,
+  `source_bsp_to_h360.py` and instructions. **There is NO XEX in
+  the preview ZIP.** Users must copy an executable from a successful
+  Actions XEX build into that folder.
+- Both maps pass the H360 v1 structure/endianness, group-relative
+  16-bit indices, 32 MiB file cap, group count and vertex count limits
+  in `world_explore.c`. C0A0 is 303 groups, 48,874 vertices,
+  95,892 indices / 31,964 triangles, 1,379,336-byte H360.
+  C1A0 is 28 groups, 2,353 vertices, 5,010 indices /
+  1,670 triangles, 67,868-byte H360.
+- `xenosworks/xsdk/include/xsdk/gpu.h` explicitly documents
+  `xsdk_gpu_draw_indexed` as **maximum 65,535 indices per call**.
+  Our original `hl1_world_explore.xex` submitted *all 95,892*
+  C0A0 indices in one call, **exceeding the SDK limit**. This is a
+  real bug that may cause a blank screen, crash or no draw, but without
+  the user's title log it is NOT proven as the sole cause of failure.
+- The smaller C1A0 map stays below 65,535 and is a useful
+  control test using the older known-good `hl1_world_explore.xex`
+  to distinguish wrong folder/XEX path from oversized GPU draw.
+
+## New dedicated experimental XEX
+
+New independent `projects/half-life1-xbox/x360_probe/bms_world_probe.c`
+is built as `hl1_bms_world_probe.xex`. It preserves the
+original GoldSrc `hl1_world_explore.xex` and other known-good files.
+
+- `xsdk_gpu_draw_indexed` is called with **up to 65,532 indices**
+  per batch, always divisible by 6 (whole triangles and dword-aligned
+  offset in uint16 index memory).
+- C0A0's 95,892 indices are now split into TWO draws:
+  **65,532 + 30,360**. Small C1A0 uses one draw.
+- Logs `HL1_BMS: SCENE_VALID`,
+  `HL1_BMS: INDEX_DRAW_BATCHES=2 total_indices=95892`,
+  `GPU_MAP_FRAME_SUBMITTED`, and `BOOT_COMPLETE`.
+- Uses the existing shader and vertex layout, index-buffer
+  conversion, and orbit/free-flight input code. Limits runtime to
+  600 frames for large-map diagnostics and allows early Back exit.
+- It is not yet known whether GPU memory allocations, vertex cache
+  capacity, Source BSP geometry, shader and performance will be
+  correct in Xenia; **cloud compilation and user-visible testing
+  are distinct gates**.
+- [GitHub Actions run #55](https://github.com/RealMCera/half-life2/actions/runs/40962160451)
+  builds and packages it, with the artifact
+  `HalfLife1-X360-XEX-StartupProbe`. Download ONLY after Success.
+
+### Safe Windows test — C0A0
+
+Create a NEW folder and copy into it:
+```text
+C0A0/
+  hl1_bms_world_probe.xex
+  assets/
+    hl1_c0a0_world.h360
+```
+Run the new `hl1_bms_world_probe.xex` with desktop Xenia Canary.
+Read:
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_bms_world_probe.log" -Tail 60
+```
+
+If it still does not launch, inspect Xenia's `xenia.log` and
+confirm exact file layout, XEX file size and log last-write-time.
+Do NOT assume error cause from a previous/stale log.
+The original GoldSrc demo should not be overwritten by the
+BMS C0A0 asset.
+
+The temporary SDK LUT-timeout bypass remains Xenia-only.
+**Never run these binaries on real Xbox 360.** No private game
+assets are committed to GitHub.
+
+---
+
 # Black Mesa Alpha 5 private archive — verified audit and safe import route
 
 Updated October 29, 2026. The user supplied a privately held
