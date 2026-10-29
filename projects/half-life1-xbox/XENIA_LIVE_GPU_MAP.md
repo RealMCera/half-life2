@@ -1,3 +1,17 @@
+# BUILD FIX — Shader header mismatch (2026-10-29)
+
+GitHub Actions run [#40918892542](https://github.com/RealMCera/half-life2/actions/runs/40918892542) **failed during compilation**, before producing the new live map XEX. The exact compiler error was:
+
+```text
+fatal error: hl1_world_shaders.h: No such file or directory
+```
+
+The XSDK CMake shader helper generates `hl1_world_gpu_probe_shaders.h` for the target `hl1_world_gpu_probe`, not `hl1_world_shaders.h`. Updated the C source to include the **correct generated header**, commit `d2416d5`.
+
+New build [#40924364581](https://github.com/RealMCera/half-life2/actions/runs/40924364581) was started to verify the fix. **Do not download an XEX until that new build is successful**; no live map rendering has been emulator tested yet.
+
+---
+
 # First live GPU Black Mesa `c0a0` renderer (Xenia-only experiment)
 
 ## Confirmed preceding milestone
