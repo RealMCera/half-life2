@@ -1,3 +1,82 @@
+# USER VERIFIED: REAL Black Mesa map rotating onscreen (2026-10-29)
+
+The user explicitly confirmed: **"I DID SEE IT ROTATING"**, and
+also provided a screenshot of the Xenia view. The previously recorded
+full GPU-map XEX log showed successful real-map upload (7,833 triangles),
+360 frame submissions and 359 flips. This verifies **live onscreen
+GPU-rendered real Black Mesa `c0a0` geometry in Windows Xenia Canary**.
+No textures, collision, enemies or actual game/first-person player
+movement have been implemented.
+
+The previous GPU orbit XEX **`hl1_world_gpu_probe.xex` is KNOWN GOOD
+and left unchanged**.
+
+## New separate EXPERIMENTAL indexed explorer XEX
+
+`x360_probe/world_explore.c` builds as `hl1_world_explore.xex`
+using the same original GLSL material-color shaders. It converts the
+group-relative H360 indices to a single global 16-bit GPU index buffer
+and uploads each shared source vertex once instead of repeating
+triangle corners. The source H360 data were inspected locally and
+confirmed to have 10,378 vertices, 23,499 indices and a maximum global
+index of 10,377 (fits 16 bits).
+
+Estimated GPU memory for mesh representation (no other resources):
+- Earlier unindexed: **563,976 bytes** of packed vertex data.
+- New indexed: **249,072 bytes** vertices plus **47,000 bytes**
+  packed 16-bit indices = **296,072 bytes**.
+- Difference: **267,904 bytes (~47.5% less mesh buffer memory)**.
+  This is theoretical from source format, NOT a measured Xenia frame
+  rate improvement or guaranteed reduction in missed flips.
+
+Camera options, if Xenia exposes a gamepad:
+- No gamepad: slow auto-orbit, as on known-good XEX.
+- In orbit mode: left stick rotates, triggers zoom.
+- Press **A** once: toggle free-fly view; left stick walks/strafe,
+  right stick looks; triggers rise/descend; hold LB to move faster,
+  B resets free-fly camera, Back exits.
+- Press A again to return to orbit.
+- A maximum of 1,800 frames gives a bounded test; this is NOT
+  complete Half-Life navigation (no collision/gravity).
+- No keyboard mapping is guaranteed; input mappings depend on Xenia.
+
+**Status:** the separate new indexed/fly XEX is unverified until its
+new GitHub build succeeds and user visually tests it.
+Do not overwrite or delete the known-good `hl1_world_gpu_probe.xex`
+while testing.
+
+## Windows test after successful build
+
+Download the new successful GitHub Actions artifact
+`HalfLife1-X360-XEX-StartupProbe`, extract, and place the user's
+private mesh next to the new XEX:
+
+```text
+HalfLife1-X360-XEX-StartupProbe/
+  hl1_world_explore.xex
+  assets/
+    hl1_c0a0_world.h360
+```
+
+Launch `hl1_world_explore.xex` in Xenia Canary. Inspect:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_world_explore.log" -Tail 45
+```
+
+Look for `HL1_EXPLORE: INDEXED_MESH_READY`,
+`HL1_EXPLORE: GPU_MAP_FRAME_SUBMITTED`, `MODE=FREE_FLY`,
+and `HL1_EXPLORE: FRAMES=... VBLANKS=... FLIPS=... MISSED=...`.
+Only visually seeing the geometry confirms that it is rendered
+correctly; comparing missed flip counts requires the same emulator
+configuration and comparable run conditions.
+
+All XEXs use the temporary **Xenia-only** LUT workaround. **NEVER
+use the patched diagnostic programs on physical Xbox 360 hardware.**
+All copyrighted game-derived assets remain private, outside GitHub.
+
+---
+
 # VERIFIED XENIA RUNTIME: full c0a0 GPU mesh submissions (2026-10-29)
 
 User tested the GPU world XEX from successful [GitHub cloud run
