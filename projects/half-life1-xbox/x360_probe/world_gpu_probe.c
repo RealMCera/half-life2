@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "hl1_world_shaders.h"
+#include "hl1_world_gpu_probe_shaders.h"
 #include "xsdk/gpu.h"
 #include "xsdk/kernel.h"
 #include "xsdk/log.h"
