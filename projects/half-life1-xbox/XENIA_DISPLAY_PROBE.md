@@ -1,3 +1,77 @@
+# ACTUAL XENIA LOG: first display probe reached LUT timeout
+
+The user ran the cloud-built native 360 `hl1_display_probe.xex`
+in Windows Xenia Canary and supplied this exact log:
+
+```text
+HL1_DISPLAY: BOOT_BEGIN
+HL1_DISPLAY: probe version 1 (single 720p frame)
+HL1_DISPLAY: gpu_open = 0x00000000
+display: the LUT autofill didn't finish: 0xC00000B5
+HL1_DISPLAY: present_open = 0xC00000B5
+HL1_DISPLAY: RESULT_DISPLAY_UNAVAILABLE
+HL1_DISPLAY: Xenia likely needs a different display path
+HL1_DISPLAY: BOOT_COMPLETE
+exit: status 2
+```
+
+`0xC00000B5` means `STATUS_IO_TIMEOUT`, **not**
+`STATUS_NOT_SUPPORTED`. Inspection of upstream
+[`src/display.c`](https://github.com/xenosworks/xsdk/blob/main/src/display.c)
+showed that `fill_lut()` writes a display-controller autofill
+command and polls bit 1 for completion, sleeping 1 ms for at most
+100 ms. In the user's emulator, the bit did not indicate done.
+**GPU initialization DID succeed**; the display setup did not.
+No actual rendered frame was demonstrated.
+
+## Second diagnostic — isolated skip of one failed SDK wait
+
+We added:
+- `tools/patch_xsdk_xenia_lut_diagnostic.py`, which alters ONLY
+  the *disposable cloud runner* checkout of upstream xsdk, after
+  a baseline XEX has already been built.
+- Fail-closed `tests/test_xenia_lut_diagnostic_patch.py`, which
+  refuses to apply the patch if upstream code differs.
+- A **second** CMake build of the same simple one-frame test,
+  linked to the temporary patched libxsdk, uploaded as
+  `hl1_display_lut_probe.xex`.
+- The artifact still includes the **unchanged**
+  `hl1_display_probe.xex` and `hl1_remaster_probe.xex`.
+
+**This is a diagnostic, NOT a supported emulator fix.** It only
+suppresses the specific LUT `STATUS_IO_TIMEOUT` to identify whether
+the next display API works. The LUT hardware behavior is NOT actually
+emulated, so the test may still display nothing, produce a GPU error,
+or exit. It must NEVER be used on a real Xbox 360.
+We have not tested the experimental XEX in the user's emulator yet.
+
+### How to run it after a NEW successful GitHub build
+
+1. Under [GitHub Actions](https://github.com/RealMCera/half-life2/actions),
+   download **the newest successful** `HalfLife1-X360-XEX-StartupProbe`
+   artifact that includes `hl1_display_lut_probe.xex`.
+2. Extract the three XEX files. The new display experiment needs
+   NO `assets` folder. Keep your existing working shaded-map
+   viewer and map folder untouched.
+3. Open `hl1_display_lut_probe.xex` in Windows Xenia Canary.
+   A normal dashboard exit or no visible frame is still possible.
+4. Inspect **its different title log**:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_display_lut_probe.log" -Tail 40
+```
+
+5. Confirm that the log includes
+   `EXPERIMENTAL_LUT_BYPASS_PROBE` and
+   `HL1_DISPLAY_EXPERIMENT: ignoring LUT timeout` and report
+   the new `present_open` status plus any visible frame.
+   If the emulator crashes or hangs, terminate it; do not change
+   emulator/system configuration to force the experiment.
+
+No Debian/WSL installation on the user's Windows PC is needed.
+
+---
+
 # Xenia graphics display compatibility experiment
 
 **Why this exists:** The user's real Windows Xenia Canary has now
