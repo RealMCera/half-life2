@@ -1,3 +1,34 @@
+# VERIFIED — solid shaded c0a0 image in real Windows Xenia Canary (2026-10-29)
+
+The user supplied a screenshot of `hl1_shaded.bmp`, opened in
+Windows Live Photo Gallery. The image depicts a clean **solid, flat-colored
+isometric rendering** of the original `c0a0` Black Mesa geometry, including
+two room structures, a long curved elevated connector, height differences,
+and a small isolated-looking rectangular solid at the bottom. The earlier
+wireframe screenshots and Xenia logs agree with this geometry.
+
+This verifies that the Xbox 360 XEX CPU renderer's shaded/depth-buffered
+offline BMP output works **end to end** in Windows Xenia, not just in
+host-C tests. A separate new runtime log was not provided in this turn;
+the screenshot demonstrates image output, not a formal frame-timing or
+render correctness benchmark.
+
+**Current limits:** no game textures, no true per-pixel material maps,
+no movable BSP entities, no first-person controller, no gameplay,
+and **no GPU-presented real-time scene** in Xenia. Do not call
+the static offline BMP a playable game or a live renderer.
+
+**Next engineering gate:** first prove a simple **solid-color frame can
+be displayed inside the Xenia emulator window** using an Xbox 360 XEX.
+The public xsdk GETTING_STARTED docs warn that its `xsdk_present_open`
+display-controller path returns `0xC00000BB` on their tested
+desktop Xenia version. A diagnostic-only display-probe XEX should
+record the actual kernel/GPU statuses on the user's Xenia build,
+without assuming it can draw. Only after a real frame is visible should
+we work on a navigable first-person mesh renderer.
+
+---
+
 # Black Mesa c0a0 — shaded isometric milestone
 
 ## User-verified current state
