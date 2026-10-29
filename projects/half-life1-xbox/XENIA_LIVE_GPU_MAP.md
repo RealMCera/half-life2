@@ -1,3 +1,101 @@
+# CONFIRMED ACTUAL CAMERA TRANSLATION IN XENIA; walking XEX build pending (2026-10-29)
+
+The user pasted a **real Windows Xenia Canary** log for the
+separate indexed free-flight `hl1_world_explore.xex` after
+the D-pad-fallback build [#45](https://github.com/RealMCera/half-life2/actions/runs/40941445055):
+
+```text
+HL1_EXPLORE: MODE=FREE_FLY frame=208 player_slot=0
+HL1_INPUT: RAW slot=0 frame=671 buttons=0x0004 LX=0 LY=0 RX=0 RY=0
+HL1_EXPLORE: CAMERA_MOVED frame=671 x_milli=-23 y_milli=2080 z_milli=2711 yaw_milli=-440
+HL1_INPUT: RAW slot=0 frame=723 buttons=0x0002 LX=0 LY=0 RX=0 RY=0
+HL1_EXPLORE: CAMERA_MOVED frame=723 x_milli=-459 y_milli=2080 z_milli=2945 yaw_milli=-440
+HL1_INPUT: RAW slot=0 frame=1192 buttons=0x0001 LX=0 LY=0 RX=0 RY=32767
+HL1_EXPLORE: CAMERA_MOVED frame=1192 x_milli=-624 y_milli=-52 z_milli=357 yaw_milli=274
+HL1_INPUT: RAW slot=0 frame=1269 buttons=0x0004 LX=0 LY=0 RX=-32768 RY=0
+HL1_EXPLORE: CAMERA_MOVED frame=1269 x_milli=-509 y_milli=-52 z_milli=-100 yaw_milli=-1265
+HL1_EXPLORE: GPU_MAP_FRAME_SUBMITTED frame=1799 triangles=7833
+HL1_EXPLORE: FRAMES=1800 VBLANKS=2039 FLIPS=1799 MISSED=238
+HL1_INPUT: SUMMARY success_frames=1800 active_frames=865
+HL1_INPUT: SUMMARY A_OR_START_SWITCH=CURRENTLY_FREE_FLY
+exit: status 0
+```
+
+**Verified:** A/Start-to-free-fly control transition works via
+virtual gamepad slot 0; D-pad buttons are recognized;
+native camera state moves X/Z (and Y when input moves
+vertically); occasional right analog stick RX/RY **also
+have nonzero inputs**, disproving the earlier assumption
+that analog sticks never work. 1,800 frames submitted,
+1,799 flips and 238 missed, exit code zero. Do not
+interpret this as a stable FPS benchmark.
+
+**Still unverified:** This is logged camera movement,
+not proof the camera stays on safe floor surfaces,
+collides with walls, triggers game entities or provides
+actual HL1 gameplay. The earlier image and user report
+visually confirmed the rotating map; this newer
+free-flight movement was confirmed **in the title log**.
+
+## Separate CPU map collision/gravity experiment (new, unverified)
+
+New `x360_probe/world_walk.c` target:
+`hl1_world_walk.xex`, using the **same** indexed Xenos GPU
+mesh and user-private H360 file. All verified earlier
+`hl1_world_explore.xex` and `hl1_world_gpu_probe.xex` source
+paths remain unchanged.
+
+Features to test:
+- Extract CPU triangle surfaces from the already validated
+  private H360 model; identify nearly horizontal walkable
+  faces, choose diagnostic spawn on one.
+- First-person mode toggled using **virtual Start**.
+- In WALK mode D-pad moves and LB/RB turn; analog
+  sticks continue to work when Xenia reports them.
+- Vertical ray/triangle barycentric test gives terrain height;
+  approximate gravity and jump with **virtual A or Y**;
+  B respawns, Back exits.
+- Minimal two-height segment/mesh wall blocking and
+  axis-separated slide; logs SPAWN, COLLISION_MESH,
+  PLAYER, LANDED, JUMP, FALL_RECOVERY.
+- Like the existing map XEX, bounded at 1,800 frames.
+  CPU mesh collision has no acceleration structure yet:
+  performance can be worse. More sophisticated BSP
+  collision hulls, stairs, moving brushes, trigger
+  volumes, exact eye height and map spawn are **not
+  implemented**.
+- This has not yet passed GitHub compilation or runtime
+  testing. Please check the build result before download.
+
+After successful [GitHub Actions build #49](https://github.com/RealMCera/half-life2/actions/runs/40950772992):
+
+```text
+HalfLife1-X360-XEX-StartupProbe/
+  hl1_world_walk.xex
+  assets/
+    hl1_c0a0_world.h360
+```
+
+In Xenia Canary run `hl1_world_walk.xex`,
+press **Start** to enter WALK mode, D-pad Up to
+move, LB/RB to turn, A or Y to jump, B to reset,
+Back to exit. Read:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_world_walk.log" -Tail 90
+```
+
+Observe if the image shows a first-person location
+rather than the overview and whether moving is
+blocked by a wall and stays on a floor. Report log
+plus visual result separately.
+
+This walk title is still strictly **Xenia-only** due
+to the temporary LUT timeout SDK patch. Do not use
+on physical Xbox 360 hardware.
+
+---
+
 # USER VERIFIED: Start button switches free-fly; analog axes appear ZERO (2026-10-29)
 
 Actual user Xenia title log from run #42:
