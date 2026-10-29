@@ -39,7 +39,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev \
-            curl xz-utils patch python3 cmake ninja-build git ca-certificates
+            curl xz-utils patch python3 cmake ninja-build git ca-certificates glslang-tools
 
       - name: Test original H360 CPU wireframe renderer using runner GCC
         run: python3 -m unittest discover -s tests -p 'test_x360_wireframe_host.py' -v
@@ -90,7 +90,9 @@ jobs:
           # Modify only the disposable SDK checkout, and only the known
           # display.c timeout handling. Never use this patch on physical 360s.
           python3 tools/patch_xsdk_xenia_lut_diagnostic.py "$XSDK_DIR"
-          make -C "$XSDK_DIR" -j3 TOOLCHAIN="$XSDK_PREFIX/bin/powerpc-xsdk-elf-" build/libxsdk.a
+          make -C "$XSDK_DIR" -j3 TOOLCHAIN="$XSDK_PREFIX/bin/powerpc-xsdk-elf-" build/libxsdk.a build/host/libxsc.so
+          glslangValidator -V projects/half-life1-xbox/x360_probe/hl1_triangle.vert -o /tmp/hl1_triangle.vert.spv
+          glslangValidator -V projects/half-life1-xbox/x360_probe/hl1_triangle.frag -o /tmp/hl1_triangle.frag.spv
           cmake \
             -S projects/half-life1-xbox/x360_probe \
             -B "$LUT_BUILD" \
@@ -98,9 +100,11 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$XSDK_DIR/cmake/xsdk.cmake" \
             -DXSDK_TOOLCHAIN="$XSDK_PREFIX" \
             -DHL1_EXPERIMENTAL_LUT_PROBE=ON \
+            -DXSDK_GLSLANG=/usr/bin/glslangValidator \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build "$LUT_BUILD" --target hl1_display_probe --verbose
+          cmake --build "$LUT_BUILD" --target hl1_display_probe hl1_triangle_probe --verbose
           test -s "$LUT_BUILD/hl1_display_probe.xex"
+          test -s "$LUT_BUILD/hl1_triangle_probe.xex"
 
       - name: Validate XEX2 file header and prepare download
         shell: bash
@@ -116,16 +120,18 @@ jobs:
               if header != b'XEX2':
                   raise SystemExit(f'{name} is not XEX2: {header!r}')
               print(f'{name}: XEX2 header verified; {p.stat().st_size} bytes. Xenia startup is not verified by CI.')
-          p = Path(__import__('os').environ['LUT_BUILD']) / 'hl1_display_probe.xex'
-          if p.read_bytes()[:4] != b'XEX2':
-              raise SystemExit('Experimental LUT probe is not XEX2')
-          print('Experimental LUT bypass XEX2 header verified. Emulator startup UNTESTED.')
+          for name in ('hl1_display_probe.xex', 'hl1_triangle_probe.xex'):
+              p = Path(__import__('os').environ['LUT_BUILD']) / name
+              if p.read_bytes()[:4] != b'XEX2':
+                  raise SystemExit('Experimental XEX is not XEX2: ' + name)
+              print('Experimental XEX2 header verified: ' + name + '. Emulator runtime UNTESTED.')
           PY
           cp "$PROBE_BUILD/hl1_remaster_probe.xex" dist/
           cp "$PROBE_BUILD/hl1_display_probe.xex" dist/
           cp "$LUT_BUILD/hl1_display_probe.xex" dist/hl1_display_lut_probe.xex
+          cp "$LUT_BUILD/hl1_triangle_probe.xex" dist/hl1_triangle_probe.xex
           cp xsdk-upstream-commit.txt dist/
-          sha256sum dist/hl1_remaster_probe.xex dist/hl1_display_probe.xex dist/hl1_display_lut_probe.xex > dist/SHA256SUMS.txt
+          sha256sum dist/hl1_remaster_probe.xex dist/hl1_display_probe.xex dist/hl1_display_lut_probe.xex dist/hl1_triangle_probe.xex > dist/SHA256SUMS.txt
           cat > dist/README.txt <<'EOF'
           Half-Life 1 Xbox 360 native H360 scene and display probes.
           hl1_remaster_probe.xex: original map / BMP geometry preview.
@@ -135,7 +141,11 @@ jobs:
           autofill STATUS_IO_TIMEOUT so we can diagnose the NEXT display
           failure. This DOES NOT emulate LUT, guarantee a visible frame,
           or fix Xenia. NEVER RUN ON PHYSICAL XBOX 360 HARDWARE.
-          Both display probes try separate ONE-FRAME kernel/GPU/720p
+          hl1_triangle_probe.xex: EXPERIMENTAL emulator-only GPU triangle.
+          It submits RGB-shaded geometry using native Xbox 360 shaders.
+          Shader execution, live screen visibility, and emulator stability
+          are UNTESTED until actually run in Xenia Canary.
+          Both display probes use the 720p kernel/GPU/present stack.
           display capability diagnostic, with NO game asset requirement.
           The display probe may only log RESULT_DISPLAY_UNAVAILABLE
           because the desktop Xenia build can reject xsdk present_open.
