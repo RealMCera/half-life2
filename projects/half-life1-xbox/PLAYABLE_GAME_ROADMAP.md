@@ -21,12 +21,11 @@ NOT a claim that the Half-Life engine or game is already ported.
 
 ## What is NOT yet working
 
-- Controller-driven free flight: previous indexed viewer had no
-  `MODE=FREE_FLY` log marker; user reported controller toggle did
-  NOT work. A four-slot input diagnostic build completed successfully
-  in cloud run
-  [#40935487943](https://github.com/RealMCera/half-life2/actions/runs/40935487943),
-  but is not verified in the user's Xenia yet.
+- Controller-driven free flight has now been **verified by user's later
+  Xenia logs**, using virtual Start to toggle modes and D-pad to move.
+  Camera X/Z/Y and yaw logs change with real button input.
+  Later analog right-stick samples also gave nonzero RX/RY values.
+  **Visual first-person navigation and collision remain unverified**.
 - No map collision or physics, interior navigation, player
   capsule, gravity, pickups, buttons, doors, triggers, AI,
   weapons, combat, sound, music, menu or save system.
@@ -92,8 +91,8 @@ HL1 replacement asset pack.
 | Gate | Minimum proof | Status |
 |---|---|---|
 | A. Visible Xbox GPU world | Original `c0a0` onscreen in Xenia | **CONFIRMED** |
-| B. Reliable player input | Digital A/Start, sticks, controller slot logged and free-fly observed | **OPEN** |
-| C. Traversable vertical slice | First-person view, collision against floor/walls, gravity/jump and clipping through no solid world | **NOT STARTED** |
+| B. Reliable player input | Start and D-pad mapped; actual camera positions change in Xenia logs | **VERIFIED, digital path** |
+| C. Traversable vertical slice | Floor collision, basic wall blocking, gravity, jump and first-person view | **CODED EXPERIMENT; runtime unverified** |
 | D. Gameplay loop | Trigger/button + door, a pickup, health, one working weapon, one target/enemy and damage | **NOT STARTED** |
 | E. Basic Source texture bridge | Private VTF converted; H360 material-to-texture mapping; UVs/sampler on GPU | **NOT STARTED** |
 | F. Playable HL1 chapter | BSP brush entities, props and transitions, AI, audio, HUD, checkpoints/saves | **NOT STARTED** |
@@ -113,12 +112,13 @@ unquantified; do not advertise an invented completion date.
 
 ## Next actionable build/test
 
-Run the successful controller-diagnostic artifact from
-[GitHub Actions #42](https://github.com/RealMCera/half-life2/actions/runs/40935487943).
-Keep `assets/hl1_c0a0_world.h360` beside
-`hl1_world_explore.xex` as before. After attempting A or Start,
-inspect `cache/hl1_world_explore.log` for
-`HL1_INPUT: SLOT=`, `HL1_INPUT: RAW`, and
-`MODE=FREE_FLY`.
-Then implement a small player-collision and interaction slice
-without losing the working orbit XEX.
+The user's later actual `hl1_world_explore.log` confirmed Start
+switching free-flight and D-pad X/Z camera movement, with occasional
+right-stick input. [Cloud build #49](https://github.com/RealMCera/half-life2/actions/runs/40950772992)
+adds the **separate `hl1_world_walk.xex`** with initial mesh-based
+floor, wall, gravity and jump experiments. After **successful** compilation,
+put the private `assets/hl1_c0a0_world.h360` beside the walk XEX,
+launch in desktop Xenia, press Start for WALK and test D-pad motion,
+then examine `cache/hl1_world_walk.log`. The walking collision code
+has **not yet been tested** in Xenia and does not implement GoldSrc
+BSP player hulls, so any success will be only a first physics prototype.
