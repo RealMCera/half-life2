@@ -1,3 +1,51 @@
+# USER VERIFIED: indexed Black Mesa world runs through all 1,800 GPU frames (2026-10-29)
+
+User ran new `hl1_world_explore.xex` in Windows Xenia Canary and
+provided the following title-log excerpt:
+
+```text
+HL1_EXPLORE: SCENE_VALID: 46 groups 10378 vertices 7833 triangles
+HL1_EXPLORE: gpu_open = 0x00000000
+HL1_EXPLORE: shaders_load = 0x00000000
+HL1_EXPLORE: INDEXED_MESH_READY vertices=10378 indices=23499 triangles=7833 vertex_bytes=249072 index_bytes=47000
+HL1_DISPLAY_EXPERIMENT: ignoring LUT timeout for ONE diagnostic test
+HL1_EXPLORE: present_open = 0x00000000 (1280x720)
+HL1_EXPLORE: GPU_MAP_FRAME_SUBMITTED frame=1 triangles=7833
+HL1_EXPLORE: GPU_MAP_FRAME_SUBMITTED frame=60 triangles=7833
+HL1_EXPLORE: GPU_MAP_FRAME_SUBMITTED frame=180 triangles=7833
+HL1_EXPLORE: GPU_MAP_FRAME_SUBMITTED frame=1799 triangles=7833
+HL1_EXPLORE: FRAMES=1800 VBLANKS=1967 FLIPS=1799 MISSED=165
+HL1_EXPLORE: MAP_VISIBILITY_REQUIRES_USER_CONFIRMATION
+HL1_EXPLORE: gpu_close = 0x00000000
+HL1_EXPLORE: BOOT_COMPLETE
+exit: status 0
+```
+
+**Confirmed:** indexed GPU mesh successfully loads and emits rendering
+commands for all 7,833 triangles across 1,800 frames, with 1,799
+SDK-reported flips and no crash. Mesh buffers total 296,072 bytes,
+vs 563,976 bytes for unindexed GPU version, a 267,904-byte
+(~47.5%) reduction in mesh storage. The initial *unindexed*
+live map was already visually confirmed by user in Xenia. The
+user has not yet explicitly confirmed that the **indexed** map
+looked correct or that the new free-flight controls engaged.
+
+**Performance:** 165 missed flips in the newer 1,800-frame indexed
+test versus 268 missed in 360-frame prior unindexed test. Counts
+are encouraging, but not a controlled apples-to-apples FPS
+benchmark; runtime, camera, and device conditions may vary.
+
+**Input not yet confirmed:** no `HL1_EXPLORE: MODE=FREE_FLY`
+entry in this title log. This may mean the A toggle was never
+pressed, the gamepad was unavailable/unmapped, or input events
+were not delivered. Ask user if A toggled camera and whether
+analog sticks moved the camera before claiming free-flight works.
+
+The XEX remains Xenia-only due to experimental LUT timeout
+diagnostic bypass; **never run on actual Xbox 360 hardware**.
+
+---
+
 # Visual check: Xenia screenshot of Black Mesa geometry (2026-10-29)
 
 The user sent another screenshot showing a Xenia Canary **real-time
