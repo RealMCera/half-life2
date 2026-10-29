@@ -25,4 +25,12 @@ if(HL1_EXPERIMENTAL_LUT_PROBE)
     target_compile_options(hl1_triangle_probe PRIVATE -Wall -Wextra -Werror)
     xsdk_add_shaders(hl1_triangle_probe hl1_triangle.vert hl1_triangle.frag)
     xsdk_add_xex(hl1_triangle_probe)
+
+    # Original c0a0 world geometry: actual native GPU 3D, no copyrighted
+    # assets in this repository. Requires user's H360 file beside XEX.
+    add_executable(hl1_world_gpu_probe world_gpu_probe.c)
+    set_target_properties(hl1_world_gpu_probe PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_options(hl1_world_gpu_probe PRIVATE -Wall -Wextra -Werror)
+    xsdk_add_shaders(hl1_world_gpu_probe hl1_world.vert hl1_world.frag)
+    xsdk_add_xex(hl1_world_gpu_probe)
 endif()
