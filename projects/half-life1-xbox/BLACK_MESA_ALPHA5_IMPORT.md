@@ -1,3 +1,60 @@
+# User verified full BMS C0A0 graphics submission / presentation stats (2026-10-30)
+
+**This replaces earlier uncertainty about whether the XEX ran.**
+The user supplied the full Windows Xenia Canary title log for
+`hl1_bms_world_probe.xex`:
+
+```text
+HL1_BMS: BOOT_BEGIN
+HL1_BMS: MULTIDRAW_LARGE_MAP_PREVIEW 65532_INDEX_LIMIT
+HL1_BMS: SCENE_VALID: 303 groups 48874 vertices 31964 triangles
+HL1_BMS: gpu_open = 0x00000000
+HL1_BMS: shaders_load = 0x00000000
+HL1_BMS: INDEXED_MESH_READY vertices=48874 indices=95892 triangles=31964 vertex_bytes=1172976 index_bytes=191784
+HL1_BMS: INDEX_DRAW_BATCHES=2 total_indices=95892 max_per_batch=65532
+HL1_BMS: present_open = 0x00000000 (1280x720)
+HL1_BMS: GPU_MAP_FRAME_SUBMITTED frame=1 triangles=31964
+HL1_BMS: GPU_MAP_FRAME_SUBMITTED frame=60 triangles=31964
+HL1_BMS: GPU_MAP_FRAME_SUBMITTED frame=180 triangles=31964
+HL1_INPUT: RAW slot=0 frame=578 buttons=0x0020 LX=0 LY=0 RX=0 RY=0
+HL1_BMS: FRAMES=578 VBLANKS=579 FLIPS=577 MISSED=0
+HL1_INPUT: SUMMARY success_frames=579 active_frames=119
+HL1_INPUT: SUMMARY A_OR_START_SWITCH=CURRENTLY_ORBIT
+HL1_BMS: gpu_close = 0x00000000
+HL1_BMS: BOOT_COMPLETE
+exit: status 0
+```
+
+**Verified:** the XEX successfully runs and loads the private
+converted Alpha 5 Source map; GPU opens, shaders load,
+vertices/indices upload, two indexed draw batches submit,
+present succeeds, 577 flips in 578 submitted frames, zero
+SDK-reported missed flips, and normal shutdown after
+virtual Back button at frame 578. Runtime retained **orbit**
+camera mode; no Start/free-fly toggle observed in this test.
+
+**Do not interpret** SDK `MISSED=0` as independently
+measured FPS, nor the GPU submission logs as confirmation of
+physically accurate textures/geometry/lighting, gameplay, or
+reliable collision. The prior screenshot displays colored
+geometry but the screenshot did not include the XEX filename.
+
+Mesh GPU buffer storage: 1,172,976 + 191,784 =
+**1,364,760 bytes**, exclusive of CPU file storage, other
+allocations, shaders and framebuffers. User-private original
+HL1 H360 mesh remains separately intact.
+
+Next milestone should be a **playable map slice**: import
+actual player-start entity, implement stable collision and
+navigation on the Alpha 5 map, then a door/button trigger
+and one test objective. The Source BSP editor/VMF has
+entity/brush data that a plain H360 render mesh does not.
+Textures/models are valuable but are *not* prerequisites for
+the initial gameplay loop. Avoid additional unrelated
+display diagnostics unless a new graphics bug emerges.
+
+---
+
 # VERIFIED IN USER'S XENIA: Black Mesa Alpha 5 C0A0 GPU loader and split draws (2026-10-30)
 
 **User-provided Windows Xenia Canary title-log evidence** after testing the
