@@ -1,3 +1,52 @@
+# VERIFIED IN USER'S XENIA: Black Mesa Alpha 5 C0A0 GPU loader and split draws (2026-10-30)
+
+**User-provided Windows Xenia Canary title-log evidence** after testing the
+separate `hl1_bms_world_probe.xex`:
+
+```text
+HL1_BMS: SCENE_VALID: 303 groups 48874 vertices 31964 triangles
+HL1_BMS: INDEX_DRAW_BATCHES=2 total_indices=95892 max_per_batch=65532
+HL1_BMS: GPU_MAP_FRAME_SUBMITTED frame=1 triangles=31964
+HL1_BMS: GPU_MAP_FRAME_SUBMITTED frame=60 triangles=31964
+HL1_BMS: GPU_MAP_FRAME_SUBMITTED frame=180 triangles=31964
+HL1_BMS: BOOT_COMPLETE
+```
+
+The user also confirmed a new title log was written on
+**2026-10-30 at 8:27:28 AM**, indicating that the new
+`hl1_bms_world_probe.xex` actually launched in Windows Xenia.
+The earlier screenshot in conversation showed colored geometric
+world structures, but the screenshot itself did not show a readable
+XEX filename; **don't assign that screenshot to this binary without
+a separate visual confirmation**.
+
+User's Windows folder file sizes support the intended isolation:
+```text
+BlackMesa_Alpha5_Private_Preview/C0A0/assets/hl1_c0a0_world.h360   1,379,336 bytes
+BlackMesa_Alpha5_Private_Preview/C1A0/assets/hl1_c0a0_world.h360      67,868 bytes
+HalfLife1-X360-XEX-StartupProbe/assets/hl1_c0a0_world.h360           298,310 bytes
+```
+
+**What is now verified**: H360 big-endian parser accepts the converted
+BMS map, both GPU index batches are configured, draw submissions
+complete through at least frame 180, and XEX reaches BOOT_COMPLETE
+without the previous no-log failure.
+
+**What is not verified yet**: the exact new map's appearance,
+complete vertex colors and geometry validity on screen,
+FPS/performance metrics, runtime textured Source surfaces,
+props, doors, collision/physics and playable Black Mesa gameplay.
+The present log is filtered to selected patterns, so do not
+invent final present statistics.
+
+**Next test**: inspect the complete log tail, screenshot the
+new BMS executable, and observe camera orbit/free-fly.
+Then build a *separate* BMS texture / source entity prototype
+without touching the original HL1 rendering or stable-walk XEXs.
+Continue keeping game-derived assets private, not in public GitHub.
+
+---
+
 # Fix for BMS preview not opening — oversized indexed draw (2026-10-29)
 
 User reported that the previously supplied private Black Mesa Alpha 5
