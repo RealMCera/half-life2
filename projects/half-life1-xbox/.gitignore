@@ -1,0 +1,11 @@
+# Keep game discs and extracted assets local. Do not commit retail data.
+local/
+*.iso
+*.xiso
+*.xbe
+*.pak
+*.wad
+*.bsp
+*.mdl
+*.dll
+*.exe
