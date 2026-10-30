@@ -1,3 +1,86 @@
+# Next step after confirmed 31,964-triangle renderer: BMS WALK integration (2026-10-30)
+
+The user asked **"OKAY SO WHAT NOW?"** after their actual BMS C0A0
+`hl1_bms_world_probe.xex` log showed 578 frames, 577 flips, no
+reported misses and clean exit.
+
+**New code committed (not yet emulator-verified):**
+
+- New **separate** `x360_probe/bms_world_walk.c` target
+  `hl1_bms_world_walk.xex`: combines the BMS large-map 65,532-index
+  multi-draw geometry renderer with the previously developed
+  `world_walk_stable.c` ground-support approximation,
+  gravity, jump and wall-segment collision.
+- Mode **Start: WALK/ORBIT**, D-pad move, LB/RB yaw, right analog
+  view, A/Y jump, B reset, Back exit.
+- Optional private `assets/bms_spawn.txt` holding a Source-BSP
+  `info_player_start` origin as three decimal X Y Z numbers
+  on one line (e.g. generated from private C0A0
+  `map_manifest.json`). The executable transforms Source
+  coordinates into the same normalized H360 Y-up space and
+  tries to place the player on a supporting static floor.
+  If the floor is missing because H360 excludes
+  brush-entity models/props/displacements, the program
+  logs `SOURCE_SPAWN_UNSUPPORTED` and falls back to its
+  best-scored floor centroid.
+- Logs `HL1_BMS_WALK: DRAW_BATCHES`,
+  `COLLISION_MESH`, `SPAWN_SUPPORT`,
+  `SOURCE_SPAWN_ACCEPTED`/fallback,
+  `PLAYER_SPAWN`, `MODE=WALK`,
+  `PLAYER`, `JUMP`, `LANDED`,
+  `FALL_RECOVERY`, and
+  `PHYSICS blocked_edges=... blocked_walls=...
+  jumps=... landings=... recoveries=...`.
+- The **existing** `hl1_bms_world_probe.xex` and original
+  `hl1_world_explore.xex`, `hl1_world_walk.xex`
+  remain unchanged. This is an additional experiment.
+- The first BMS walker is **not yet a playable game**.
+  It lacks authentic Source/GoldSrc BSP hull collision,
+  solid entities, player capsule, doors, NPCs, physics
+  and original graphics. We must first verify that it
+  compiles and stays on a floor when tested in Xenia.
+
+Cloud build: [GitHub Actions #58](https://github.com/RealMCera/half-life2/actions/runs/41064921641),
+`HalfLife1-X360-XEX-StartupProbe` artifact, download
+**only after successful compilation**. The new XEX
+must be tested inside desktop Windows Xenia Canary.
+
+Separately delivered privately in-chat:
+`BlackMesa_C0A0_Walking_Test_Private.zip`, which contains
+`BMS_C0A0_Walking_Test/assets/hl1_c0a0_world.h360`,
+optional `assets/bms_spawn.txt`, and README.
+No proprietary map or Source material is committed to public GitHub.
+
+The test directory after copying the **new built XEX**:
+
+```text
+BMS_C0A0_Walking_Test/
+  hl1_bms_world_walk.xex
+  assets/
+    hl1_c0a0_world.h360
+    bms_spawn.txt
+```
+
+After launching, read:
+
+```powershell
+Get-Content "C:\Users\FrontDesk\Downloads\xenia_canary_windows\cache\hl1_bms_world_walk.log" -Tail 100
+```
+
+**Critical technical caveat:** A static world rendering mesh
+is not a complete Source BSP collision world. In particular,
+the two Source player spawn origins in the C0A0 manifest may
+fall on missing dynamic brush-model surfaces, so it is
+expected that an authentic Source spawn can be rejected
+despite correct coordinates. Do not mark it as a bug
+in the coordinate parser without checking materialized
+world support geometry.
+
+As before, all XEXs rely on the temporary **Xenia-only**
+LUT timeout bypass; never run on physical Xbox 360 hardware.
+
+---
+
 # User verified full BMS C0A0 graphics submission / presentation stats (2026-10-30)
 
 **This replaces earlier uncertainty about whether the XEX ran.**
