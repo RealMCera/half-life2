@@ -102,7 +102,7 @@ jobs:
             -DHL1_EXPERIMENTAL_LUT_PROBE=ON \
             -DXSDK_GLSLANG=/usr/bin/glslangValidator \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build "$LUT_BUILD" --target hl1_display_probe hl1_triangle_probe hl1_world_gpu_probe hl1_world_explore hl1_bms_world_probe hl1_world_walk hl1_world_walk_stable --verbose
+          cmake --build "$LUT_BUILD" --target hl1_display_probe hl1_triangle_probe hl1_world_gpu_probe hl1_world_explore hl1_bms_world_probe hl1_bms_world_walk hl1_world_walk hl1_world_walk_stable --verbose
           test -s "$LUT_BUILD/hl1_display_probe.xex"
           test -s "$LUT_BUILD/hl1_triangle_probe.xex"
           test -s "$LUT_BUILD/hl1_world_gpu_probe.xex"
@@ -110,6 +110,7 @@ jobs:
           test -s "$LUT_BUILD/hl1_world_walk.xex"
           test -s "$LUT_BUILD/hl1_world_walk_stable.xex"
           test -s "$LUT_BUILD/hl1_bms_world_probe.xex"
+          test -s "$LUT_BUILD/hl1_bms_world_walk.xex"
 
       - name: Validate XEX2 file header and prepare download
         shell: bash
@@ -125,7 +126,7 @@ jobs:
               if header != b'XEX2':
                   raise SystemExit(f'{name} is not XEX2: {header!r}')
               print(f'{name}: XEX2 header verified; {p.stat().st_size} bytes. Xenia startup is not verified by CI.')
-          for name in ('hl1_display_probe.xex', 'hl1_triangle_probe.xex', 'hl1_world_gpu_probe.xex', 'hl1_world_explore.xex', 'hl1_world_walk.xex', 'hl1_world_walk_stable.xex', 'hl1_bms_world_probe.xex'):
+          for name in ('hl1_display_probe.xex', 'hl1_triangle_probe.xex', 'hl1_world_gpu_probe.xex', 'hl1_world_explore.xex', 'hl1_world_walk.xex', 'hl1_world_walk_stable.xex', 'hl1_bms_world_probe.xex', 'hl1_bms_world_walk.xex'):
               p = Path(__import__('os').environ['LUT_BUILD']) / name
               if p.read_bytes()[:4] != b'XEX2':
                   raise SystemExit('Experimental XEX is not XEX2: ' + name)
@@ -140,8 +141,9 @@ jobs:
           cp "$LUT_BUILD/hl1_world_walk.xex" dist/hl1_world_walk.xex
           cp "$LUT_BUILD/hl1_world_walk_stable.xex" dist/hl1_world_walk_stable.xex
           cp "$LUT_BUILD/hl1_bms_world_probe.xex" dist/hl1_bms_world_probe.xex
+          cp "$LUT_BUILD/hl1_bms_world_walk.xex" dist/hl1_bms_world_walk.xex
           cp xsdk-upstream-commit.txt dist/
-          sha256sum dist/hl1_remaster_probe.xex dist/hl1_display_probe.xex dist/hl1_display_lut_probe.xex dist/hl1_triangle_probe.xex dist/hl1_world_gpu_probe.xex dist/hl1_world_explore.xex dist/hl1_world_walk.xex dist/hl1_world_walk_stable.xex dist/hl1_bms_world_probe.xex > dist/SHA256SUMS.txt
+          sha256sum dist/hl1_remaster_probe.xex dist/hl1_display_probe.xex dist/hl1_display_lut_probe.xex dist/hl1_triangle_probe.xex dist/hl1_world_gpu_probe.xex dist/hl1_world_explore.xex dist/hl1_world_walk.xex dist/hl1_world_walk_stable.xex dist/hl1_bms_world_probe.xex dist/hl1_bms_world_walk.xex > dist/SHA256SUMS.txt
           cat > dist/README.txt <<'EOF'
           Half-Life 1 Xbox 360 native H360 scene and display probes.
           hl1_remaster_probe.xex: original map / BMP geometry preview.
@@ -151,6 +153,11 @@ jobs:
           autofill STATUS_IO_TIMEOUT so we can diagnose the NEXT display
           failure. This DOES NOT emulate LUT, guarantee a visible frame,
           or fix Xenia. NEVER RUN ON PHYSICAL XBOX 360 HARDWARE.
+          hl1_bms_world_walk.xex: First-person BMS Alpha 5 walking test.
+          Uses split GPU draws, stable-ground render-mesh approximation,
+          Start to enter WALK, D-pad movement, LB/RB turn, A/Y jump, B reset,
+          Back exits. Optional assets/bms_spawn.txt X Y Z Source coordinates.
+          This XEX is UNVERIFIED in Xenia and has no BSP hull physics/doors.
           hl1_bms_world_probe.xex: Dedicated BMS Alpha 5 static map preview.
           Handles more than 65535 indices via 65532-index draw batches.
           Put the PRIVATE conversion output at assets/hl1_c0a0_world.h360.
